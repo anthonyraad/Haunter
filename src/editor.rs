@@ -7,7 +7,8 @@ use nih_plug_egui::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::{load_file, HaunterParams, Shared};
+use crate::preset::{self, Choice};
+use crate::{apply_preset, load_file, read_preset, save_preset, HaunterParams, Shared};
 
 pub const WIDTH: u32 = 760;
 pub const HEIGHT: u32 = 600;
@@ -19,6 +20,10 @@ const DISC: Color32 = Color32::from_rgb(0xf4, 0xf6, 0xff);
 const TRACK: Color32 = Color32::from_rgb(0xb4, 0xb8, 0xd0);
 const ARC: Color32 = Color32::from_rgb(0x3e, 0x4e, 0xd8);
 const PLAYHEAD: Color32 = Color32::from_rgb(0xd8, 0x5a, 0x3e);
+/// The Rate readout while Restart is off.
+const MUTED: Color32 = Color32::from_rgb(0x8c, 0x8c, 0x8c);
+const ERROR: Color32 = Color32::from_rgb(0xb0, 0x30, 0x20);
+const INFINITY: &str = "\u{221E}";
 // Dream Eater's dark knob, the same as Dropout's The End knob in its Destroy section.
 const EATER_DISC: Color32 = Color32::from_rgb(0x6e, 0x6e, 0x6e);
 const EATER_OUTLINE: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x2a);
@@ -43,6 +48,17 @@ struct EditorState {
     meter_db: f32,
     dragging: Option<Handle>,
     dialog_open: Arc<AtomicBool>,
+    /// The saved presets, read from the folder each time the preset menu opens.
+    user_presets: Vec<String>,
+    menu_open: bool,
+    /// The Save prompt's name while the prompt is open.
+    naming: Option<String>,
+    /// Puts the cursor in the name field on the next frame.
+    focus_name: bool,
+    /// Why the last save failed, shown until the prompt closes.
+    save_error: Option<String>,
+    /// `Shared::processed_blocks` when a preset's parameters were sent to the host.
+    preset_sent_at: Option<u64>,
 }
 
 pub fn create(params: Arc<HaunterParams>, shared: Arc<Shared>, state: Arc<EguiState>) -> Option<Box<dyn Editor>> {
@@ -72,6 +88,9 @@ fn configure(context: &egui::Context) {
 #[cfg_attr(not(test), allow(dead_code))]
 struct Drawn {
     used: Rect,
+    /// The preset menu and the Save button, or nothing while the Save prompt is open.
+    preset_menu: Rect,
+    save: Rect,
     restart: Rect,
     reverse: Rect,
     /// The first row of knobs, which starts with Rate.
@@ -105,15 +124,15 @@ fn draw(
 
     egui::CentralPanel::default()
         .show(context, |ui| {
-            header(ui, params, shared, state);
+            let [preset_menu, save] = header(ui, setter, params, shared, state);
             ui.add_space(8.0);
             waveform(ui, setter, params, shared, state, hovering_files);
             ui.add_space(10.0);
-            let ([restart, reverse], rate_enabled) = toggles_and_meter(ui, setter, params, shared, state);
+            let ([restart, reverse], restart_on) = toggles_and_meter(ui, setter, params, shared, state);
             ui.add_space(8.0);
             // Without Restart the region just loops, so the grid spacing does nothing.
             let upper_knobs = knob_row(ui, setter, &[
-                ("Rate", &params.rate, rate_enabled, Face::Plain),
+                ("Rate", &params.rate, restart_on, Face::Plain),
                 ("Depth", &params.depth, true, Face::Plain),
                 ("Attack", &params.attack, true, Face::Plain),
                 ("Release", &params.release, true, Face::Plain),
@@ -127,7 +146,7 @@ fn draw(
                 ("Blend", &params.blend, true, Face::Plain),
                 ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level }),
             ]);
-            Drawn { used: ui.min_rect(), restart, reverse, upper_knobs, lower_knobs }
+            Drawn { used: ui.min_rect(), preset_menu, save, restart, reverse, upper_knobs, lower_knobs }
         })
         .inner
 }
@@ -138,29 +157,177 @@ fn is_audio_file(path: &std::path::Path) -> bool {
         .is_some_and(|ext| AUDIO_EXTENSIONS.iter().any(|known| ext.eq_ignore_ascii_case(known)))
 }
 
-fn header(ui: &mut egui::Ui, params: &Arc<HaunterParams>, shared: &Arc<Shared>, state: &mut EditorState) {
+/// The title, then the preset menu, Save, and Load, or the Save prompt in their place. Returns
+/// where the preset menu and Save were drawn.
+fn header(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    params: &Arc<HaunterParams>,
+    shared: &Arc<Shared>,
+    state: &mut EditorState,
+) -> [Rect; 2] {
+    let mut drawn = [Rect::NOTHING; 2];
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Haunter").size(22.0).strong().color(INK));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if state.naming.is_some() {
+                naming_prompt(ui, params, shared, state);
+                return;
+            }
             let busy = shared.loading.load(Ordering::Acquire) || state.dialog_open.load(Ordering::Acquire);
-            let button = egui::Button::new(egui::RichText::new("Load").size(14.0).color(INK))
-                .min_size(egui::vec2(86.0, 26.0))
-                .fill(DISC)
-                .stroke(Stroke::new(1.0_f32, OUTLINE));
-            if ui.add_enabled(!busy, button).clicked() {
+            if ui.add_enabled(!busy, header_button("Load", 86.0)).clicked() {
                 open_file_dialog(params.clone(), shared.clone(), state.dialog_open.clone());
             }
+            let save = ui
+                .add_enabled(!busy, header_button("Save", 64.0))
+                .on_hover_text("Saves the sample and every setting as a preset.");
+            if save.clicked() {
+                let name = match params.preset.get().choice {
+                    Choice::User(name) => name,
+                    _ => String::new(),
+                };
+                state.naming = Some(name);
+                state.focus_name = true;
+                state.save_error = None;
+            }
+            drawn = [preset_menu(ui, setter, params, shared, state, !busy), save.rect];
         });
     });
-    let status = shared.status.lock().unwrap().clone();
-    let line = if !status.is_empty() {
-        status
-    } else if let Some(overview) = shared.overview.lock().unwrap().as_ref() {
-        format!("{} · {:.0} ms", overview.name, overview.seconds * 1000.0)
+    let (line, color) = if let Some(error) = &state.save_error {
+        (error.clone(), ERROR)
     } else {
-        "Load a kick or any one-shot. Its volume shape ducks this track on the tempo grid.".to_owned()
+        let status = shared.status.lock().unwrap().clone();
+        let line = if !status.is_empty() {
+            status
+        } else if let Some(overview) = shared.overview.lock().unwrap().as_ref() {
+            format!("{} · {:.0} ms", overview.name, overview.seconds * 1000.0)
+        } else {
+            "Load a kick or any one-shot. Its volume shape ducks this track on the tempo grid.".to_owned()
+        };
+        (line, SUBTLE)
     };
-    ui.label(egui::RichText::new(line).color(SUBTLE));
+    ui.label(egui::RichText::new(line).color(color));
+    drawn
+}
+
+fn header_button(text: &str, width: f32) -> egui::Button<'_> {
+    egui::Button::new(egui::RichText::new(text).size(14.0).color(INK))
+        .min_size(egui::vec2(width, 26.0))
+        .fill(DISC)
+        .stroke(Stroke::new(1.0_f32, OUTLINE))
+}
+
+/// The preset's name, with a `*` once anything differs from what the preset set.
+fn preset_label(params: &HaunterParams, shared: &Shared, state: &EditorState) -> String {
+    let selection = params.preset.get();
+    let blocks = shared.processed_blocks.load(Ordering::Relaxed);
+    let pending = state.preset_sent_at.is_some_and(|at| blocks < at + HOST_GRACE_BLOCKS);
+    let modified = selection.is_modified(params, params.sample.fingerprint(), pending);
+    format!("{}{}", selection.choice.name(), if modified { "*" } else { "" })
+}
+
+/// The preset menu: `--`, the factory presets, then the user's. Returns where it was drawn.
+fn preset_menu(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    params: &HaunterParams,
+    shared: &Shared,
+    state: &mut EditorState,
+    enabled: bool,
+) -> Rect {
+    let selected = params.preset.get().choice;
+    let label = preset_label(params, shared, state);
+    let mut picked = None;
+    let menu = ui
+        .add_enabled_ui(enabled, |ui| {
+            ui.spacing_mut().interact_size.y = 26.0;
+            let widgets = &mut ui.visuals_mut().widgets;
+            for look in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
+                look.weak_bg_fill = DISC;
+                look.bg_stroke = Stroke::new(1.0_f32, OUTLINE);
+            }
+            egui::ComboBox::from_id_salt("preset")
+                .width(190.0)
+                .truncate()
+                .selected_text(egui::RichText::new(label).size(14.0).color(INK))
+                .show_ui(ui, |ui| {
+                    if !state.menu_open {
+                        state.user_presets = shared.user_presets.list();
+                    }
+                    let mut item = |ui: &mut egui::Ui, choice: Choice| {
+                        if ui.selectable_label(choice == selected, choice.name()).clicked() {
+                            picked = Some(choice);
+                        }
+                    };
+                    item(ui, Choice::None);
+                    for name in preset::factory_names() {
+                        item(ui, Choice::Factory(name.to_owned()));
+                    }
+                    if !state.user_presets.is_empty() {
+                        ui.separator();
+                    }
+                    for name in &state.user_presets {
+                        item(ui, Choice::User(name.clone()));
+                    }
+                })
+        })
+        .inner;
+    state.menu_open = menu.inner.is_some();
+    if let Some(choice) = picked {
+        select_preset(choice, setter, params, shared, state);
+    }
+    menu.response.rect
+}
+
+/// Loads a preset. Choosing the selected one again puts it back the way it was saved.
+fn select_preset(choice: Choice, setter: &ParamSetter, params: &HaunterParams, shared: &Shared, state: &mut EditorState) {
+    match read_preset(&choice, shared) {
+        Ok(preset) => {
+            apply_preset(choice, preset, setter, params, shared);
+            state.preset_sent_at = Some(shared.processed_blocks.load(Ordering::Relaxed));
+        }
+        Err(error) => shared.set_status(error),
+    }
+}
+
+/// A name field with OK and Cancel, in place of the preset controls. Enter saves and Escape
+/// cancels.
+fn naming_prompt(ui: &mut egui::Ui, params: &HaunterParams, shared: &Shared, state: &mut EditorState) {
+    let cancel = ui.add(header_button("Cancel", 72.0));
+    let ok = ui.add(header_button("OK", 56.0));
+    let Some(name) = state.naming.as_mut() else {
+        return;
+    };
+    let field = ui.add(
+        egui::TextEdit::singleline(name)
+            .desired_width(190.0)
+            .char_limit(64)
+            .font(egui::FontId::proportional(14.0))
+            .margin(egui::vec2(6.0, 4.0))
+            .hint_text("Preset name"),
+    );
+    if std::mem::take(&mut state.focus_name) {
+        field.request_focus();
+    }
+    ui.label(egui::RichText::new("Save as").color(SUBTLE));
+    let enter = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+    let escape = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    if cancel.clicked() || escape {
+        state.naming = None;
+        state.save_error = None;
+    } else if ok.clicked() || enter {
+        match save_preset(name, params, shared) {
+            Ok(_) => {
+                state.naming = None;
+                state.save_error = None;
+                state.preset_sent_at = None;
+            }
+            Err(error) => {
+                state.save_error = Some(error);
+                state.focus_name = true;
+            }
+        }
+    }
 }
 
 fn open_file_dialog(params: Arc<HaunterParams>, shared: Arc<Shared>, dialog_open: Arc<AtomicBool>) {
@@ -307,8 +474,9 @@ fn drop_overlay(painter: &egui::Painter, rect: Rect, hovering_files: bool) {
     }
 }
 
-/// Blocks the host gets to apply a toggle's edit before the toggle shows the parameter again.
-const TOGGLE_GRACE_BLOCKS: u64 = 3;
+/// Blocks the host gets to apply an edit from the editor before the editor shows the parameter
+/// again, after a toggle or a preset.
+const HOST_GRACE_BLOCKS: u64 = 3;
 
 /// A toggle edit the host has been sent but has not applied to the parameter yet.
 #[derive(Clone, Copy)]
@@ -330,7 +498,7 @@ fn toggle(ui: &mut egui::Ui, setter: &ParamSetter, param: &BoolParam, shared: &S
     let memory = ui.make_persistent_id(text);
     let blocks = shared.processed_blocks.load(Ordering::Relaxed);
     let mut toggling = ui.memory(|mem| mem.data.get_temp::<Toggling>(memory)).filter(|edit| {
-        edit.held || (param.value() != edit.target && blocks < edit.closed_at + TOGGLE_GRACE_BLOCKS)
+        edit.held || (param.value() != edit.target && blocks < edit.closed_at + HOST_GRACE_BLOCKS)
     });
     let on = toggling.map_or(param.value(), |edit| edit.target);
 
@@ -433,18 +601,20 @@ enum Face {
 }
 
 trait KnobParam {
-    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str, face: Face);
+    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str, turnable: bool, face: Face);
 }
 
 impl<P: Param> KnobParam for P {
-    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str, face: Face) {
-        draw_knob(ui, setter, self, name, face);
+    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str, turnable: bool, face: Face) {
+        draw_knob(ui, setter, self, name, turnable, face);
     }
 }
 
-fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name: &str, face: Face) {
+/// A knob that isn't `turnable` looks the same but takes no input, and reads a grey infinity.
+fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name: &str, turnable: bool, face: Face) {
     let width = ui.available_width().max(88.0);
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 112.0), egui::Sense::click_and_drag());
+    let sense = if turnable { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 112.0), sense);
     let normalized = param.modulated_normalized_value();
     let memory = ui.id().with(name);
 
@@ -478,8 +648,6 @@ fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name:
         setter.end_set_parameter(param);
     }
 
-    let enabled = ui.is_enabled();
-    let tint = |color: Color32| if enabled { color } else { color.gamma_multiply(0.35) };
     let dial = 74.0_f32.min(rect.width() - 8.0);
     let center = Pos2::new(rect.center().x, rect.top() + dial * 0.5 + 2.0);
     let radius = dial * 0.5 - 3.0;
@@ -489,55 +657,69 @@ fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name:
         Face::Eater { .. } => (EATER_DISC, EATER_OUTLINE, EATER_TRACK, EATER_ARC, EATER_ARC, 2.2),
     };
     let painter = ui.painter();
-    painter.circle_filled(center, radius - 1.0, tint(disc));
-    painter.circle_stroke(center, radius - 1.0, Stroke::new(1.0_f32, tint(outline)));
-    painter.line(arc_points(center, radius - 5.0, ROTARY_START, ROTARY_END), Stroke::new(2.0_f32, tint(track)));
+    painter.circle_filled(center, radius - 1.0, disc);
+    painter.circle_stroke(center, radius - 1.0, Stroke::new(1.0_f32, outline));
+    painter.line(arc_points(center, radius - 5.0, ROTARY_START, ROTARY_END), Stroke::new(2.0_f32, track));
     if normalized > 0.004 {
-        painter.line(arc_points(center, radius - 5.0, ROTARY_START, angle), Stroke::new(2.0_f32, tint(arc)));
+        painter.line(arc_points(center, radius - 5.0, ROTARY_START, angle), Stroke::new(2.0_f32, arc));
     }
     if let Face::Eater { progress } = face {
         let progress = progress.clamp(0.0, 1.0);
         if progress > 0.004 && angle > ROTARY_START + 0.004 {
             let filled = ROTARY_START + progress * (angle - ROTARY_START);
-            painter.line(arc_points(center, radius - 5.0, ROTARY_START, filled), Stroke::new(2.0_f32, tint(ARC)));
+            painter.line(arc_points(center, radius - 5.0, ROTARY_START, filled), Stroke::new(2.0_f32, ARC));
         }
     }
     let inner = Pos2::new(center.x + angle.sin() * dial * 0.18, center.y - angle.cos() * dial * 0.18);
     let outer = Pos2::new(center.x + angle.sin() * dial * 0.36, center.y - angle.cos() * dial * 0.36);
-    painter.line_segment([inner, outer], Stroke::new(pointer_width, tint(pointer)));
+    painter.line_segment([inner, outer], Stroke::new(pointer_width, pointer));
 
-    painter.text(
-        Pos2::new(rect.center().x, rect.top() + dial + 14.0),
-        egui::Align2::CENTER_CENTER,
-        param.to_string(),
-        egui::FontId::proportional(13.0),
-        tint(INK),
-    );
+    let readout = Pos2::new(rect.center().x, rect.top() + dial + 14.0);
+    if turnable {
+        painter.text(readout, egui::Align2::CENTER_CENTER, param.to_string(), egui::FontId::proportional(13.0), INK);
+    } else {
+        draw_infinity(painter, readout, MUTED);
+    }
     painter.text(
         Pos2::new(rect.center().x, rect.top() + dial + 30.0),
         egui::Align2::CENTER_CENTER,
         name.to_uppercase(),
         egui::FontId::proportional(11.0),
-        tint(SUBTLE),
+        SUBTLE,
     );
 }
 
-/// Draws a row of knobs, each with whether it can be used and how it looks. Returns the row's area.
+/// An infinity sign centred on `center`, from the font if it has one and drawn otherwise.
+fn draw_infinity(painter: &egui::Painter, center: Pos2, color: Color32) {
+    let font = egui::FontId::proportional(18.0);
+    if painter.ctx().fonts(|fonts| fonts.has_glyphs(&font, INFINITY)) {
+        painter.text(center, egui::Align2::CENTER_CENTER, INFINITY, font, color);
+        return;
+    }
+    // A lemniscate of Gerono stretched sideways.
+    let points = (0..=48)
+        .map(|step| {
+            let t = step as f32 / 48.0 * std::f32::consts::TAU;
+            Pos2::new(center.x + 8.0 * t.sin(), center.y + 4.0 * (2.0 * t).sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(points, Stroke::new(1.6_f32, color)));
+}
+
+/// Draws a row of knobs, each with whether it can be turned and how it looks. Returns the row's
+/// area.
 fn knob_row(ui: &mut egui::Ui, setter: &ParamSetter, knobs: &[(&str, &dyn KnobParam, bool, Face)]) -> Rect {
     let width = ui.available_width();
     let height = 118.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    for (index, (name, param, enabled, face)) in knobs.iter().enumerate() {
+    for (index, (name, param, turnable, face)) in knobs.iter().enumerate() {
         let center_x = rect.left() + width * (index as f32 + 0.5) / KNOB_COLUMNS;
         let slot = Rect::from_center_size(Pos2::new(center_x, rect.center().y), egui::vec2(120.0, height));
-        let mut builder = egui::UiBuilder::new()
+        let builder = egui::UiBuilder::new()
             .id_salt(*name)
             .max_rect(slot)
             .layout(egui::Layout::top_down(egui::Align::Center));
-        if !enabled {
-            builder = builder.disabled();
-        }
-        ui.allocate_new_ui(builder, |ui| param.draw(ui, setter, name, *face));
+        ui.allocate_new_ui(builder, |ui| param.draw(ui, setter, name, *turnable, *face));
     }
     rect
 }
@@ -545,6 +727,7 @@ fn knob_row(ui: &mut egui::Ui, setter: &ParamSetter, knobs: &[(&str, &dyn KnobPa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempDir;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
@@ -679,6 +862,36 @@ mod tests {
                 .collect()
         }
 
+        /// Each painted text with where it was drawn and its colour.
+        fn text_shapes(&self) -> Vec<(String, Rect, Color32)> {
+            self.shapes
+                .iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Text(text) => {
+                        let color = text.galley.job.sections.first().map_or(Color32::PLACEHOLDER, |s| s.format.color);
+                        Some((text.galley.text().to_owned(), text.visual_bounding_rect(), color))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Where `text` was painted, if it was.
+        fn find_text(&self, text: &str) -> Option<Rect> {
+            self.text_shapes().into_iter().find(|(painted, _, _)| painted == text).map(|(_, rect, _)| rect)
+        }
+
+        fn type_text(&mut self, text: &str) {
+            self.input.events.push(egui::Event::Text(text.to_owned()));
+        }
+
+        fn press_key(&mut self, key: egui::Key) {
+            for pressed in [true, false] {
+                let modifiers = self.input.modifiers;
+                self.input.events.push(egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers });
+            }
+        }
+
         fn take_edits(&self) -> Vec<Edit> {
             std::mem::take(&mut *self.host.edits.lock().unwrap())
         }
@@ -688,6 +901,7 @@ mod tests {
         plugin: crate::Haunter,
         screen: Screen,
         state: EditorState,
+        presets: TempDir,
     }
 
     impl Editor {
@@ -696,7 +910,8 @@ mod tests {
         }
 
         fn scaled(with_sample: bool, pixels_per_point: f32) -> Self {
-            let plugin = crate::Haunter::default();
+            let presets = TempDir::new();
+            let plugin = crate::Haunter::with_preset_dir(presets.path().to_owned());
             if with_sample {
                 let kick = (0..4_800).map(|n| (n as f32 * 0.01).sin() * (1.0 - n as f32 / 4_800.0)).collect();
                 let sample =
@@ -705,11 +920,11 @@ mod tests {
                 plugin.shared.playhead.store(0.3, Ordering::Relaxed);
                 plugin.shared.gain_reduction_db.store(9.0, Ordering::Relaxed);
             }
-            Editor { plugin, screen: Screen::new(pixels_per_point), state: EditorState::default() }
+            Editor { plugin, screen: Screen::new(pixels_per_point), state: EditorState::default(), presets }
         }
 
         fn frame(&mut self) -> Drawn {
-            let Editor { plugin, screen, state } = self;
+            let Editor { plugin, screen, state, .. } = self;
             screen.frame(|context, setter| draw(context, setter, &plugin.params, &plugin.shared, state))
         }
 
@@ -775,11 +990,23 @@ mod tests {
 
     #[test]
     fn every_control_fits_in_the_window() {
-        for with_sample in [false, true] {
-            let used = Editor::new(with_sample).settle().used;
+        for (with_sample, naming) in [(false, false), (true, false), (true, true)] {
+            let mut editor = Editor::new(with_sample);
+            if naming {
+                editor.state.naming = Some("A rather long preset name".into());
+            }
+            let drawn = editor.settle();
+            let used = drawn.used;
             assert!(used.max.x <= WIDTH as f32, "too wide: {used:?}");
             assert!(used.max.y <= HEIGHT as f32, "too tall: {used:?}");
             assert!(used.max.y > HEIGHT as f32 * 0.8, "unexpectedly short layout: {used:?}");
+            if !naming {
+                let load = editor.screen.find_text("Load").expect("Load is drawn");
+                let title = editor.screen.find_text("Haunter").expect("the title is drawn");
+                assert!(title.right() < drawn.preset_menu.left(), "the title, then the preset menu");
+                assert!(drawn.preset_menu.right() <= drawn.save.left(), "the menu is left of Save");
+                assert!(drawn.save.right() <= load.left(), "Save is left of Load");
+            }
         }
     }
 
@@ -790,10 +1017,7 @@ mod tests {
         editor.screen.take_edits();
         let restart = editor.plugin.params.restart.as_ptr();
         let reverse = editor.plugin.params.reverse.as_ptr();
-        let rate = knob_centres(drawn.upper_knobs).next().unwrap();
-        let rate_lit = |screen: &Screen| screen.discs(DISC).iter().any(|disc| disc.distance(rate) < 20.0);
         assert!(editor.screen.lit(drawn.restart) && !editor.screen.lit(drawn.reverse));
-        assert!(rate_lit(&editor.screen), "Rate starts enabled");
 
         editor.move_to(drawn.reverse.center());
         editor.wait(0.7);
@@ -820,8 +1044,6 @@ mod tests {
         editor.click_at(drawn.restart.center());
         assert_one_edit(&editor.screen.take_edits(), restart, 0.0);
         assert!(!editor.screen.lit(drawn.restart), "Restart shows off");
-        assert!(!rate_lit(&editor.screen), "and Rate is greyed out");
-        assert_eq!(editor.screen.discs(DISC).len(), 8, "only Rate");
 
         editor.click_at(drawn.reverse.center());
         assert_one_edit(&editor.screen.take_edits(), reverse, 0.0);
@@ -852,7 +1074,7 @@ mod tests {
         assert!(editor.screen.lit(drawn.reverse), "no blocks yet, so the host has not had its chance");
 
         let blocks = &editor.plugin.shared.processed_blocks;
-        blocks.fetch_add(TOGGLE_GRACE_BLOCKS - 1, Ordering::Relaxed);
+        blocks.fetch_add(HOST_GRACE_BLOCKS - 1, Ordering::Relaxed);
         editor.frame();
         assert!(editor.screen.lit(drawn.reverse));
         editor.plugin.shared.processed_blocks.fetch_add(1, Ordering::Relaxed);
@@ -912,16 +1134,79 @@ mod tests {
         }
     }
 
+    /// The Rate readout's texts and colours, from the painted shapes under the Rate knob.
+    fn rate_readout(editor: &Editor, row: Rect) -> Vec<(String, Color32)> {
+        let rate = knob_centres(row).next().unwrap();
+        editor
+            .screen
+            .text_shapes()
+            .into_iter()
+            .filter(|(text, rect, _)| (rect.center().x - rate.x).abs() < 40.0 && row.contains(rect.center()) && text != "RATE")
+            .map(|(text, _, color)| (text, color))
+            .collect()
+    }
+
     #[test]
-    fn a_disabled_knob_ignores_drags_and_double_clicks() {
+    fn restart_off_locks_rate_and_shows_infinity() {
+        let mut editor = Editor::new(true);
+        let drawn = editor.settle();
+        let rate = editor.plugin.params.rate.as_ptr();
+        let rate_centre = knob_centres(drawn.upper_knobs).next().unwrap();
+        assert_eq!(rate_readout(&editor, drawn.upper_knobs), [("1/4".to_owned(), INK)]);
+
+        editor.click_at(drawn.restart.center());
+        editor.screen.take_edits();
+        let font_has_infinity = editor.screen.context.fonts(|fonts| fonts.has_glyphs(&egui::FontId::proportional(18.0), INFINITY));
+        assert!(font_has_infinity, "egui's default font draws U+221E");
+        assert_eq!(rate_readout(&editor, drawn.upper_knobs), [(INFINITY.to_owned(), MUTED)], "a grey infinity instead of 1/4");
+        assert_eq!(editor.screen.discs(DISC).len(), 9, "Rate keeps its normal face, like every knob but Dream Eater");
+        let rate_fills: Vec<Color32> = editor
+            .screen
+            .shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Circle(circle) if circle.center.distance(rate_centre) < 20.0 && circle.fill != Color32::TRANSPARENT => {
+                    Some(circle.fill)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rate_fills, [DISC], "nothing greys it out");
+
+        editor.move_to(rate_centre);
+        editor.drag(egui::vec2(0.0, -40.0));
+        for pressed in [true, false, true, false] {
+            editor.screen.left_button(pressed);
+            editor.frame();
+        }
+        editor.screen.input.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 3.0),
+            modifiers: egui::Modifiers::NONE,
+        });
+        editor.frame();
+        let edits = editor.screen.take_edits();
+        assert!(!edits.iter().any(|edit| matches!(edit, Edit::Begin(p) | Edit::Set(p, _) | Edit::End(p) if *p == rate)), "{edits:?}");
+
+        editor.click_at(drawn.restart.center());
+        assert_eq!(rate_readout(&editor, drawn.upper_knobs), [("1/4".to_owned(), INK)], "Restart on shows the fraction again");
+        editor.screen.take_edits();
+        editor.move_to(rate_centre);
+        editor.drag(egui::vec2(0.0, -40.0));
+        let edits = editor.screen.take_edits();
+        assert!(edits.iter().any(|edit| matches!(edit, Edit::Set(p, _) if *p == rate)), "and Rate turns again: {edits:?}");
+    }
+
+    #[test]
+    fn a_locked_knob_ignores_drags_and_double_clicks() {
         let plugin = crate::Haunter::default();
         let rate = plugin.params.rate.as_ptr();
-        for enabled in [true, false] {
+        for turnable in [true, false] {
             let mut screen = Screen::new(1.0);
             let row = |screen: &mut Screen| {
                 screen.frame(|context, setter| {
                     egui::CentralPanel::default()
-                        .show(context, |ui| knob_row(ui, setter, &[("Rate", &plugin.params.rate, enabled, Face::Plain)]))
+                        .show(context, |ui| knob_row(ui, setter, &[("Rate", &plugin.params.rate, turnable, Face::Plain)]))
                         .inner
                 })
             };
@@ -947,10 +1232,10 @@ mod tests {
                 }
             }
             let edits = screen.take_edits();
-            if enabled {
-                assert!(edits.iter().any(|edit| matches!(edit, Edit::Set(p, _) if *p == rate)), "an enabled knob turns");
+            if turnable {
+                assert!(edits.iter().any(|edit| matches!(edit, Edit::Set(p, _) if *p == rate)), "a turnable knob turns");
             } else {
-                assert!(edits.is_empty(), "a disabled knob does nothing: {edits:?}");
+                assert!(edits.is_empty(), "a locked knob does nothing: {edits:?}");
             }
         }
     }
@@ -988,5 +1273,210 @@ mod tests {
         let dream = editor.plugin.params.dream_eater.as_ptr();
         let edits = editor.screen.take_edits();
         assert!(edits.iter().any(|edit| matches!(edit, Edit::Set(p, value) if *p == dream && *value > 0.0)), "{edits:?}");
+    }
+
+    /// The text in the preset menu's button.
+    fn shown_preset(editor: &mut Editor) -> String {
+        let menu = editor.frame().preset_menu;
+        let texts: Vec<String> = editor
+            .screen
+            .text_shapes()
+            .into_iter()
+            .filter(|(_, rect, _)| menu.contains(rect.center()))
+            .map(|(text, _, _)| text)
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        texts[0].clone()
+    }
+
+    /// Opens the preset menu and returns its entries from top to bottom, with where each is.
+    fn open_preset_menu(editor: &mut Editor) -> Vec<(String, Rect)> {
+        let menu = editor.frame().preset_menu;
+        editor.click_at(menu.center());
+        // egui lays the popup out unseen on its first frame.
+        editor.frame();
+        assert!(editor.state.menu_open, "the menu opens");
+        let mut entries: Vec<(String, Rect)> = editor
+            .screen
+            .text_shapes()
+            .into_iter()
+            .filter(|(_, rect, _)| rect.top() > menu.bottom() && rect.left() >= menu.left() && rect.right() <= menu.right())
+            .map(|(text, rect, _)| (text, rect))
+            .collect();
+        entries.sort_by(|a, b| a.1.top().total_cmp(&b.1.top()));
+        // The popup's rows are close together; anything after a gap is the rest of the editor.
+        let rows = entries.windows(2).take_while(|pair| pair[1].1.top() - pair[0].1.top() < 40.0).count() + 1;
+        entries.truncate(rows);
+        entries
+    }
+
+    fn close_preset_menu(editor: &mut Editor) {
+        let menu = editor.frame().preset_menu;
+        editor.click_at(menu.center());
+        assert!(!editor.state.menu_open, "a second click closes it");
+    }
+
+    fn pick_preset(editor: &mut Editor, name: &str) {
+        let entries = open_preset_menu(editor);
+        let (_, rect) = entries
+            .iter()
+            .find(|(text, _)| text == name)
+            .unwrap_or_else(|| panic!("{name} is not in the menu: {entries:?}"));
+        editor.click_at(rect.center());
+        editor.frame();
+        assert!(!editor.state.menu_open, "choosing closes the menu");
+    }
+
+    fn another_sample() -> crate::sample::EmbeddedSample {
+        let audio = (0..2_400).map(|n| (n as f32 * 0.02).sin() * 0.5).collect();
+        crate::sample::EmbeddedSample { name: "snare.wav".into(), sample_rate: 48_000.0, channels: vec![audio] }
+    }
+
+    #[test]
+    fn choosing_water_loads_its_embedded_sample_with_default_settings() {
+        let mut editor = Editor::new(false);
+        editor.settle();
+        assert_eq!(shown_preset(&mut editor), "--", "a new instance has no preset and no sample");
+        let entries: Vec<String> = open_preset_menu(&mut editor).into_iter().map(|(text, _)| text).collect();
+        assert_eq!(entries, ["--", "Water"]);
+        close_preset_menu(&mut editor);
+        editor.screen.take_edits();
+
+        pick_preset(&mut editor, "Water");
+        let params = editor.plugin.params.clone();
+        let sample = params.sample.read(|s| s.cloned()).expect("Water loads a sample");
+        assert_eq!(sample.name, "Water");
+        assert_eq!(sample, crate::preset::Preset::factory("Water").unwrap().sample.unwrap(), "the sample built into the plugin");
+        assert_eq!(params.preset.get().choice, Choice::Factory("Water".into()));
+        assert_eq!(shown_preset(&mut editor), "Water");
+        assert!(editor.screen.texts().iter().any(|text| text.starts_with("Water · 4179 ms")), "{:?}", editor.screen.texts());
+
+        let edits = editor.screen.take_edits();
+        for (id, ptr, _) in params.param_map() {
+            let default = unsafe { ptr.default_normalized_value() };
+            let sent: Vec<Edit> = edits
+                .iter()
+                .filter(|edit| matches!(edit, Edit::Begin(p) | Edit::Set(p, _) | Edit::End(p) if *p == ptr))
+                .copied()
+                .collect();
+            assert_eq!(sent, [Edit::Begin(ptr), Edit::Set(ptr, default), Edit::End(ptr)], "{id} goes to its default");
+        }
+
+        editor.plugin.adopt_pending_sample();
+        let playing = editor.plugin.engine.sample().expect("the audio thread plays it");
+        assert_eq!(playing.frames(), (184_275.0 * 48_000.0 / 44_100.0f64).round() as usize, "resampled to the host rate");
+
+        pick_preset(&mut editor, "--");
+        assert!(params.sample.read(|s| s.is_none()), "-- means no sample");
+        assert_eq!(shown_preset(&mut editor), "--");
+        editor.plugin.adopt_pending_sample();
+        assert!(editor.plugin.engine.sample().is_none());
+    }
+
+    #[test]
+    fn choosing_a_user_preset_sends_its_settings_and_loads_its_sample() {
+        let mut editor = Editor::new(false);
+        editor.settle();
+        let mut preset = crate::preset::Preset { values: Default::default(), sample: Some(another_sample()) };
+        for (id, value) in [("rate", 4.0), ("restart", 0.0), ("reverse", 1.0), ("start", 0.125), ("depth", 0.4), ("release", 321.5)] {
+            preset.values.insert(id.to_owned(), value);
+        }
+        editor.plugin.shared.user_presets.save("Snare Gate", &preset).unwrap();
+        let entries: Vec<String> = open_preset_menu(&mut editor).into_iter().map(|(text, _)| text).collect();
+        assert_eq!(entries, ["--", "Water", "Snare Gate"], "user presets come after the factory ones");
+        close_preset_menu(&mut editor);
+        editor.screen.take_edits();
+
+        pick_preset(&mut editor, "Snare Gate");
+        let params = editor.plugin.params.clone();
+        assert_eq!(params.sample.read(|s| s.cloned()), preset.sample);
+        let edits = editor.screen.take_edits();
+        for (id, ptr, _) in params.param_map() {
+            let expected = unsafe { ptr.preview_normalized(preset.value(&id, &ptr)) };
+            assert!(edits.contains(&Edit::Set(ptr, expected)), "{id} is sent as {expected}: {edits:?}");
+        }
+        assert_eq!(shown_preset(&mut editor), "Snare Gate", "not changed while the host applies the settings");
+        editor.plugin.shared.processed_blocks.fetch_add(HOST_GRACE_BLOCKS, Ordering::Relaxed);
+        assert_eq!(shown_preset(&mut editor), "Snare Gate*", "the test host never applies them, so they differ");
+    }
+
+    #[test]
+    fn the_preset_name_gets_a_star_after_a_change_until_saved_or_chosen_again() {
+        let mut editor = Editor::new(false);
+        editor.settle();
+        pick_preset(&mut editor, "Water");
+        assert_eq!(shown_preset(&mut editor), "Water");
+
+        crate::install_sample(another_sample(), &editor.plugin.params, &editor.plugin.shared);
+        assert_eq!(shown_preset(&mut editor), "Water*", "a replaced sample");
+        pick_preset(&mut editor, "Water");
+        assert_eq!(shown_preset(&mut editor), "Water", "choosing it again puts it back");
+
+        // The test host never applies edits, so move what the preset set instead of the knob.
+        editor.plugin.shared.processed_blocks.fetch_add(HOST_GRACE_BLOCKS, Ordering::Relaxed);
+        for (id, value) in [("depth", 0.3), ("restart", 0.0), ("reverse", 1.0), ("start", 0.2)] {
+            let params = &editor.plugin.params;
+            let original = params.preset.get();
+            let mut moved = original.clone();
+            moved.values.insert(id.to_owned(), value);
+            params.preset.set(moved);
+            assert_eq!(shown_preset(&mut editor), "Water*", "{id} changed");
+            editor.plugin.params.preset.set(original);
+            assert_eq!(shown_preset(&mut editor), "Water");
+        }
+
+        crate::install_sample(another_sample(), &editor.plugin.params, &editor.plugin.shared);
+        assert_eq!(shown_preset(&mut editor), "Water*");
+        let save = editor.frame().save;
+        editor.click_at(save.center());
+        assert!(editor.state.naming.is_some(), "Save asks for a name");
+        editor.frame();
+        assert!(editor.screen.find_text("Save as").is_some() && editor.screen.find_text("OK").is_some());
+        editor.screen.type_text("Water");
+        editor.frame();
+        editor.screen.press_key(egui::Key::Enter);
+        editor.frame();
+        let error = editor.state.save_error.clone().expect("a factory name is refused");
+        editor.frame();
+        assert!(editor.screen.find_text(&error).is_some(), "the reason is shown");
+        for _ in 0.."Water".len() {
+            editor.screen.press_key(egui::Key::Backspace);
+        }
+        editor.screen.type_text("Snare Ghost");
+        editor.frame();
+        editor.screen.press_key(egui::Key::Enter);
+        editor.frame();
+        assert!(editor.state.naming.is_none(), "saved: {:?}", editor.state.save_error);
+        assert!(editor.presets.path().join("Snare Ghost.json").is_file());
+        assert_eq!(shown_preset(&mut editor), "Snare Ghost", "saving clears the star");
+
+        crate::install_sample(kick_like(), &editor.plugin.params, &editor.plugin.shared);
+        assert_eq!(shown_preset(&mut editor), "Snare Ghost*");
+        pick_preset(&mut editor, "Snare Ghost");
+        assert_eq!(shown_preset(&mut editor), "Snare Ghost");
+        assert_eq!(editor.plugin.params.sample.read(|s| s.cloned()), Some(another_sample()), "with its own sample back");
+
+        // Saving again under the same name, from the prompt prefilled with it, replaces it.
+        let save = editor.frame().save;
+        editor.click_at(save.center());
+        assert_eq!(editor.state.naming.as_deref(), Some("Snare Ghost"));
+        editor.frame();
+        let ok = editor.screen.find_text("OK").unwrap();
+        editor.click_at(ok.center());
+        assert!(editor.state.naming.is_none());
+        assert_eq!(editor.plugin.shared.user_presets.list(), ["Snare Ghost"]);
+
+        let save = editor.frame().save;
+        editor.click_at(save.center());
+        editor.screen.press_key(egui::Key::Escape);
+        editor.frame();
+        assert!(editor.state.naming.is_none(), "Escape cancels");
+        let cancel_and_back = editor.frame();
+        assert_ne!(cancel_and_back.preset_menu, Rect::NOTHING, "the preset controls come back");
+    }
+
+    fn kick_like() -> crate::sample::EmbeddedSample {
+        let audio = (0..4_800).map(|n| (n as f32 * 0.005).sin() * (1.0 - n as f32 / 4_800.0)).collect();
+        crate::sample::EmbeddedSample { name: "boom.wav".into(), sample_rate: 48_000.0, channels: vec![audio] }
     }
 }

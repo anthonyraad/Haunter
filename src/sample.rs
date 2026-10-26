@@ -96,6 +96,26 @@ impl EmbeddedSample {
     pub fn seconds(&self) -> f64 {
         self.frames() as f64 / self.sample_rate
     }
+
+    /// A 64-bit FNV-1a hash of the name, rate, and audio. It is saved with presets and projects,
+    /// so it must stay the same across builds; never 0, which stands for no sample.
+    pub fn fingerprint(&self) -> u64 {
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |word: u64| hash = (hash ^ word).wrapping_mul(PRIME);
+        for byte in self.name.bytes() {
+            mix(byte as u64);
+        }
+        mix(self.sample_rate.to_bits());
+        mix(self.channels.len() as u64);
+        for channel in &self.channels {
+            mix(channel.len() as u64);
+            for value in channel {
+                mix(value.to_bits() as u64);
+            }
+        }
+        hash.max(1)
+    }
 }
 
 /// Windowed-sinc sample rate conversion. Lowers the cutoff when downsampling so it doesn't alias.
@@ -271,6 +291,16 @@ mod tests {
         let sample = EmbeddedSample::from_decoded("long".into(), audio).unwrap();
         assert_eq!(sample.channels.len(), 2);
         assert_eq!(sample.frames(), 30_000);
+    }
+
+    #[test]
+    fn fingerprints_are_stable_and_tell_samples_apart() {
+        let sample = EmbeddedSample { name: "a".into(), sample_rate: 48_000.0, channels: vec![vec![0.5, -0.25]] };
+        assert_eq!(sample.fingerprint(), 0x2f93_a99b_4dca_315f, "saved presets and projects rely on this value");
+        let renamed = EmbeddedSample { name: "b".into(), ..sample.clone() };
+        let changed = EmbeddedSample { channels: vec![vec![0.5, -0.5]], ..sample.clone() };
+        assert_ne!(sample.fingerprint(), renamed.fingerprint());
+        assert_ne!(sample.fingerprint(), changed.fingerprint());
     }
 
     #[test]

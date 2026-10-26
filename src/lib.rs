@@ -9,9 +9,11 @@ use std::sync::{Arc, Mutex, RwLock};
 pub mod audio_file;
 pub mod dsp;
 mod editor;
+pub mod preset;
 pub mod sample;
 
 use dsp::{Engine, FrameGains, Settings, SyncRate, TransportInfo, HP_OFF_HZ, LP_OFF_HZ};
+use preset::{Choice, Preset, Selection, SelectionSlot, UserPresets};
 use sample::{EmbeddedSample, Overview, PreparedSample};
 
 /// The persisted sample. Every replacement, including one from a loaded project or preset, bumps
@@ -20,17 +22,25 @@ use sample::{EmbeddedSample, Overview, PreparedSample};
 pub struct SampleSlot {
     sample: RwLock<Option<EmbeddedSample>>,
     generation: AtomicU64,
+    /// [`EmbeddedSample::fingerprint`] of the sample, or 0 for none.
+    fingerprint: AtomicU64,
 }
 
 impl SampleSlot {
     /// Stores a new sample and returns its generation.
     pub fn replace(&self, sample: Option<EmbeddedSample>) -> u64 {
+        let fingerprint = sample.as_ref().map_or(0, EmbeddedSample::fingerprint);
         *self.sample.write().unwrap() = sample;
+        self.fingerprint.store(fingerprint, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint.load(Ordering::Acquire)
     }
 
     pub fn read<R>(&self, f: impl FnOnce(Option<&EmbeddedSample>) -> R) -> R {
@@ -53,7 +63,8 @@ impl<'a> PersistentField<'a, Option<EmbeddedSample>> for SampleSlot {
 
 struct PendingSample {
     generation: u64,
-    prepared: Arc<PreparedSample>,
+    /// `None` clears the sample.
+    prepared: Option<Arc<PreparedSample>>,
 }
 
 /// State shared by the audio thread, the editor, and the file loader.
@@ -79,10 +90,11 @@ pub struct Shared {
     /// Blocks processed so far. While the host runs the plugin, an edit from the editor only
     /// reaches the parameter in a later block, so this tells the editor whether it has had one.
     processed_blocks: AtomicU64,
+    user_presets: UserPresets,
 }
 
 impl Shared {
-    fn new() -> Self {
+    fn new(user_presets: UserPresets) -> Self {
         Shared {
             host_rate: AtomicF32::new(48_000.0),
             sample_seconds: Arc::new(AtomicF32::new(0.0)),
@@ -96,6 +108,7 @@ impl Shared {
             playhead: AtomicF32::new(-1.0),
             dream_level: AtomicF32::new(0.0),
             processed_blocks: AtomicU64::new(0),
+            user_presets,
         }
     }
 
@@ -134,14 +147,57 @@ pub fn load_file(path: PathBuf, params: Arc<HaunterParams>, shared: Arc<Shared>)
     });
 }
 
+/// Installs a newly loaded sample, and has the editor reset Start and End for it.
 pub fn install_sample(sample: EmbeddedSample, params: &HaunterParams, shared: &Shared) {
+    install(Some(sample), params, shared);
+    shared.reset_region.store(true, Ordering::Release);
+}
+
+/// Installs or clears the sample, leaving Start and End alone.
+fn install(sample: Option<EmbeddedSample>, params: &HaunterParams, shared: &Shared) {
     let host_rate = shared.host_rate.load(Ordering::Acquire) as f64;
-    let prepared = Arc::new(PreparedSample::new(&sample, host_rate));
-    shared.show_sample(Some(&sample));
-    let generation = params.sample.replace(Some(sample));
+    let prepared = sample.as_ref().map(|sample| Arc::new(PreparedSample::new(sample, host_rate)));
+    shared.show_sample(sample.as_ref());
+    let generation = params.sample.replace(sample);
     shared.retired.lock().unwrap().take();
     *shared.pending.lock().unwrap() = Some(PendingSample { generation, prepared });
-    shared.reset_region.store(true, Ordering::Release);
+}
+
+/// Loads `preset`: sends the host an edit for every parameter, the same way a knob does, and
+/// installs its sample. Remembers what it set so the editor can tell when something changes.
+pub fn apply_preset(choice: Choice, preset: Preset, setter: &ParamSetter, params: &HaunterParams, shared: &Shared) {
+    for (id, ptr, _) in params.param_map() {
+        let normalized = unsafe { ptr.preview_normalized(preset.value(&id, &ptr)) };
+        unsafe {
+            setter.raw_context.raw_begin_set_parameter(ptr);
+            setter.raw_context.raw_set_parameter_normalized(ptr, normalized);
+            setter.raw_context.raw_end_set_parameter(ptr);
+        }
+    }
+    let values = preset.complete_values(params);
+    let sample = preset.sample.as_ref().map_or(0, EmbeddedSample::fingerprint);
+    install(preset.sample, params, shared);
+    params.preset.set(Selection { choice, values, sample });
+    shared.set_status("");
+}
+
+/// Saves the sample and every parameter as the user preset `name`, and selects it. Returns the
+/// name as saved.
+pub fn save_preset(name: &str, params: &HaunterParams, shared: &Shared) -> Result<String, String> {
+    let preset = Preset::capture(params, params.sample.read(|sample| sample.cloned()));
+    let name = shared.user_presets.save(name, &preset)?;
+    let sample = preset.sample.as_ref().map_or(0, EmbeddedSample::fingerprint);
+    params.preset.set(Selection { choice: Choice::User(name.clone()), values: preset.values, sample });
+    Ok(name)
+}
+
+/// Reads the preset `choice` names, from the plugin or the user's folder.
+pub fn read_preset(choice: &Choice, shared: &Shared) -> Result<Preset, String> {
+    match choice {
+        Choice::None => Ok(Preset::default()),
+        Choice::Factory(name) => Preset::factory(name),
+        Choice::User(name) => shared.user_presets.load(name),
+    }
 }
 
 #[derive(Params)]
@@ -151,6 +207,10 @@ pub struct HaunterParams {
 
     #[persist = "sample"]
     pub sample: SampleSlot,
+
+    /// The selected preset, so a project reopens showing it.
+    #[persist = "preset"]
+    pub preset: SelectionSlot,
 
     #[id = "rate"]
     pub rate: EnumParam<SyncRate>,
@@ -283,6 +343,7 @@ impl HaunterParams {
         HaunterParams {
             editor_state: EguiState::from_size(editor::WIDTH, editor::HEIGHT),
             sample: SampleSlot::default(),
+            preset: SelectionSlot::default(),
             rate: EnumParam::new("Rate", SyncRate::Quarter),
             restart: BoolParam::new("Restart", true),
             reverse: BoolParam::new("Reverse", false),
@@ -339,12 +400,20 @@ pub struct Haunter {
 
 impl Default for Haunter {
     fn default() -> Self {
-        let shared = Arc::new(Shared::new());
-        let params = Arc::new(HaunterParams::new(shared.sample_seconds.clone()));
+        let plugin = Haunter::with_preset_dir(UserPresets::default_dir());
         #[cfg(feature = "standalone")]
         if let Some(path) = std::env::var_os("HAUNTER_PREVIEW_SAMPLE") {
-            load_file(path.into(), params.clone(), shared.clone());
+            load_file(path.into(), plugin.params.clone(), plugin.shared.clone());
         }
+        plugin
+    }
+}
+
+impl Haunter {
+    /// A plugin that keeps its user presets in `dir`.
+    pub fn with_preset_dir(dir: PathBuf) -> Self {
+        let shared = Arc::new(Shared::new(UserPresets::new(dir)));
+        let params = Arc::new(HaunterParams::new(shared.sample_seconds.clone()));
         Haunter {
             params,
             shared,
@@ -352,9 +421,7 @@ impl Default for Haunter {
             engine_generation: 0,
         }
     }
-}
 
-impl Haunter {
     /// Rebuilds the playback copy from the persisted sample if it or the host rate changed.
     fn sync_sample(&mut self, sample_rate: f64) {
         let generation = self.params.sample.generation();
@@ -379,10 +446,10 @@ impl Haunter {
             return;
         };
         drop(pending);
-        if next.prepared.sample_rate != self.engine.sample_rate() {
+        if next.prepared.as_ref().is_some_and(|prepared| prepared.sample_rate != self.engine.sample_rate()) {
             return;
         }
-        let old = self.engine.set_sample(Some(next.prepared));
+        let old = self.engine.set_sample(next.prepared);
         self.engine_generation = next.generation;
         if let (Some(old), Ok(mut retired)) = (old, self.shared.retired.try_lock()) {
             if retired.is_none() {
@@ -503,9 +570,37 @@ impl Vst3Plugin for Haunter {
 nih_export_vst3!(Haunter);
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fresh folder under the system temp folder, deleted when dropped.
+    pub struct TempDir(PathBuf);
+
+    impl TempDir {
+        pub fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let unique = format!("{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+            TempDir(std::env::temp_dir().join("haunter-tests").join(unique))
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use test_support::TempDir;
 
     fn kick(rate: f64) -> EmbeddedSample {
         let frames = (0.3 * rate) as usize;
@@ -586,6 +681,77 @@ mod tests {
         let fields = plugin.params.serialize_fields();
         assert_eq!(fields.get("sample").map(String::as_str), Some("null"));
         assert!(fields.contains_key("editor-state"));
+        assert_eq!(fields.get("preset").map(String::as_str), Some(r#"{"choice":{"kind":"none"},"values":{},"sample":0}"#));
+    }
+
+    #[test]
+    fn a_saved_user_preset_round_trips_the_sample_and_every_parameter() {
+        let folder = TempDir::new();
+        let plugin = Haunter::with_preset_dir(folder.path().join("Presets"));
+        assert!(plugin.shared.user_presets.list().is_empty(), "no folder yet means no presets");
+        install_sample(kick(44_100.0), &plugin.params, &plugin.shared);
+
+        let name = save_preset("  Ghost Kick ", &plugin.params, &plugin.shared).unwrap();
+        assert_eq!(name, "Ghost Kick");
+        assert!(folder.path().join("Presets").join("Ghost Kick.json").is_file());
+        assert_eq!(plugin.shared.user_presets.list(), ["Ghost Kick"]);
+        let selection = plugin.params.preset.get();
+        assert_eq!(selection.choice, Choice::User("Ghost Kick".into()));
+        assert!(!selection.is_modified(plugin.params.as_ref(), plugin.params.sample.fingerprint(), false));
+
+        let loaded = read_preset(&selection.choice, &plugin.shared).unwrap();
+        let ids: Vec<String> = plugin.params.param_map().into_iter().map(|(id, _, _)| id).collect();
+        assert!(ids.iter().all(|id| loaded.values.contains_key(id)), "every parameter is saved");
+        assert_eq!(loaded.values, selection.values);
+        assert_eq!(loaded.sample, plugin.params.sample.read(|s| s.cloned()), "the audio comes back bit for bit");
+
+        // Values away from the defaults survive too, and saving under the same name replaces it.
+        let mut custom = loaded.clone();
+        for (id, value) in [("rate", 4.0), ("restart", 0.0), ("reverse", 1.0), ("start", 0.125), ("end", 0.75), ("depth", 0.4)] {
+            custom.values.insert(id.to_owned(), value);
+        }
+        custom.values.insert("release".to_owned(), 321.5);
+        custom.values.insert("dream-eater".to_owned(), 0.37);
+        plugin.shared.user_presets.save("ghost kick", &custom).unwrap();
+        assert_eq!(plugin.shared.user_presets.list().len(), 1, "one preset per name");
+        assert_eq!(read_preset(&Choice::User("Ghost Kick".into()), &plugin.shared).unwrap(), custom);
+
+        let elsewhere = Haunter::with_preset_dir(folder.path().join("Presets"));
+        assert_eq!(elsewhere.shared.user_presets.list().len(), 1, "presets outlive the plugin instance");
+        assert!(save_preset("Water", &plugin.params, &plugin.shared).is_err(), "factory names are taken");
+        assert!(save_preset("a/b", &plugin.params, &plugin.shared).is_err());
+        assert!(!folder.path().join("Presets").read_dir().unwrap().any(|e| e.unwrap().path().extension().unwrap() == "tmp"));
+    }
+
+    #[test]
+    fn damaged_or_missing_presets_report_an_error() {
+        let folder = TempDir::new();
+        let plugin = Haunter::with_preset_dir(folder.path().to_owned());
+        assert!(read_preset(&Choice::User("Nope".into()), &plugin.shared).is_err());
+        std::fs::create_dir_all(folder.path()).unwrap();
+        std::fs::write(folder.path().join("Broken.json"), "{ not json").unwrap();
+        assert_eq!(plugin.shared.user_presets.list(), ["Broken"]);
+        let error = read_preset(&Choice::User("Broken".into()), &plugin.shared).unwrap_err();
+        assert!(error.contains("damaged"), "{error}");
+    }
+
+    #[test]
+    fn the_selected_preset_is_kept_in_the_plugin_state() {
+        let folder = TempDir::new();
+        let original = Haunter::with_preset_dir(folder.path().to_owned());
+        install_sample(kick(44_100.0), &original.params, &original.shared);
+        save_preset("Mine", &original.params, &original.shared).unwrap();
+        install_sample(kick(48_000.0), &original.params, &original.shared);
+
+        let restored = Haunter::with_preset_dir(folder.path().to_owned());
+        load_state(&restored, &save_state(&original));
+        let selection = restored.params.preset.get();
+        assert_eq!(selection, original.params.preset.get());
+        assert_eq!(selection.choice.name(), "Mine");
+        assert!(
+            selection.is_modified(restored.params.as_ref(), restored.params.sample.fingerprint(), false),
+            "the project reopens showing the preset as changed, because the sample was replaced"
+        );
     }
 
     #[test]

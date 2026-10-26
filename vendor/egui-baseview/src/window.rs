@@ -100,6 +100,8 @@ where
     bg_color: Rgba,
     close_requested: bool,
     repaint_after: Option<Instant>,
+    /// Whether a text field had keyboard focus last frame.
+    editing_text: bool,
 }
 
 impl<State, U> EguiWindow<State, U>
@@ -201,6 +203,7 @@ where
             bg_color,
             close_requested,
             repaint_after: Some(start_time),
+            editing_text: false,
         }
     }
 
@@ -390,6 +393,20 @@ where
             // TODO: Set mouse cursor for MacOS once baseview supports it.
             #[cfg(not(target_os = "macos"))]
             window.set_mouse_cursor(cursor_icon);
+        }
+
+        // Windows only sends keys to the focused window, and in a host that is the host's window.
+        // Take focus while a text field is being edited and give it back afterwards, so the
+        // host's shortcuts work again.
+        let editing_text = full_output.platform_output.ime.is_some();
+        if editing_text != self.editing_text {
+            self.editing_text = editing_text;
+            #[cfg(target_os = "windows")]
+            if editing_text {
+                window.focus();
+            } else {
+                return_focus_to_parent(window);
+            }
         }
 
         // A temporary workaround for keyboard input not working sometimes in Windows.
@@ -666,6 +683,21 @@ fn dropped_paths(data: &baseview::DropData) -> impl Iterator<Item = std::path::P
         baseview::DropData::None => &[],
     };
     paths.iter().cloned()
+}
+
+/// Gives keyboard focus back to the host's window that holds this one, if this one has it.
+#[cfg(target_os = "windows")]
+fn return_focus_to_parent(window: &baseview::Window) {
+    use winapi::um::winuser::{GetFocus, GetParent, SetFocus};
+    if let raw_window_handle::RawWindowHandle::Win32(handle) = window.raw_window_handle() {
+        let hwnd = handle.hwnd as winapi::shared::windef::HWND;
+        unsafe {
+            let parent = GetParent(hwnd);
+            if !parent.is_null() && GetFocus() == hwnd {
+                SetFocus(parent);
+            }
+        }
+    }
 }
 
 fn is_cut_command(modifiers: egui::Modifiers, keycode: keyboard_types::Code) -> bool {

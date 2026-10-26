@@ -17,18 +17,45 @@ const DECLICK_SECONDS: f64 = 0.001;
 
 /// Dream Eater's comb delay while the sample is silent. 9 ms puts the lowest resonance near 111 Hz.
 const DREAM_BASE_SECONDS: f64 = 0.009;
-/// How far the sample's peak shortens the comb delay at full Dream Eater, in octaves.
+/// How far the sample's peak shortens the comb delay, in octaves. This and the settings below are
+/// where the square-root curve alone would end at 100%; the upper range takes them further.
 const DREAM_SWEEP_OCTAVES: f64 = 3.0;
-/// Comb feedback at full Dream Eater and the sample's peak. Kept below 1 so the comb always decays.
+/// Comb feedback at the sample's peak.
 const DREAM_MAX_FEEDBACK: f64 = 0.85;
 /// The feedback left between hits, as a share of the feedback at the peak.
 const DREAM_RESTING_FEEDBACK: f64 = 0.35;
-/// Comb level in the output at full Dream Eater. The rest is the dry track.
+/// Comb level in the output. The rest is the dry track.
 const DREAM_MAX_WET: f64 = 0.8;
 /// Glide on the envelope before it moves the delay, so a fast attack sweeps instead of jumping.
 const DREAM_GLIDE_MS: f32 = 8.0;
 /// Low-pass in the comb's feedback path, so high resonances die away first.
 const DREAM_DAMPING_HZ: f64 = 7_000.0;
+/// Where the knob's upper range starts pushing the comb past the settings above. Below this,
+/// Dream Eater follows the square-root curve alone.
+const DREAM_TOP_FROM: f64 = 0.55;
+/// Feedback at full Dream Eater and the sample's peak. Kept below 1 so the comb always decays.
+const DREAM_TOP_FEEDBACK: f64 = 0.95;
+/// The feedback left between hits at full Dream Eater, as a share of the feedback at the peak.
+const DREAM_TOP_RESTING_FEEDBACK: f64 = 0.55;
+/// Sweep at full Dream Eater, in octaves.
+const DREAM_TOP_SWEEP_OCTAVES: f64 = 3.5;
+/// Comb level in the output at full Dream Eater.
+const DREAM_TOP_WET: f64 = 0.95;
+/// Damping at full Dream Eater.
+const DREAM_TOP_DAMPING_HZ: f64 = 9_000.0;
+/// The share of the comb's input attenuation (as an exponent) given back at full Dream Eater.
+const DREAM_TOP_EASE: f64 = 0.5;
+/// The feedback path is linear below this level and bends smoothly toward the ceiling above it.
+const DREAM_LOOP_KNEE: f64 = 1.0;
+const DREAM_LOOP_CEILING: f64 = 1.5;
+/// The DC blocker in the feedback path, far enough below the lowest resonance to leave it alone.
+const DREAM_DC_BLOCK_HZ: f64 = 15.0;
+/// The limiter on the comb's output is transparent below the knee and never passes the ceiling.
+/// The knee lowers through the upper range, so it only works hard where the comb does.
+const DREAM_LIMIT_KNEE: f64 = 0.95;
+const DREAM_TOP_LIMIT_KNEE: f64 = 0.85;
+const DREAM_LIMIT_CEILING: f64 = 1.0;
+const DREAM_LIMIT_RELEASE_MS: f32 = 80.0;
 
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncRate {
@@ -242,6 +269,16 @@ impl EnvelopeFollower {
     }
 }
 
+/// Unity up to `knee`, then bends smoothly toward `ceiling` without reaching it. The slope and
+/// curvature are continuous at the knee, so crossing it adds no edge.
+fn soft_knee(level: f64, knee: f64, ceiling: f64) -> f64 {
+    if level <= knee {
+        level
+    } else {
+        knee + (ceiling - knee) * ((level - knee) / (ceiling - knee)).tanh()
+    }
+}
+
 /// A feedback comb with a fractional, moving delay and damping inside the loop.
 #[derive(Debug, Clone, Default)]
 struct Comb {
@@ -249,6 +286,8 @@ struct Comb {
     buffer: Vec<f64>,
     write: usize,
     damped: f64,
+    /// The feedback path's DC level, for the DC blocker.
+    low: f64,
 }
 
 impl Comb {
@@ -261,22 +300,52 @@ impl Comb {
         self.buffer.fill(0.0);
         self.write = 0;
         self.damped = 0.0;
+        self.low = 0.0;
     }
 
-    /// `delay` is in frames and must be at least 1 and no longer than the allocated delay.
-    /// Linear interpolation and the one-pole damping both have gains of at most 1, so the loop
-    /// is stable for any `feedback` below 1 however fast the delay moves.
-    fn process(&mut self, input: f64, delay: f64, feedback: f64, damping: f64) -> f64 {
+    /// `frame.delay` is in frames and must be at least 1 and no longer than the allocated delay.
+    /// Linear interpolation, the one-pole damping and the DC blocker all have gains of at most 1,
+    /// so the loop is stable for any feedback below 1 however fast the delay moves, and the
+    /// saturator caps what goes round it, so even a hot input can't build up without bound.
+    fn process(&mut self, input: f64, frame: &CombFrame) -> f64 {
         let mask = self.buffer.len() - 1;
-        let whole = delay as usize;
-        let fraction = delay - whole as f64;
+        let whole = frame.delay as usize;
+        let fraction = frame.delay - whole as f64;
         let newer = self.buffer[(self.write + self.buffer.len() - whole) & mask];
         let older = self.buffer[(self.write + self.buffer.len() - whole - 1) & mask];
-        self.damped += damping * (newer + fraction * (older - newer) - self.damped);
-        let output = input + feedback * self.damped;
+        self.damped += frame.damping * (newer + fraction * (older - newer) - self.damped);
+        self.low += frame.dc_coefficient * (self.damped - self.low);
+        let looped = self.damped - frame.dc_block * self.low;
+        let looped = soft_knee(looped.abs(), DREAM_LOOP_KNEE, DREAM_LOOP_CEILING).copysign(looped);
+        let output = input + frame.feedback * looped;
         self.buffer[self.write] = output;
         self.write = (self.write + 1) & mask;
         output
+    }
+}
+
+/// Holds the comb's output under a ceiling with a gain that follows the stereo peak: instant
+/// down, smooth back up, so it shapes the level rather than the waveform.
+#[derive(Debug, Clone, Default)]
+struct Limiter {
+    envelope: f64,
+    release: f64,
+}
+
+impl Limiter {
+    fn reset(&mut self) {
+        self.envelope = 0.0;
+    }
+
+    /// The gain for a frame whose loudest channel is `peak`. The output is at most
+    /// `soft_knee(envelope) < DREAM_LIMIT_CEILING`, since the envelope is never below `peak`.
+    fn gain(&mut self, peak: f64, knee: f64) -> f64 {
+        self.envelope = peak.max(self.envelope * self.release);
+        if self.envelope <= knee {
+            1.0
+        } else {
+            soft_knee(self.envelope, knee, DREAM_LIMIT_CEILING) / self.envelope
+        }
     }
 }
 
@@ -285,8 +354,13 @@ impl Comb {
 struct CombFrame {
     delay: f64,
     feedback: f64,
+    damping: f64,
+    dc_coefficient: f64,
+    /// 0..1, how much of the DC blocker is in the loop.
+    dc_block: f64,
     input_scale: f64,
     wet: f64,
+    limit_knee: f64,
 }
 
 /// Everything that changes at most once per block.
@@ -554,8 +628,12 @@ pub struct Engine {
     dream_sweep: f64,
     dream_glide: f64,
     dream_damping: f64,
+    dream_top_damping: f64,
+    dream_dc_coefficient: f64,
     /// The comb delay while the sample is silent, in frames.
     dream_base_delay: f64,
+    /// Keeps the combs' output under full scale.
+    limiter: Limiter,
 }
 
 impl Engine {
@@ -580,7 +658,10 @@ impl Engine {
             dream_sweep: 0.0,
             dream_glide: 0.0,
             dream_damping: 0.0,
+            dream_top_damping: 0.0,
+            dream_dc_coefficient: 0.0,
             dream_base_delay: 1.0,
+            limiter: Limiter::default(),
         };
         engine.prepare(sample_rate);
         engine
@@ -592,7 +673,11 @@ impl Engine {
         self.declick = ((DECLICK_SECONDS * sample_rate).round() as usize).max(1);
         self.dream_base_delay = (DREAM_BASE_SECONDS * sample_rate).max(2.0);
         self.dream_glide = 1.0 - one_pole(DREAM_GLIDE_MS, sample_rate);
-        self.dream_damping = 1.0 - (-2.0 * std::f64::consts::PI * DREAM_DAMPING_HZ / sample_rate).exp();
+        let pole = |hz: f64| 1.0 - (-2.0 * std::f64::consts::PI * hz / sample_rate).exp();
+        self.dream_damping = pole(DREAM_DAMPING_HZ);
+        self.dream_top_damping = pole(DREAM_TOP_DAMPING_HZ);
+        self.dream_dc_coefficient = pole(DREAM_DC_BLOCK_HZ);
+        self.limiter.release = one_pole(DREAM_LIMIT_RELEASE_MS, sample_rate);
         for comb in &mut self.combs {
             comb.allocate(self.dream_base_delay.ceil() as usize);
         }
@@ -612,6 +697,7 @@ impl Engine {
         for comb in &mut self.combs {
             comb.reset();
         }
+        self.limiter.reset();
         self.combs_running = false;
         self.dream_sweep = 0.0;
     }
@@ -735,6 +821,17 @@ impl Engine {
             let (track_gain, add_left, add_right, envelope) = self.frame(trigger, transport.playing, &gains);
             let comb = self.dream_eater(envelope, gains.dream_eater);
             min_track_gain = min_track_gain.min(track_gain);
+            let mut eaten = [0.0f64; 2];
+            if let Some(comb) = comb {
+                for (index, channel) in channels.iter().enumerate().take(eaten.len()) {
+                    eaten[index] = self.eat(index, channel[frame], comb);
+                }
+                let loudest = eaten.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+                let safety = self.limiter.gain(loudest, comb.limit_knee);
+                for value in &mut eaten {
+                    *value *= safety;
+                }
+            }
             for (index, channel) in channels.iter_mut().enumerate() {
                 let add = match (channel_count, index) {
                     (1, _) => 0.5 * (add_left + add_right),
@@ -742,9 +839,9 @@ impl Engine {
                     (_, 1) => add_right,
                     _ => 0.0,
                 };
-                let track = match comb {
-                    Some(comb) => self.eat(index, channel[frame], comb),
-                    None => channel[frame],
+                let track = match eaten.get(index) {
+                    Some(&value) if comb.is_some() => value as f32,
+                    _ => channel[frame],
                 };
                 channel[frame] = track * track_gain + add;
             }
@@ -771,33 +868,52 @@ impl Engine {
             for comb in &mut self.combs {
                 comb.reset();
             }
+            self.limiter.reset();
             self.combs_running = true;
         }
+        let amount = amount.min(1.0) as f64;
         // The comb's effect is roughly wet times feedback, so a square-root curve on both makes it
         // grow evenly along the knob instead of hiding in its last third.
-        let drive = (amount.min(1.0) as f64).sqrt();
+        let drive = amount.sqrt();
+        // The upper range adds on top, starting gently and steepest at the end of the knob.
+        let top = ((amount - DREAM_TOP_FROM) / (1.0 - DREAM_TOP_FROM)).clamp(0.0, 1.0).powi(2);
         let sweep = self.dream_sweep.clamp(0.0, 1.0);
-        let delay = (self.dream_base_delay * (-DREAM_SWEEP_OCTAVES * drive * sweep).exp2()).max(2.0);
-        let feedback =
-            DREAM_MAX_FEEDBACK * drive * (DREAM_RESTING_FEEDBACK + (1.0 - DREAM_RESTING_FEEDBACK) * sweep);
+        let octaves = DREAM_SWEEP_OCTAVES + (DREAM_TOP_SWEEP_OCTAVES - DREAM_SWEEP_OCTAVES) * top;
+        let delay = (self.dream_base_delay * (-octaves * drive * sweep).exp2()).max(2.0);
+        let ceiling = DREAM_MAX_FEEDBACK + (DREAM_TOP_FEEDBACK - DREAM_MAX_FEEDBACK) * top;
+        let resting = DREAM_RESTING_FEEDBACK + (DREAM_TOP_RESTING_FEEDBACK - DREAM_RESTING_FEEDBACK) * top;
+        let feedback = ceiling * drive * (resting + (1.0 - resting) * sweep);
         // A feedback comb lifts a tone on a resonance by 1/(1-g) and broadband sound by
         // 1/sqrt(1-g²). Scaling the input by the geometric mean of the two keeps both within about
-        // 5.5 dB of the dry level at the highest feedback.
-        let input_scale = ((1.0 - feedback) * (1.0 - feedback * feedback).sqrt()).sqrt();
-        Some(CombFrame { delay, feedback, input_scale, wet: DREAM_MAX_WET * drive })
+        // 5.5 dB of the dry level at the highest feedback. The upper range gives some of that
+        // back so the comb hits harder, and the limiter catches the peaks.
+        let mut input_scale = ((1.0 - feedback) * (1.0 - feedback * feedback).sqrt()).sqrt();
+        if top > 0.0 {
+            input_scale = input_scale.powf(1.0 - DREAM_TOP_EASE * top);
+        }
+        Some(CombFrame {
+            delay,
+            feedback,
+            damping: self.dream_damping + (self.dream_top_damping - self.dream_damping) * top,
+            dc_coefficient: self.dream_dc_coefficient,
+            dc_block: top,
+            input_scale,
+            wet: DREAM_MAX_WET * drive + (DREAM_TOP_WET - DREAM_MAX_WET) * top,
+            limit_knee: DREAM_LIMIT_KNEE + (DREAM_TOP_LIMIT_KNEE - DREAM_LIMIT_KNEE) * top,
+        })
     }
 
-    fn eat(&mut self, channel: usize, track: f32, frame: CombFrame) -> f32 {
-        let Some(comb) = self.combs.get_mut(channel) else {
-            return track;
-        };
+    fn eat(&mut self, channel: usize, track: f32, frame: CombFrame) -> f64 {
         let dry = track as f64;
-        let wet = comb.process(dry * frame.input_scale, frame.delay, frame.feedback, self.dream_damping);
+        let Some(comb) = self.combs.get_mut(channel) else {
+            return dry;
+        };
+        let wet = comb.process(dry * frame.input_scale, &frame);
         if !wet.is_finite() {
             comb.reset();
-            return track;
+            return dry;
         }
-        (dry + frame.wet * (wet - dry)) as f32
+        dry + frame.wet * (wet - dry)
     }
 
     fn fade_gain(&self, voice: &Voice, frames: usize) -> f32 {
@@ -1454,34 +1570,132 @@ mod tests {
         let on_the_hit = moved(0, 4_800);
         let between_hits = moved(21_600, 24_000);
         assert!(on_the_hit > 0.3, "the kick sweeps the comb: {on_the_hit}");
-        assert!(between_hits < on_the_hit * 0.3, "and lets go after it: {between_hits} vs {on_the_hit}");
+        // Between hits only the release's last trace still detunes the resting comb very slightly.
+        assert!(between_hits < on_the_hit * 0.35, "and lets go after it: {between_hits} vs {on_the_hit}");
         assert!(levels[0] > 0.3 && levels[9] < 0.05, "the editor sees the sweep: {levels:?}");
     }
 
-    #[test]
-    fn dream_eater_at_full_stays_finite_bounded_and_rings_out() {
-        // Worst-case material: full-scale noise, then a full-scale tone on the comb's resting
-        // resonance, retriggered every 1/16 with the fastest attack.
+    /// Worst-case material at `amount`: full-scale noise, then a full-scale tone on the comb's
+    /// resting resonance, retriggered every 1/16 with the fastest attack. Returns the engine and
+    /// the output's peak.
+    fn worst_case(amount: f32) -> (Engine, f32) {
         let mut engine = Engine::new(RATE);
         engine.settings.rate = SyncRate::Sixteenth;
         engine.settings.attack_ms = 0.1;
         engine.settings.release_ms = 5.0;
         engine.set_sample(Some(prepared(vec![kick(300.0)])));
         engine.finish_analysis();
-        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0 };
+        let gains = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: amount };
         let frames = 4 * RATE as usize;
         let mut input = noise(frames / 2);
         input.extend(sine(1.0 / DREAM_BASE_SECONDS, frames / 2));
         let mut peak = 0.0f32;
         for (block, chunk) in input.chunks(512).enumerate() {
             let transport = TransportInfo::playing_at((block * 512) as f64 * 2.0 / RATE, 120.0, RATE);
-            let out = process_track(&mut engine, chunk, transport, full);
+            let out = process_track(&mut engine, chunk, transport, gains);
             assert!(out.iter().all(|v| v.is_finite()), "block {block}");
             peak = out.iter().fold(peak, |m, v| m.max(v.abs()));
         }
-        assert!(peak < 2.0, "stays within 6 dB of a full-scale input: {peak}");
+        (engine, peak)
+    }
 
+    #[test]
+    fn dream_eater_at_full_stays_finite_under_full_scale_and_rings_out() {
+        for amount in [0.5, 0.8, 1.0] {
+            let (_, peak) = worst_case(amount);
+            assert!(peak <= 1.0, "a full-scale input stays at or under full scale at {amount}: {peak}");
+        }
+        let (mut engine, _) = worst_case(1.0);
+        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0 };
         let tail = process_track(&mut engine, &vec![0.0; RATE as usize / 2], TransportInfo::stopped(), full);
         assert!(tail[tail.len() - 2_400..].iter().all(|v| v.abs() < 1e-6), "the comb dies away");
+    }
+
+    #[test]
+    fn dream_eater_keeps_its_original_curve_below_the_upper_range() {
+        let mut engine = Engine::new(RATE);
+        for amount in [0.01f32, 0.1, 0.25, 0.4, 0.5, 0.54] {
+            for envelope in [0.0, 0.3, 1.0] {
+                let frame = engine.dream_eater(envelope, amount).unwrap();
+                let sweep = engine.dream_sweep;
+                let drive = (amount as f64).sqrt();
+                let feedback =
+                    DREAM_MAX_FEEDBACK * drive * (DREAM_RESTING_FEEDBACK + (1.0 - DREAM_RESTING_FEEDBACK) * sweep);
+                let delay = (engine.dream_base_delay * (-DREAM_SWEEP_OCTAVES * drive * sweep).exp2()).max(2.0);
+                assert_eq!(frame.feedback, feedback);
+                assert_eq!(frame.delay, delay);
+                assert_eq!(frame.input_scale, ((1.0 - feedback) * (1.0 - feedback * feedback).sqrt()).sqrt());
+                assert_eq!(frame.wet, DREAM_MAX_WET * drive);
+                assert_eq!(frame.damping, engine.dream_damping);
+                assert_eq!(frame.dc_block, 0.0);
+            }
+        }
+        engine.dream_sweep = 1.0;
+        let full = engine.dream_eater(1.0, 1.0).unwrap();
+        assert_eq!(full.feedback, DREAM_TOP_FEEDBACK);
+        assert_eq!(full.wet, DREAM_TOP_WET);
+    }
+
+    #[test]
+    fn dream_eater_hits_harder_at_the_top_and_stays_about_as_loud() {
+        let input = track(96_000);
+        let playing = TransportInfo::playing_at(0.0, 120.0, RATE);
+        let dry = process_track(&mut kick_engine(), &input, playing, || ducking(0.0));
+        let eaten = process_track(&mut kick_engine(), &input, playing, || ducking(1.0));
+        let difference: Vec<f32> = eaten.iter().zip(&dry).map(|(a, b)| a - b).collect();
+        let change = rms(&difference) / rms(&dry);
+        let loudness = 20.0 * (rms(&eaten) / rms(&dry)).log10();
+        assert!(change > 0.45, "full Dream Eater changes the track a lot: {change}");
+        assert!(loudness.abs() < 1.0, "and keeps it within 1 dB of Off: {loudness} dB");
+        assert!(band_rms(&eaten, 5_000.0) < band_rms(&dry, 5_000.0), "without adding brightness");
+    }
+
+    #[test]
+    fn dream_eater_at_full_does_not_build_up_dc() {
+        let mut engine = kick_engine();
+        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0 };
+        let output = process_track(&mut engine, &vec![0.5; 96_000], TransportInfo::playing_at(0.0, 120.0, RATE), full);
+        let settled = &output[24_000..];
+        assert!(settled.iter().all(|&v| v <= 0.5), "an offset comes out no larger than it went in");
+    }
+
+    fn band_rms(signal: &[f32], cutoff: f64) -> f32 {
+        let mut filter = Svf::default();
+        filter.set(cutoff, RATE);
+        let high: Vec<f32> = signal.iter().map(|&v| filter.process(v as f64).1 as f32).collect();
+        rms(&high)
+    }
+
+    #[test]
+    #[ignore]
+    fn dream_eater_report() {
+        let input = track(96_000);
+        let hot: Vec<f32> = noise(96_000);
+        let playing = TransportInfo::playing_at(0.0, 120.0, RATE);
+        for (name, input) in [("track", &input), ("noise", &hot)] {
+            let dry = process_track(&mut kick_engine(), input, playing, || ducking(0.0));
+            println!(
+                "{name} off: peak {:.3}  dc {:.1e}",
+                dry.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+                dry.iter().map(|&v| v as f64).sum::<f64>() / dry.len() as f64,
+            );
+            for amount in [0.1f32, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] {
+                let eaten = process_track(&mut kick_engine(), input, playing, || ducking(amount));
+                let difference: Vec<f32> = eaten.iter().zip(&dry).map(|(a, b)| a - b).collect();
+                let mean = eaten.iter().map(|&v| v as f64).sum::<f64>() / eaten.len() as f64;
+                println!(
+                    "{name} {amount:.1}: diff {:.3}  loudness {:+.2} dB  peak {:.3}  dc {:.1e}  >5k {:+.2} dB  >10k {:+.2} dB",
+                    rms(&difference) / rms(&dry),
+                    20.0 * (rms(&eaten) / rms(&dry)).log10(),
+                    eaten.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+                    mean,
+                    20.0 * (band_rms(&eaten, 5_000.0) / band_rms(&dry, 5_000.0)).log10(),
+                    20.0 * (band_rms(&eaten, 10_000.0) / band_rms(&dry, 10_000.0)).log10(),
+                );
+            }
+        }
+        for amount in [0.5f32, 0.8, 1.0] {
+            println!("worst-case peak {amount:.1}: {:.3}", worst_case(amount).1);
+        }
     }
 }

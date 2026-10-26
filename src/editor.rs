@@ -19,6 +19,11 @@ const DISC: Color32 = Color32::from_rgb(0xf4, 0xf6, 0xff);
 const TRACK: Color32 = Color32::from_rgb(0xb4, 0xb8, 0xd0);
 const ARC: Color32 = Color32::from_rgb(0x3e, 0x4e, 0xd8);
 const PLAYHEAD: Color32 = Color32::from_rgb(0xd8, 0x5a, 0x3e);
+// Dream Eater's dark knob, the same as Dropout's The End knob in its Destroy section.
+const EATER_DISC: Color32 = Color32::from_rgb(0x6e, 0x6e, 0x6e);
+const EATER_OUTLINE: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x2a);
+const EATER_TRACK: Color32 = Color32::from_rgb(0x3f, 0x3f, 0x3f);
+const EATER_ARC: Color32 = Color32::WHITE;
 
 const ROTARY_START: f32 = std::f32::consts::PI * 1.2;
 const ROTARY_END: f32 = std::f32::consts::PI * 2.8;
@@ -69,6 +74,8 @@ struct Drawn {
     used: Rect,
     restart: Rect,
     reverse: Rect,
+    /// The second row of knobs, which ends with Dream Eater.
+    lower_knobs: Rect,
 }
 
 /// Builds one frame of the editor.
@@ -105,20 +112,21 @@ fn draw(
             // Without Restart the region just loops, so the grid spacing does nothing.
             let rate_enabled = params.restart.value();
             knob_row(ui, setter, &[
-                ("Rate", &params.rate, rate_enabled),
-                ("Depth", &params.depth, true),
-                ("Attack", &params.attack, true),
-                ("Release", &params.release, true),
-                ("Mix", &params.mix, true),
+                ("Rate", &params.rate, rate_enabled, Face::Plain),
+                ("Depth", &params.depth, true, Face::Plain),
+                ("Attack", &params.attack, true, Face::Plain),
+                ("Release", &params.release, true, Face::Plain),
+                ("Mix", &params.mix, true, Face::Plain),
             ]);
-            knob_row(ui, setter, &[
-                ("HP", &params.high_pass, true),
-                ("LP", &params.low_pass, true),
-                ("Sample Vol", &params.sample_volume, true),
-                ("Blend", &params.blend, true),
-                ("Output", &params.output, true),
+            let dream_level = shared.dream_level.load(Ordering::Relaxed);
+            let lower_knobs = knob_row(ui, setter, &[
+                ("HP", &params.high_pass, true, Face::Plain),
+                ("LP", &params.low_pass, true, Face::Plain),
+                ("Sample Vol", &params.sample_volume, true, Face::Plain),
+                ("Blend", &params.blend, true, Face::Plain),
+                ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level }),
             ]);
-            Drawn { used: ui.min_rect(), restart, reverse }
+            Drawn { used: ui.min_rect(), restart, reverse, lower_knobs }
         })
         .inner
 }
@@ -367,17 +375,26 @@ fn arc_points(center: Pos2, radius: f32, start: f32, end: f32) -> Vec<Pos2> {
         .collect()
 }
 
+/// How a knob is painted.
+#[derive(Clone, Copy, PartialEq)]
+enum Face {
+    Plain,
+    /// Dropout's Destroy treatment: a dark disc with a white arc and pointer, and `progress`
+    /// (0..1, the sample's live sweep) filling the white arc in blue from the start.
+    Eater { progress: f32 },
+}
+
 trait KnobParam {
-    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str);
+    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str, face: Face);
 }
 
 impl<P: Param> KnobParam for P {
-    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str) {
-        draw_knob(ui, setter, self, name);
+    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str, face: Face) {
+        draw_knob(ui, setter, self, name, face);
     }
 }
 
-fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name: &str) {
+fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name: &str, face: Face) {
     let width = ui.available_width().max(88.0);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 112.0), egui::Sense::click_and_drag());
     let normalized = param.modulated_normalized_value();
@@ -419,16 +436,27 @@ fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name:
     let center = Pos2::new(rect.center().x, rect.top() + dial * 0.5 + 2.0);
     let radius = dial * 0.5 - 3.0;
     let angle = ROTARY_START + normalized * (ROTARY_END - ROTARY_START);
+    let (disc, outline, track, arc, pointer, pointer_width) = match face {
+        Face::Plain => (DISC, OUTLINE, TRACK, ARC, INK, 1.5_f32),
+        Face::Eater { .. } => (EATER_DISC, EATER_OUTLINE, EATER_TRACK, EATER_ARC, EATER_ARC, 2.2),
+    };
     let painter = ui.painter();
-    painter.circle_filled(center, radius - 1.0, tint(DISC));
-    painter.circle_stroke(center, radius - 1.0, Stroke::new(1.0_f32, tint(OUTLINE)));
-    painter.line(arc_points(center, radius - 5.0, ROTARY_START, ROTARY_END), Stroke::new(2.0_f32, tint(TRACK)));
+    painter.circle_filled(center, radius - 1.0, tint(disc));
+    painter.circle_stroke(center, radius - 1.0, Stroke::new(1.0_f32, tint(outline)));
+    painter.line(arc_points(center, radius - 5.0, ROTARY_START, ROTARY_END), Stroke::new(2.0_f32, tint(track)));
     if normalized > 0.004 {
-        painter.line(arc_points(center, radius - 5.0, ROTARY_START, angle), Stroke::new(2.0_f32, tint(ARC)));
+        painter.line(arc_points(center, radius - 5.0, ROTARY_START, angle), Stroke::new(2.0_f32, tint(arc)));
+    }
+    if let Face::Eater { progress } = face {
+        let progress = progress.clamp(0.0, 1.0);
+        if progress > 0.004 && angle > ROTARY_START + 0.004 {
+            let filled = ROTARY_START + progress * (angle - ROTARY_START);
+            painter.line(arc_points(center, radius - 5.0, ROTARY_START, filled), Stroke::new(2.0_f32, tint(ARC)));
+        }
     }
     let inner = Pos2::new(center.x + angle.sin() * dial * 0.18, center.y - angle.cos() * dial * 0.18);
     let outer = Pos2::new(center.x + angle.sin() * dial * 0.36, center.y - angle.cos() * dial * 0.36);
-    painter.line_segment([inner, outer], Stroke::new(1.5_f32, tint(INK)));
+    painter.line_segment([inner, outer], Stroke::new(pointer_width, tint(pointer)));
 
     painter.text(
         Pos2::new(rect.center().x, rect.top() + dial + 14.0),
@@ -446,12 +474,12 @@ fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name:
     );
 }
 
-/// Draws a row of knobs, each with whether it can be used. Returns the row's area.
-fn knob_row(ui: &mut egui::Ui, setter: &ParamSetter, knobs: &[(&str, &dyn KnobParam, bool)]) -> Rect {
+/// Draws a row of knobs, each with whether it can be used and how it looks. Returns the row's area.
+fn knob_row(ui: &mut egui::Ui, setter: &ParamSetter, knobs: &[(&str, &dyn KnobParam, bool, Face)]) -> Rect {
     let width = ui.available_width();
     let height = 118.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    for (index, (name, param, enabled)) in knobs.iter().enumerate() {
+    for (index, (name, param, enabled, face)) in knobs.iter().enumerate() {
         let center_x = rect.left() + width * (index as f32 + 0.5) / KNOB_COLUMNS;
         let slot = Rect::from_center_size(Pos2::new(center_x, rect.center().y), egui::vec2(120.0, height));
         let mut builder = egui::UiBuilder::new()
@@ -461,7 +489,7 @@ fn knob_row(ui: &mut egui::Ui, setter: &ParamSetter, knobs: &[(&str, &dyn KnobPa
         if !enabled {
             builder = builder.disabled();
         }
-        ui.allocate_new_ui(builder, |ui| param.draw(ui, setter, name));
+        ui.allocate_new_ui(builder, |ui| param.draw(ui, setter, name, *face));
     }
     rect
 }
@@ -501,13 +529,15 @@ mod tests {
         host: Host,
         context: egui::Context,
         time: f64,
+        /// Everything painted in the last frame.
+        shapes: Vec<egui::Shape>,
     }
 
     impl Screen {
         fn new() -> Self {
             let context = egui::Context::default();
             configure(&context);
-            Screen { host: Host::default(), context, time: 0.0 }
+            Screen { host: Host::default(), context, time: 0.0, shapes: Vec::new() }
         }
 
         fn frame<R>(&mut self, events: Vec<egui::Event>, mut ui: impl FnMut(&egui::Context, &ParamSetter) -> R) -> R {
@@ -520,8 +550,29 @@ mod tests {
             };
             let setter = ParamSetter::new(&self.host);
             let mut result = None;
-            let _ = self.context.run(input, |context| result = Some(ui(context, &setter)));
+            let output = self.context.run(input, |context| result = Some(ui(context, &setter)));
+            fn flatten(shape: egui::Shape, into: &mut Vec<egui::Shape>) {
+                match shape {
+                    egui::Shape::Vec(shapes) => shapes.into_iter().for_each(|shape| flatten(shape, into)),
+                    shape => into.push(shape),
+                }
+            }
+            self.shapes.clear();
+            for clipped in output.shapes {
+                flatten(clipped.shape, &mut self.shapes);
+            }
             result.unwrap()
+        }
+
+        /// Centres of the filled discs painted in `color`.
+        fn discs(&self, color: Color32) -> Vec<Pos2> {
+            self.shapes
+                .iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Circle(circle) if circle.fill == color => Some(circle.center),
+                    _ => None,
+                })
+                .collect()
         }
 
         fn take_edits(&self) -> Vec<(ParamPtr, f32)> {
@@ -627,7 +678,7 @@ mod tests {
             let row = |screen: &mut Screen, events| {
                 screen.frame(events, |context, setter| {
                     egui::CentralPanel::default()
-                        .show(context, |ui| knob_row(ui, setter, &[("Rate", &plugin.params.rate, enabled)]))
+                        .show(context, |ui| knob_row(ui, setter, &[("Rate", &plugin.params.rate, enabled, Face::Plain)]))
                         .inner
                 })
             };
@@ -647,5 +698,41 @@ mod tests {
                 assert!(edits.is_empty(), "a disabled knob does nothing: {edits:?}");
             }
         }
+    }
+
+    #[test]
+    fn dream_eater_sits_where_output_was_with_the_destroy_look() {
+        let mut editor = Editor::new(true);
+        let row = editor.settle().lower_knobs;
+        let last_column = row.left() + row.width() * 4.5 / KNOB_COLUMNS;
+
+        let dark = editor.screen.discs(EATER_DISC);
+        assert_eq!(dark.len(), 1, "only Dream Eater is dark: {dark:?}");
+        assert!((dark[0].x - last_column).abs() < 1.0 && row.contains(dark[0]), "last knob of the lower row");
+        assert_eq!(editor.screen.discs(DISC).len(), 9, "the other knobs keep their light face");
+        let white_pointer = editor.screen.shapes.iter().any(|shape| {
+            matches!(shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == EATER_ARC && stroke.width == 2.2)
+        });
+        assert!(white_pointer, "a thicker white pointer");
+        let texts: Vec<String> = editor
+            .screen
+            .shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) if (text.pos.x - last_column).abs() < 60.0 && row.contains(text.pos) => {
+                    Some(text.galley.text().to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&"Off".to_owned()) && texts.contains(&"DREAM EATER".to_owned()), "{texts:?}");
+
+        editor.screen.take_edits();
+        let knob = Pos2::new(last_column, row.top() + 40.0);
+        let up = |by: f32| knob - egui::vec2(0.0, by);
+        editor.play(vec![moved(knob), button(knob, true), moved(up(20.0)), moved(up(40.0)), button(up(40.0), false)]);
+        let dream = editor.plugin.params.dream_eater.as_ptr();
+        let edits = editor.screen.take_edits();
+        assert!(edits.iter().any(|&(param, value)| param == dream && value > 0.0), "{edits:?}");
     }
 }

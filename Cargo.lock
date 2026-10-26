@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "ghostpump_vst"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "base64",
  "nih_plug",

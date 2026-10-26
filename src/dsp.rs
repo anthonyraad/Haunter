@@ -15,6 +15,21 @@ pub const MIN_REGION_FRAMES: usize = 32;
 const ANALYSIS_BUDGET: usize = 32_768;
 const DECLICK_SECONDS: f64 = 0.001;
 
+/// Dream Eater's comb delay while the sample is silent. 9 ms puts the lowest resonance near 111 Hz.
+const DREAM_BASE_SECONDS: f64 = 0.009;
+/// How far the sample's peak shortens the comb delay at full Dream Eater, in octaves.
+const DREAM_SWEEP_OCTAVES: f64 = 3.0;
+/// Comb feedback at full Dream Eater and the sample's peak. Kept below 1 so the comb always decays.
+const DREAM_MAX_FEEDBACK: f64 = 0.85;
+/// The feedback left between hits, as a share of the feedback at the peak.
+const DREAM_RESTING_FEEDBACK: f64 = 0.35;
+/// Comb level in the output at full Dream Eater. The rest is the dry track.
+const DREAM_MAX_WET: f64 = 0.8;
+/// Glide on the envelope before it moves the delay, so a fast attack sweeps instead of jumping.
+const DREAM_GLIDE_MS: f32 = 8.0;
+/// Low-pass in the comb's feedback path, so high resonances die away first.
+const DREAM_DAMPING_HZ: f64 = 7_000.0;
+
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncRate {
     #[id = "1/1"]
@@ -227,6 +242,53 @@ impl EnvelopeFollower {
     }
 }
 
+/// A feedback comb with a fractional, moving delay and damping inside the loop.
+#[derive(Debug, Clone, Default)]
+struct Comb {
+    /// A power-of-two ring buffer of past outputs.
+    buffer: Vec<f64>,
+    write: usize,
+    damped: f64,
+}
+
+impl Comb {
+    fn allocate(&mut self, longest_delay: usize) {
+        self.buffer = vec![0.0; (longest_delay + 2).next_power_of_two()];
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.buffer.fill(0.0);
+        self.write = 0;
+        self.damped = 0.0;
+    }
+
+    /// `delay` is in frames and must be at least 1 and no longer than the allocated delay.
+    /// Linear interpolation and the one-pole damping both have gains of at most 1, so the loop
+    /// is stable for any `feedback` below 1 however fast the delay moves.
+    fn process(&mut self, input: f64, delay: f64, feedback: f64, damping: f64) -> f64 {
+        let mask = self.buffer.len() - 1;
+        let whole = delay as usize;
+        let fraction = delay - whole as f64;
+        let newer = self.buffer[(self.write + self.buffer.len() - whole) & mask];
+        let older = self.buffer[(self.write + self.buffer.len() - whole - 1) & mask];
+        self.damped += damping * (newer + fraction * (older - newer) - self.damped);
+        let output = input + feedback * self.damped;
+        self.buffer[self.write] = output;
+        self.write = (self.write + 1) & mask;
+        output
+    }
+}
+
+/// Dream Eater's comb settings for one frame.
+#[derive(Debug, Clone, Copy)]
+struct CombFrame {
+    delay: f64,
+    feedback: f64,
+    input_scale: f64,
+    wet: f64,
+}
+
 /// Everything that changes at most once per block.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
@@ -271,12 +333,13 @@ pub struct FrameGains {
     pub mix: f32,
     /// Sample volume times sample blend.
     pub sample_level: f32,
-    pub output: f32,
+    /// 0..1, how hard the sample's envelope drives the comb on the track. 0 bypasses the comb.
+    pub dream_eater: f32,
 }
 
 impl Default for FrameGains {
     fn default() -> Self {
-        FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, output: 1.0 }
+        FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 }
     }
 }
 
@@ -300,10 +363,12 @@ impl TransportInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BlockReport {
-    /// The lowest gain applied to the track in this block, before output gain.
+    /// The lowest ducking gain applied to the track in this block.
     pub min_track_gain: f32,
     /// Playback position as a fraction of the sample, if a voice is sounding.
     pub playhead: Option<f32>,
+    /// 0..1, how far the sample is currently sweeping the Dream Eater comb. 0 while it is off.
+    pub dream_level: f32,
 }
 
 type Region = (usize, usize);
@@ -481,6 +546,16 @@ pub struct Engine {
     declick: usize,
     region: Region,
     was_playing: bool,
+    /// Dream Eater's combs on the track, left and right.
+    combs: [Comb; 2],
+    /// Whether the combs ran last frame. They start from silence each time Dream Eater comes on.
+    combs_running: bool,
+    /// The ducking envelope, glided, as it moves the combs.
+    dream_sweep: f64,
+    dream_glide: f64,
+    dream_damping: f64,
+    /// The comb delay while the sample is silent, in frames.
+    dream_base_delay: f64,
 }
 
 impl Engine {
@@ -500,14 +575,27 @@ impl Engine {
             declick: 1,
             region: (0, 0),
             was_playing: false,
+            combs: Default::default(),
+            combs_running: false,
+            dream_sweep: 0.0,
+            dream_glide: 0.0,
+            dream_damping: 0.0,
+            dream_base_delay: 1.0,
         };
         engine.prepare(sample_rate);
         engine
     }
 
+    /// Sets the sample rate and allocates for it. Not for the audio thread.
     pub fn prepare(&mut self, sample_rate: f64) {
         self.sample_rate = sample_rate;
         self.declick = ((DECLICK_SECONDS * sample_rate).round() as usize).max(1);
+        self.dream_base_delay = (DREAM_BASE_SECONDS * sample_rate).max(2.0);
+        self.dream_glide = 1.0 - one_pole(DREAM_GLIDE_MS, sample_rate);
+        self.dream_damping = 1.0 - (-2.0 * std::f64::consts::PI * DREAM_DAMPING_HZ / sample_rate).exp();
+        for comb in &mut self.combs {
+            comb.allocate(self.dream_base_delay.ceil() as usize);
+        }
         self.reset();
     }
 
@@ -521,6 +609,11 @@ impl Engine {
         self.follower.reset();
         self.raw_follower.reset();
         self.was_playing = false;
+        for comb in &mut self.combs {
+            comb.reset();
+        }
+        self.combs_running = false;
+        self.dream_sweep = 0.0;
     }
 
     pub fn sample_rate(&self) -> f64 {
@@ -608,7 +701,8 @@ impl Engine {
         }
     }
 
-    /// Ducks `channels` in place and mixes in the sample. `gains` is called once per frame.
+    /// Runs Dream Eater's comb over the track, ducks `channels` in place, and mixes in the sample.
+    /// `gains` is called once per frame.
     pub fn process(
         &mut self,
         channels: &mut [&mut [f32]],
@@ -638,7 +732,8 @@ impl Engine {
                 None => std::mem::take(&mut start_loop),
             };
             let gains = gains();
-            let (track_gain, add_left, add_right) = self.frame(trigger, transport.playing, &gains);
+            let (track_gain, add_left, add_right, envelope) = self.frame(trigger, transport.playing, &gains);
+            let comb = self.dream_eater(envelope, gains.dream_eater);
             min_track_gain = min_track_gain.min(track_gain);
             for (index, channel) in channels.iter_mut().enumerate() {
                 let add = match (channel_count, index) {
@@ -647,7 +742,11 @@ impl Engine {
                     (_, 1) => add_right,
                     _ => 0.0,
                 };
-                channel[frame] = (channel[frame] * track_gain + add) * gains.output;
+                let track = match comb {
+                    Some(comb) => self.eat(index, channel[frame], comb),
+                    None => channel[frame],
+                };
+                channel[frame] = track * track_gain + add;
             }
         }
 
@@ -655,17 +754,60 @@ impl Engine {
             (Some(sample), Some(voice)) if sample.frames() > 0 => Some(voice.pos as f32 / sample.frames() as f32),
             _ => None,
         };
-        BlockReport { min_track_gain, playhead }
+        let dream_level = if self.combs_running { self.dream_sweep.clamp(0.0, 1.0) as f32 } else { 0.0 };
+        BlockReport { min_track_gain, playhead, dream_level }
+    }
+
+    /// Glides the envelope and turns it into this frame's comb settings, or `None` when Dream Eater
+    /// is off and the track should pass untouched.
+    fn dream_eater(&mut self, envelope: f32, amount: f32) -> Option<CombFrame> {
+        self.dream_sweep += self.dream_glide * (envelope as f64 - self.dream_sweep);
+        if amount.is_nan() || amount <= 0.0 {
+            self.combs_running = false;
+            return None;
+        }
+        // A comb that was bypassed holds stale audio, so it starts again from silence.
+        if !self.combs_running {
+            for comb in &mut self.combs {
+                comb.reset();
+            }
+            self.combs_running = true;
+        }
+        // The comb's effect is roughly wet times feedback, so a square-root curve on both makes it
+        // grow evenly along the knob instead of hiding in its last third.
+        let drive = (amount.min(1.0) as f64).sqrt();
+        let sweep = self.dream_sweep.clamp(0.0, 1.0);
+        let delay = (self.dream_base_delay * (-DREAM_SWEEP_OCTAVES * drive * sweep).exp2()).max(2.0);
+        let feedback =
+            DREAM_MAX_FEEDBACK * drive * (DREAM_RESTING_FEEDBACK + (1.0 - DREAM_RESTING_FEEDBACK) * sweep);
+        // A feedback comb lifts a tone on a resonance by 1/(1-g) and broadband sound by
+        // 1/sqrt(1-g²). Scaling the input by the geometric mean of the two keeps both within about
+        // 5.5 dB of the dry level at the highest feedback.
+        let input_scale = ((1.0 - feedback) * (1.0 - feedback * feedback).sqrt()).sqrt();
+        Some(CombFrame { delay, feedback, input_scale, wet: DREAM_MAX_WET * drive })
+    }
+
+    fn eat(&mut self, channel: usize, track: f32, frame: CombFrame) -> f32 {
+        let Some(comb) = self.combs.get_mut(channel) else {
+            return track;
+        };
+        let dry = track as f64;
+        let wet = comb.process(dry * frame.input_scale, frame.delay, frame.feedback, self.dream_damping);
+        if !wet.is_finite() {
+            comb.reset();
+            return track;
+        }
+        (dry + frame.wet * (wet - dry)) as f32
     }
 
     fn fade_gain(&self, voice: &Voice, frames: usize) -> f32 {
         voice.declick_gain(self.region, self.fades_out(voice.reverse, frames), self.declick)
     }
 
-    /// Returns (track gain, sample left, sample right) for one frame.
-    fn frame(&mut self, trigger: bool, playing: bool, gains: &FrameGains) -> (f32, f32, f32) {
+    /// Returns (track gain, sample left, sample right, normalised envelope) for one frame.
+    fn frame(&mut self, trigger: bool, playing: bool, gains: &FrameGains) -> (f32, f32, f32, f32) {
         let Some(sample) = self.sample.clone() else {
-            return (1.0, 0.0, 0.0);
+            return (1.0, 0.0, 0.0, 0.0);
         };
         let frames = sample.frames();
         let region = self.region;
@@ -720,7 +862,7 @@ impl Engine {
         let normalised = if peak > 1e-9 { (level / peak).min(1.0) as f32 } else { 0.0 };
         let ducked = 1.0 - gains.depth * normalised;
         let track_gain = 1.0 - gains.mix * (1.0 - ducked);
-        (track_gain, left as f32 * gains.sample_level, right as f32 * gains.sample_level)
+        (track_gain, left as f32 * gains.sample_level, right as f32 * gains.sample_level, normalised)
     }
 }
 
@@ -775,7 +917,7 @@ mod tests {
     }
 
     fn sample_only() -> FrameGains {
-        FrameGains { depth: 0.0, mix: 0.0, sample_level: 1.0, output: 1.0 }
+        FrameGains { depth: 0.0, mix: 0.0, sample_level: 1.0, dream_eater: 0.0 }
     }
 
     /// Frames where the grid fires, found by playing a one-frame click sample.
@@ -903,7 +1045,7 @@ mod tests {
         let mut engine = Engine::new(RATE);
         engine.set_sample(Some(prepared(vec![kick(400.0)])));
         engine.finish_analysis();
-        let gains = FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, output: 1.0 };
+        let gains = FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
         let (left, right) = run(&mut engine, 24_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
         let lowest = left.iter().cloned().fold(f32::MAX, f32::min);
         assert!((lowest - 0.25).abs() < 1e-4, "75% depth leaves 25% at the peak, got {lowest}");
@@ -918,7 +1060,7 @@ mod tests {
         engine.settings.reverse = true;
         engine.set_sample(Some(prepared(vec![kick(400.0)])));
         engine.finish_analysis();
-        let gains = FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, output: 1.0 };
+        let gains = FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
         let (left, _) = run(&mut engine, 24_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
         let (deepest, lowest) =
             left.iter().cloned().enumerate().fold((0, f32::MAX), |best, (n, v)| if v < best.1 { (n, v) } else { best });
@@ -963,7 +1105,7 @@ mod tests {
             engine.settings.low_pass_hz = low_pass_hz;
             engine.set_sample(Some(prepared(vec![kick(300.0)])));
             engine.finish_analysis();
-            let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, output: 1.0 };
+            let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
             let (left, _) = run(&mut engine, 14_400, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
             left.iter().cloned().fold(f32::MAX, f32::min)
         };
@@ -989,14 +1131,14 @@ mod tests {
     }
 
     #[test]
-    fn mix_and_output_scale_the_effect() {
+    fn mix_scales_the_duck() {
         let mut engine = Engine::new(RATE);
         engine.set_sample(Some(prepared(vec![kick(400.0)])));
         engine.finish_analysis();
-        let gains = FrameGains { depth: 1.0, mix: 0.5, sample_level: 0.0, output: 0.5 };
+        let gains = FrameGains { depth: 1.0, mix: 0.5, sample_level: 0.0, dream_eater: 0.0 };
         let (left, _) = run(&mut engine, 24_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
         let lowest = left.iter().cloned().fold(f32::MAX, f32::min);
-        assert!((lowest - 0.25).abs() < 1e-4, "half the duck at half volume, got {lowest}");
+        assert!((lowest - 0.5).abs() < 1e-4, "half the duck, got {lowest}");
     }
 
     #[test]
@@ -1154,7 +1296,7 @@ mod tests {
         engine.settings.start = 0.5;
         engine.set_sample(Some(prepared(vec![sample])));
         engine.finish_analysis();
-        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, output: 1.0 };
+        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
         let (left, _) = run(&mut engine, 12_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
         let lowest = left.iter().cloned().fold(f32::MAX, f32::min);
         assert!(lowest < 1e-4, "{lowest}");
@@ -1164,7 +1306,7 @@ mod tests {
     fn stereo_samples_blend_into_matching_channels_and_mono_tracks_get_the_sum() {
         let mut engine = Engine::new(RATE);
         engine.set_sample(Some(prepared(vec![vec![0.4; 100], vec![-0.2; 100]])));
-        let gains = FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.5, output: 1.0 };
+        let gains = FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.5, dream_eater: 0.0 };
         let (left, right) = run(&mut engine, 200, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
         assert!((left[10] - 1.2).abs() < 1e-6 && (right[10] - 0.9).abs() < 1e-6);
         assert_eq!((left[150], right[150]), (1.0, 1.0));
@@ -1178,16 +1320,16 @@ mod tests {
     #[test]
     fn no_sample_passes_audio_through() {
         let mut engine = Engine::new(RATE);
-        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 1.0, output: 0.5 };
+        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 1.0, dream_eater: 0.0 };
         let (left, _) = run(&mut engine, 1_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
-        assert!(left.iter().all(|&v| v == 0.5));
+        assert!(left.iter().all(|&v| v == 1.0));
     }
 
     #[test]
     fn analysis_runs_incrementally_on_the_audio_thread() {
         let mut engine = Engine::new(RATE);
         engine.set_sample(Some(prepared(vec![kick(2_000.0)])));
-        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, output: 1.0 };
+        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
         // 96000 frames of analysis at 32768 per block takes three blocks.
         for _ in 0..3 {
             run(&mut engine, 64, TransportInfo::stopped(), gains);
@@ -1197,5 +1339,149 @@ mod tests {
         engine.analysis = PeakAnalysis::default();
         engine.finish_analysis();
         assert_eq!(engine.analysis.peak(), Some(peak));
+    }
+
+    /// Uniform noise in -1..1 from a fixed seed.
+    fn noise(frames: usize) -> Vec<f32> {
+        let mut seed = 0x2545_f491u32;
+        (0..frames)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    /// A busy stand-in for a track: a few partials plus noise.
+    fn track(frames: usize) -> Vec<f32> {
+        let partials = [sine(110.0, frames), sine(233.0, frames), sine(587.0, frames)];
+        let hiss = noise(frames);
+        (0..frames).map(|n| 0.15 * partials.iter().map(|p| p[n]).sum::<f32>() + 0.2 * hiss[n]).collect()
+    }
+
+    /// Processes `input` on both channels and returns the left output.
+    fn process_track(
+        engine: &mut Engine,
+        input: &[f32],
+        transport: TransportInfo,
+        gains: impl FnMut() -> FrameGains,
+    ) -> Vec<f32> {
+        let mut left = input.to_vec();
+        let mut right = input.to_vec();
+        engine.process(&mut [&mut left[..], &mut right[..]], &transport, gains);
+        assert_eq!(left, right);
+        left
+    }
+
+    fn kick_engine() -> Engine {
+        let mut engine = Engine::new(RATE);
+        engine.set_sample(Some(prepared(vec![kick(300.0)])));
+        engine.finish_analysis();
+        engine
+    }
+
+    fn ducking(dream_eater: f32) -> FrameGains {
+        FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater }
+    }
+
+    #[test]
+    fn dream_eater_off_leaves_the_track_bit_exact() {
+        let input = track(48_000);
+        let playing = TransportInfo::playing_at(0.0, 120.0, RATE);
+        let (gain, _) = run(&mut kick_engine(), 48_000, playing, ducking(0.0));
+        let output = process_track(&mut kick_engine(), &input, playing, || ducking(0.0));
+        for n in 0..input.len() {
+            assert_eq!(output[n], input[n] * gain[n], "only the duck touches the track, frame {n}");
+        }
+
+        // Once it is back at Off, a comb that was running leaves no trace.
+        let (mut was_on, mut never_on) = (kick_engine(), kick_engine());
+        process_track(&mut was_on, &input[..24_000], playing, || ducking(1.0));
+        process_track(&mut never_on, &input[..24_000], playing, || ducking(0.0));
+        let next_beat = TransportInfo::playing_at(1.0, 120.0, RATE);
+        assert_eq!(
+            process_track(&mut was_on, &input[24_000..], next_beat, || ducking(0.0)),
+            process_track(&mut never_on, &input[24_000..], next_beat, || ducking(0.0)),
+        );
+    }
+
+    #[test]
+    fn turning_dream_eater_up_changes_the_track_more() {
+        let input = track(96_000);
+        let playing = TransportInfo::playing_at(0.0, 120.0, RATE);
+        let dry = process_track(&mut kick_engine(), &input, playing, || ducking(0.0));
+        let change = |amount: f32| {
+            let eaten = process_track(&mut kick_engine(), &input, playing, || ducking(amount));
+            let difference: Vec<f32> = eaten.iter().zip(&dry).map(|(a, b)| a - b).collect();
+            rms(&difference) / rms(&dry)
+        };
+        let (light, half, full) = (change(0.1), change(0.5), change(1.0));
+        assert!(light > 0.02, "even a little is audible: {light}");
+        assert!(half > light * 1.5 && full > half * 1.2, "{light} < {half} < {full}");
+    }
+
+    #[test]
+    fn the_sample_sweeps_the_comb_in_time_with_its_hits() {
+        // No ducking, so the only difference between a kick and a silent sample is the sweep.
+        let input = track(96_000);
+        let playing = TransportInfo::playing_at(0.0, 120.0, RATE);
+        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0 };
+        let mut silent = Engine::new(RATE);
+        silent.set_sample(Some(prepared(vec![vec![0.0; 14_400]])));
+        silent.finish_analysis();
+        let mut kicked = kick_engine();
+        let still = process_track(&mut silent, &input, playing, full);
+        let mut swept = Vec::new();
+        let mut levels = Vec::new();
+        for chunk in 0..(96_000 / 2_400) {
+            let range = chunk * 2_400..(chunk + 1) * 2_400;
+            let transport = TransportInfo::playing_at(range.start as f64 * 2.0 / RATE, 120.0, RATE);
+            let mut left = input[range.clone()].to_vec();
+            let mut right = left.clone();
+            let report = kicked.process(&mut [&mut left[..], &mut right[..]], &transport, full);
+            swept.extend(left);
+            levels.push(report.dream_level);
+        }
+        let moved = |from: usize, to: usize| {
+            let (mut during, mut steady) = (Vec::new(), Vec::new());
+            for beat in 0..4 {
+                let range = beat * 24_000 + from..beat * 24_000 + to;
+                during.extend(swept[range.clone()].iter().zip(&still[range.clone()]).map(|(a, b)| a - b));
+                steady.extend_from_slice(&still[range]);
+            }
+            rms(&during) / rms(&steady)
+        };
+        let on_the_hit = moved(0, 4_800);
+        let between_hits = moved(21_600, 24_000);
+        assert!(on_the_hit > 0.3, "the kick sweeps the comb: {on_the_hit}");
+        assert!(between_hits < on_the_hit * 0.3, "and lets go after it: {between_hits} vs {on_the_hit}");
+        assert!(levels[0] > 0.3 && levels[9] < 0.05, "the editor sees the sweep: {levels:?}");
+    }
+
+    #[test]
+    fn dream_eater_at_full_stays_finite_bounded_and_rings_out() {
+        // Worst-case material: full-scale noise, then a full-scale tone on the comb's resting
+        // resonance, retriggered every 1/16 with the fastest attack.
+        let mut engine = Engine::new(RATE);
+        engine.settings.rate = SyncRate::Sixteenth;
+        engine.settings.attack_ms = 0.1;
+        engine.settings.release_ms = 5.0;
+        engine.set_sample(Some(prepared(vec![kick(300.0)])));
+        engine.finish_analysis();
+        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0 };
+        let frames = 4 * RATE as usize;
+        let mut input = noise(frames / 2);
+        input.extend(sine(1.0 / DREAM_BASE_SECONDS, frames / 2));
+        let mut peak = 0.0f32;
+        for (block, chunk) in input.chunks(512).enumerate() {
+            let transport = TransportInfo::playing_at((block * 512) as f64 * 2.0 / RATE, 120.0, RATE);
+            let out = process_track(&mut engine, chunk, transport, full);
+            assert!(out.iter().all(|v| v.is_finite()), "block {block}");
+            peak = out.iter().fold(peak, |m, v| m.max(v.abs()));
+        }
+        assert!(peak < 2.0, "stays within 6 dB of a full-scale input: {peak}");
+
+        let tail = process_track(&mut engine, &vec![0.0; RATE as usize / 2], TransportInfo::stopped(), full);
+        assert!(tail[tail.len() - 2_400..].iter().all(|v| v.abs() < 1e-6), "the comb dies away");
     }
 }

@@ -74,6 +74,8 @@ pub struct Shared {
     gain_reduction_db: AtomicF32,
     /// Playback position as a fraction of the sample, or negative when idle.
     playhead: AtomicF32,
+    /// 0..1, how far the sample is sweeping the Dream Eater comb right now.
+    dream_level: AtomicF32,
 }
 
 impl Shared {
@@ -89,6 +91,7 @@ impl Shared {
             reset_region: AtomicBool::new(false),
             gain_reduction_db: AtomicF32::new(0.0),
             playhead: AtomicF32::new(-1.0),
+            dream_level: AtomicF32::new(0.0),
         }
     }
 
@@ -175,8 +178,8 @@ pub struct GhostpumpParams {
 
     #[id = "mix"]
     pub mix: FloatParam,
-    #[id = "output"]
-    pub output: FloatParam,
+    #[id = "dream-eater"]
+    pub dream_eater: FloatParam,
 }
 
 fn region_param(name: &str, default: f32, seconds: Arc<AtomicF32>) -> FloatParam {
@@ -250,6 +253,27 @@ fn gain_param(name: &str, default_db: f32, min_db: f32, max_db: f32) -> FloatPar
     .with_string_to_value(formatters::s2v_f32_gain_to_db())
 }
 
+/// Whole-percent steps, so the knob is either exactly Off or at least 1%.
+fn dream_eater_param() -> FloatParam {
+    FloatParam::new("Dream Eater", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+        .with_step_size(0.01)
+        .with_smoother(SmoothingStyle::Linear(50.0))
+        .with_value_to_string(Arc::new(|value| {
+            if value <= 0.0 {
+                "Off".to_owned()
+            } else {
+                format!("{:.0}%", value * 100.0)
+            }
+        }))
+        .with_string_to_value(Arc::new(|text| {
+            let text = text.trim();
+            if text.eq_ignore_ascii_case("off") {
+                return Some(0.0);
+            }
+            text.trim_end_matches('%').trim().parse::<f32>().ok().map(|p| (p / 100.0).clamp(0.0, 1.0))
+        }))
+}
+
 impl GhostpumpParams {
     fn new(sample_seconds: Arc<AtomicF32>) -> Self {
         GhostpumpParams {
@@ -268,7 +292,7 @@ impl GhostpumpParams {
             sample_volume: gain_param("Sample Volume", 0.0, -48.0, 12.0),
             blend: percent_param("Sample Blend", 0.0),
             mix: percent_param("Mix", 1.0),
-            output: gain_param("Output", 0.0, -24.0, 12.0),
+            dream_eater: dream_eater_param(),
         }
     }
 
@@ -287,14 +311,18 @@ impl GhostpumpParams {
     }
 }
 
-/// Brings states saved before Restart and Reverse existed up to date. One-shot mode becomes
-/// Restart on and Loop mode becomes Restart off. Invert has no replacement and is dropped.
+/// Brings older states up to date. From 1.0, One-shot mode becomes Restart on and Loop mode
+/// becomes Restart off, and Invert is dropped. Up to 1.1, the Output gain is dropped, because the
+/// output is now always at unity. A state without Dream Eater loads with it Off, since parameters
+/// a state leaves out would otherwise keep whatever value they had.
 fn migrate_state(state: &mut PluginState) {
     if let Some(mode) = state.params.remove("mode") {
         let looped = matches!(&mode, ParamValue::String(id) if id == "loop") || matches!(mode, ParamValue::I32(1));
         state.params.entry("restart".to_owned()).or_insert(ParamValue::Bool(!looped));
     }
     state.params.remove("invert");
+    state.params.remove("output");
+    state.params.entry("dream-eater".to_owned()).or_insert(ParamValue::F32(0.0));
 }
 
 pub struct Ghostpump {
@@ -441,7 +469,7 @@ impl Plugin for Ghostpump {
                 depth: params.depth.smoothed.next(),
                 mix: params.mix.smoothed.next(),
                 sample_level: volume * blend,
-                output: params.output.smoothed.next(),
+                dream_eater: params.dream_eater.smoothed.next(),
             }
         });
 
@@ -452,6 +480,7 @@ impl Plugin for Ghostpump {
                 meter.store(reduction, Ordering::Relaxed);
             }
             self.shared.playhead.store(report.playhead.unwrap_or(-1.0), Ordering::Relaxed);
+            self.shared.dream_level.store(report.dream_level, Ordering::Relaxed);
         }
 
         ProcessStatus::Normal
@@ -491,7 +520,7 @@ mod tests {
         let frames = host_rate as usize;
         let mut left = vec![1.0f32; frames];
         let mut right = vec![1.0f32; frames];
-        let gains = FrameGains { depth: 0.8, mix: 1.0, sample_level: 0.5, output: 1.0 };
+        let gains = FrameGains { depth: 0.8, mix: 1.0, sample_level: 0.5, dream_eater: 0.0 };
         plugin.engine.process(
             &mut [&mut left[..], &mut right[..]],
             &TransportInfo::playing_at(0.0, 120.0, host_rate),
@@ -541,11 +570,11 @@ mod tests {
         let ids: Vec<String> = plugin.params.param_map().into_iter().map(|(id, _, _)| id).collect();
         for id in [
             "rate", "restart", "reverse", "start", "end", "depth", "attack", "release", "hp", "lp",
-            "sample-volume", "blend", "mix", "output",
+            "sample-volume", "blend", "mix", "dream-eater",
         ] {
             assert!(ids.iter().any(|known| known == id), "missing parameter {id}");
         }
-        assert!(!ids.iter().any(|id| id == "mode" || id == "invert"));
+        assert!(!ids.iter().any(|id| id == "mode" || id == "invert" || id == "output"));
         let fields = plugin.params.serialize_fields();
         assert_eq!(fields.get("sample").map(String::as_str), Some("null"));
         assert!(fields.contains_key("editor-state"));
@@ -554,12 +583,22 @@ mod tests {
     #[test]
     fn defaults() {
         let params = &Ghostpump::default().params;
-        for gain in [&params.sample_volume, &params.output] {
-            assert_eq!(gain.default_plain_value(), 1.0);
-            assert_eq!(gain.to_string(), "0.0 dB");
-            // What the host shows for the default it was given.
-            assert_eq!(gain.normalized_value_to_string(gain.default_normalized_value(), true), "0.0 dB");
-        }
+        let volume = &params.sample_volume;
+        assert_eq!(volume.default_plain_value(), 1.0);
+        assert_eq!(volume.to_string(), "0.0 dB");
+        // What the host shows for the default it was given.
+        assert_eq!(volume.normalized_value_to_string(volume.default_normalized_value(), true), "0.0 dB");
+
+        let dream = &params.dream_eater;
+        assert_eq!(dream.default_plain_value(), 0.0);
+        assert_eq!(dream.to_string(), "Off");
+        assert_eq!(dream.normalized_value_to_string(dream.default_normalized_value(), true), "Off");
+        assert_eq!(dream.normalized_value_to_string(0.004, true), "Off", "the knob snaps to whole percents");
+        assert_eq!(dream.normalized_value_to_string(0.01, true), "1%");
+        assert_eq!(dream.normalized_value_to_string(1.0, true), "100%");
+        assert_eq!(dream.string_to_normalized_value("off"), Some(0.0));
+        assert_eq!(dream.string_to_normalized_value("40%"), Some(0.4));
+
         assert!(params.restart.value() && params.restart.default_plain_value());
         assert!(!params.reverse.value());
         let settings = params.settings();
@@ -589,11 +628,68 @@ mod tests {
             assert!(matches!(state.params.get("depth"), Some(ParamValue::F32(v)) if *v == 0.5), "other parameters are kept");
         }
 
-        let mut current = PluginState { version: "1.1.0".into(), params: BTreeMap::new(), fields: BTreeMap::new() };
+        let mut current = PluginState { version: "1.2.0".into(), params: BTreeMap::new(), fields: BTreeMap::new() };
         current.params.insert("restart".to_owned(), ParamValue::Bool(false));
+        current.params.insert("dream-eater".to_owned(), ParamValue::F32(0.4));
         let before = format!("{:?}", current.params);
         Ghostpump::filter_state(&mut current);
         assert_eq!(format!("{:?}", current.params), before, "new states are left alone");
+    }
+
+    /// A project saved by 1.1, with Output turned down and a sample embedded.
+    fn state_from_1_1() -> PluginState {
+        let mut params = BTreeMap::new();
+        for (id, value) in [
+            ("rate", ParamValue::String("1/8".into())),
+            ("restart", ParamValue::Bool(false)),
+            ("reverse", ParamValue::Bool(true)),
+            ("start", ParamValue::F32(0.1)),
+            ("end", ParamValue::F32(0.9)),
+            ("depth", ParamValue::F32(0.5)),
+            ("attack", ParamValue::F32(2.0)),
+            ("release", ParamValue::F32(120.0)),
+            ("hp", ParamValue::F32(HP_OFF_HZ)),
+            ("lp", ParamValue::F32(LP_OFF_HZ)),
+            ("sample-volume", ParamValue::F32(1.0)),
+            ("blend", ParamValue::F32(0.0)),
+            ("mix", ParamValue::F32(1.0)),
+            ("output", ParamValue::F32(0.5)),
+        ] {
+            params.insert(id.to_owned(), value);
+        }
+        let donor = Ghostpump::default();
+        install_sample(kick(44_100.0), &donor.params, &donor.shared);
+        PluginState { version: "1.1.0".into(), params, fields: donor.params.serialize_fields() }
+    }
+
+    #[test]
+    fn states_from_1_1_load_with_output_dropped_and_dream_eater_off() {
+        let mut state = state_from_1_1();
+        Ghostpump::filter_state(&mut state);
+        assert!(!state.params.contains_key("output"), "Output no longer exists");
+        assert!(matches!(state.params.get("depth"), Some(ParamValue::F32(v)) if *v == 0.5), "other parameters are kept");
+        assert!(matches!(state.params.get("dream-eater"), Some(ParamValue::F32(v)) if *v == 0.0));
+
+        // The wrapper looks each saved parameter up by ID and skips any it doesn't know, so every
+        // one must still exist with a matching type.
+        let plugin = Ghostpump::default();
+        let known: BTreeMap<String, ParamPtr> =
+            plugin.params.param_map().into_iter().map(|(id, ptr, _)| (id, ptr)).collect();
+        for (id, value) in &state.params {
+            let ptr = known.get(id).unwrap_or_else(|| panic!("{id} is not a parameter any more"));
+            let matching = matches!(
+                (ptr, value),
+                (ParamPtr::FloatParam(_), ParamValue::F32(_))
+                    | (ParamPtr::BoolParam(_), ParamValue::Bool(_))
+                    | (ParamPtr::EnumParam(_), ParamValue::String(_))
+            );
+            assert!(matching, "{id} was saved as {value:?}");
+        }
+        let dream = &plugin.params.dream_eater;
+        assert_eq!(dream.normalized_value_to_string(dream.preview_normalized(0.0), true), "Off");
+
+        plugin.params.deserialize_fields(&state.fields);
+        assert!(plugin.params.sample.read(|s| s.is_some_and(|s| s.name == "ghost kick.wav")));
     }
 
     #[test]

@@ -1,0 +1,72 @@
+# Ghostpump
+
+Ghostpump is a 64-bit Windows VST3 audio effect for Cubase. You load a sample, usually a kick or another one-shot. On every beat of a tempo-synced grid, the sample's volume shape ducks the track Ghostpump is inserted on, like sidechaining to a ghost kick. You can also blend the sample into the output, but by default you only hear the ducking.
+
+The plugin is `release/Ghostpump.vst3`.
+
+## Install in Cubase
+
+1. Copy the whole `release\Ghostpump.vst3` folder to `C:\Program Files\Common Files\VST3\`. You need administrator rights for that folder.
+2. In Cubase, open Studio > VST Plug-in Manager and rescan, or restart Cubase.
+3. Insert Ghostpump on an audio, group, or FX channel. It is listed under Dynamics.
+4. Drag a WAV or AIFF onto the plugin window, or click **Load…**, then press play.
+
+The plugin works in stereo or mono and adds no latency. The C runtime is linked statically, so nothing else needs installing.
+
+## How it works
+
+While the transport plays, Ghostpump starts the sample on every line of the tempo grid. Grid lines are counted from the start of the project. When the transport is stopped, nothing retriggers. A sound that is already playing finishes its pass, then stops.
+
+An envelope follower runs on the sample as it plays, after the sidechain filter. Its level is compared with its own peak over the selected region, and that sets how far the track is turned down. At the sample's loudest point, the track ducks by exactly Depth.
+
+## Controls
+
+| Control | What it does |
+| --- | --- |
+| Waveform | Shows the loaded sample. Drag the **S** and **E** handles to set the region. The orange line is the playhead. |
+| Load… | Opens a file picker for WAV or AIFF. You can also drag a file onto the window. |
+| Mode | **One-shot** plays the region once per trigger. **Loop** repeats the region until the next trigger, which restarts it from Start. |
+| Invert | Flips the shape, so the track is quiet between hits and opens up at the sample's peak. |
+| Gain reduction | Shows how far the track is turned down, in dB, before Output. |
+| Rate | Grid spacing: 1/1, 1/2, 1/4, 1/8, 1/16, each also dotted or triplet. The default is 1/4. |
+| Depth | 0–100%. How far the track ducks at the sample's peak. The default is 75%. |
+| Attack | 0.1–100 ms. How quickly the follower rises. Longer values soften the start of the duck. |
+| Release | 5–1000 ms. How quickly the follower falls. Longer values make the track recover more slowly. |
+| Mix | Dry/wet for the ducking. At 50%, the track ducks half as far. |
+| HP | High-pass on the sample before the follower, 20 Hz (Off) to 2 kHz. |
+| LP | Low-pass on the sample before the follower, 50 Hz to 20 kHz (Off). Lower it to duck from only the kick's low end. |
+| Sample Vol | The sample's level, −48 to +12 dB. |
+| Blend | How much of the sample is added to the output. The default is 0%, so you only hear the duck. |
+| Output | Output gain, −24 to +12 dB. |
+
+Start and End are automatable parameters too. They show times in milliseconds, measured within the loaded sample. Double-click a knob to reset it. Hold Shift while dragging for fine adjustment.
+
+## Samples and project state
+
+- Accepted files: WAV (8, 16, 24, or 32-bit PCM, and 32 or 64-bit float, including WAVE_FORMAT_EXTENSIBLE) and AIFF/AIFC (8–32-bit PCM, `sowt`, `fl32`, `fl64`). Only the first two channels are used. A mono file plays on both sides.
+- The sample is resampled to Cubase's sample rate with a windowed-sinc filter. The original sample is kept, so if you change the project's sample rate it is converted again from the original.
+- The sample audio itself is saved in the plugin state, inside the Cubase project or preset. The project reopens with the sample even if the original file has been moved or deleted. The audio is stored as base64-encoded 32-bit float, about 470 KB per second of stereo at 44.1 kHz. Files longer than 30 seconds are cut to 30 seconds so projects stay a reasonable size.
+
+## Build from source
+
+You need Rust with the MSVC toolchain and Visual Studio's C++ build tools.
+
+```powershell
+cargo test --release
+.\scripts\package.ps1
+```
+
+`package.ps1` runs `cargo build --release` and copies `target\release\ghostpump.dll` to `release\Ghostpump.vst3\Contents\x86_64-win\Ghostpump.vst3`.
+
+The unit tests cover:
+
+- The envelope follower's attack and release times.
+- Grid timing for straight, dotted, and triplet rates, including transport start, cycle jumps, and block-size independence.
+- One-shot versus loop playback, the Start and End region, and Depth, Invert, Mix, and the sidechain filter.
+- WAV and AIFF decoding and resampling.
+- Saving and restoring the state with the embedded sample.
+- A headless check that the editor fits its window.
+
+`cargo run --release --features standalone --example standalone -- --backend dummy` opens the editor without a host. Set `GHOSTPUMP_PREVIEW_SAMPLE` to a WAV path to load it at startup.
+
+Upstream egui-baseview ignores file drops. `vendor/egui-baseview` is a copy of the revision nih-plug uses, patched to pass dropped files to egui. See `vendor/egui-baseview/PATCHED.md`.

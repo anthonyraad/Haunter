@@ -1,0 +1,36 @@
+[package]
+name = "ghostpump_vst"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "Ghostpump, a VST3 effect that ducks a track with the volume shape of a loaded sample."
+publish = false
+
+[lib]
+name = "ghostpump"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }
+serde = { version = "1.0", features = ["derive"] }
+base64 = "0.22"
+rfd = "0.15"
+
+[dev-dependencies]
+serde_json = "1.0"
+
+[features]
+# Builds `examples/standalone.rs`, a window for checking the editor without a host.
+standalone = ["nih_plug/standalone"]
+
+[[example]]
+name = "standalone"
+required-features = ["standalone"]
+
+[patch."https://github.com/BillyDM/egui-baseview.git"]
+egui-baseview = { path = "vendor/egui-baseview" }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

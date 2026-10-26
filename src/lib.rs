@@ -1,5 +1,6 @@
 use nih_plug::params::persist::PersistentField;
 use nih_plug::prelude::*;
+use nih_plug::wrapper::state::{ParamValue, PluginState};
 use nih_plug_egui::EguiState;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,7 +11,7 @@ pub mod dsp;
 mod editor;
 pub mod sample;
 
-use dsp::{Engine, FrameGains, PlayMode, Settings, SyncRate, TransportInfo, HP_OFF_HZ, LP_OFF_HZ};
+use dsp::{Engine, FrameGains, Settings, SyncRate, TransportInfo, HP_OFF_HZ, LP_OFF_HZ};
 use sample::{EmbeddedSample, Overview, PreparedSample};
 
 /// The persisted sample. Every replacement, including one from a loaded project or preset, bumps
@@ -146,8 +147,10 @@ pub struct GhostpumpParams {
 
     #[id = "rate"]
     pub rate: EnumParam<SyncRate>,
-    #[id = "mode"]
-    pub mode: EnumParam<PlayMode>,
+    #[id = "restart"]
+    pub restart: BoolParam,
+    #[id = "reverse"]
+    pub reverse: BoolParam,
     #[id = "start"]
     pub start: FloatParam,
     #[id = "end"]
@@ -159,8 +162,6 @@ pub struct GhostpumpParams {
     pub attack: FloatParam,
     #[id = "release"]
     pub release: FloatParam,
-    #[id = "invert"]
-    pub invert: BoolParam,
 
     #[id = "hp"]
     pub high_pass: FloatParam,
@@ -233,10 +234,10 @@ fn cutoff_param(name: &str, default: f32, min: f32, max: f32, off_at: f32) -> Fl
         .with_string_to_value(formatters::s2v_f32_hz_then_khz())
 }
 
-fn gain_param(name: &str, min_db: f32, max_db: f32) -> FloatParam {
+fn gain_param(name: &str, default_db: f32, min_db: f32, max_db: f32) -> FloatParam {
     FloatParam::new(
         name,
-        util::db_to_gain(0.0),
+        util::db_to_gain(default_db),
         FloatRange::Skewed {
             min: util::db_to_gain(min_db),
             max: util::db_to_gain(max_db),
@@ -255,35 +256,45 @@ impl GhostpumpParams {
             editor_state: EguiState::from_size(editor::WIDTH, editor::HEIGHT),
             sample: SampleSlot::default(),
             rate: EnumParam::new("Rate", SyncRate::Quarter),
-            mode: EnumParam::new("Mode", PlayMode::OneShot),
+            restart: BoolParam::new("Restart", true),
+            reverse: BoolParam::new("Reverse", false),
             start: region_param("Start", 0.0, sample_seconds.clone()),
             end: region_param("End", 1.0, sample_seconds),
             depth: percent_param("Depth", 0.75),
             attack: time_param("Attack", 1.0, 0.1, 100.0),
             release: time_param("Release", 80.0, 5.0, 1000.0),
-            invert: BoolParam::new("Invert", false),
             high_pass: cutoff_param("HP", HP_OFF_HZ, HP_OFF_HZ, 2_000.0, HP_OFF_HZ),
             low_pass: cutoff_param("LP", LP_OFF_HZ, 50.0, LP_OFF_HZ, LP_OFF_HZ),
-            sample_volume: gain_param("Sample Volume", -48.0, 12.0),
+            sample_volume: gain_param("Sample Volume", 0.0, -48.0, 12.0),
             blend: percent_param("Sample Blend", 0.0),
             mix: percent_param("Mix", 1.0),
-            output: gain_param("Output", -24.0, 12.0),
+            output: gain_param("Output", 0.0, -24.0, 12.0),
         }
     }
 
     fn settings(&self) -> Settings {
         Settings {
             rate: self.rate.value(),
-            mode: self.mode.value(),
+            restart: self.restart.value(),
+            reverse: self.reverse.value(),
             start: self.start.value(),
             end: self.end.value(),
             attack_ms: self.attack.value(),
             release_ms: self.release.value(),
             high_pass_hz: self.high_pass.value(),
             low_pass_hz: self.low_pass.value(),
-            invert: self.invert.value(),
         }
     }
+}
+
+/// Brings states saved before Restart and Reverse existed up to date. One-shot mode becomes
+/// Restart on and Loop mode becomes Restart off. Invert has no replacement and is dropped.
+fn migrate_state(state: &mut PluginState) {
+    if let Some(mode) = state.params.remove("mode") {
+        let looped = matches!(&mode, ParamValue::String(id) if id == "loop") || matches!(mode, ParamValue::I32(1));
+        state.params.entry("restart".to_owned()).or_insert(ParamValue::Bool(!looped));
+    }
+    state.params.remove("invert");
 }
 
 pub struct Ghostpump {
@@ -376,6 +387,10 @@ impl Plugin for Ghostpump {
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
+    }
+
+    fn filter_state(state: &mut PluginState) {
+        migrate_state(state);
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
@@ -513,7 +528,7 @@ mod tests {
 
         for plugin in [&mut original, &mut restored] {
             plugin.engine.settings.start = 0.1;
-            plugin.engine.settings.mode = PlayMode::Loop;
+            plugin.engine.settings.restart = false;
         }
         let original_output = render(&mut original, 48_000.0);
         assert_eq!(original_output, render(&mut restored, 48_000.0));
@@ -525,14 +540,60 @@ mod tests {
         let plugin = Ghostpump::default();
         let ids: Vec<String> = plugin.params.param_map().into_iter().map(|(id, _, _)| id).collect();
         for id in [
-            "rate", "mode", "start", "end", "depth", "attack", "release", "invert", "hp", "lp",
+            "rate", "restart", "reverse", "start", "end", "depth", "attack", "release", "hp", "lp",
             "sample-volume", "blend", "mix", "output",
         ] {
             assert!(ids.iter().any(|known| known == id), "missing parameter {id}");
         }
+        assert!(!ids.iter().any(|id| id == "mode" || id == "invert"));
         let fields = plugin.params.serialize_fields();
         assert_eq!(fields.get("sample").map(String::as_str), Some("null"));
         assert!(fields.contains_key("editor-state"));
+    }
+
+    #[test]
+    fn defaults() {
+        let params = &Ghostpump::default().params;
+        for gain in [&params.sample_volume, &params.output] {
+            assert_eq!(gain.default_plain_value(), 1.0);
+            assert_eq!(gain.to_string(), "0.0 dB");
+            // What the host shows for the default it was given.
+            assert_eq!(gain.normalized_value_to_string(gain.default_normalized_value(), true), "0.0 dB");
+        }
+        assert!(params.restart.value() && params.restart.default_plain_value());
+        assert!(!params.reverse.value());
+        let settings = params.settings();
+        assert!(settings.restart && !settings.reverse);
+    }
+
+    fn old_state(mode: ParamValue) -> PluginState {
+        let mut params = BTreeMap::new();
+        params.insert("mode".to_owned(), mode);
+        params.insert("invert".to_owned(), ParamValue::Bool(true));
+        params.insert("depth".to_owned(), ParamValue::F32(0.5));
+        PluginState { version: "1.0.0".into(), params, fields: BTreeMap::new() }
+    }
+
+    #[test]
+    fn old_states_map_mode_onto_restart() {
+        for (mode, restart) in [
+            (ParamValue::String("one-shot".into()), true),
+            (ParamValue::String("loop".into()), false),
+            (ParamValue::I32(0), true),
+            (ParamValue::I32(1), false),
+        ] {
+            let mut state = old_state(mode.clone());
+            Ghostpump::filter_state(&mut state);
+            assert!(matches!(state.params.get("restart"), Some(ParamValue::Bool(r)) if *r == restart), "{mode:?}");
+            assert!(!state.params.contains_key("mode") && !state.params.contains_key("invert"));
+            assert!(matches!(state.params.get("depth"), Some(ParamValue::F32(v)) if *v == 0.5), "other parameters are kept");
+        }
+
+        let mut current = PluginState { version: "1.1.0".into(), params: BTreeMap::new(), fields: BTreeMap::new() };
+        current.params.insert("restart".to_owned(), ParamValue::Bool(false));
+        let before = format!("{:?}", current.params);
+        Ghostpump::filter_state(&mut current);
+        assert_eq!(format!("{:?}", current.params), before, "new states are left alone");
     }
 
     #[test]

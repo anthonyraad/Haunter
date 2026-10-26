@@ -9,37 +9,39 @@ The plugin is `release/Ghostpump.vst3`.
 1. Copy the whole `release\Ghostpump.vst3` folder to `C:\Program Files\Common Files\VST3\`. You need administrator rights for that folder.
 2. In Cubase, open Studio > VST Plug-in Manager and rescan, or restart Cubase.
 3. Insert Ghostpump on an audio, group, or FX channel. It is listed under Dynamics.
-4. Drag a WAV or AIFF onto the plugin window, or click **Load…**, then press play.
+4. Drag a WAV or AIFF onto the plugin window, or click **Load**, then press play.
 
 The plugin works in stereo or mono and adds no latency. The C runtime is linked statically, so nothing else needs installing.
 
 ## How it works
 
-While the transport plays, Ghostpump starts the sample on every line of the tempo grid. Grid lines are counted from the start of the project. When the transport is stopped, nothing retriggers. A sound that is already playing finishes its pass, then stops.
+With **Restart** on (the default), Ghostpump plays the selected region once from Start on every line of the tempo grid while the transport plays. Grid lines are counted from the start of the project. With Restart off, the Rate knob is greyed out and the region loops continuously from the moment the transport starts. Either way, nothing starts while the transport is stopped, and a pass that is already playing finishes, then stops.
 
-An envelope follower runs on the sample as it plays, after the sidechain filter. Its level is compared with its own peak over the selected region, and that sets how far the track is turned down. At the sample's loudest point, the track ducks by exactly Depth.
+The HP and LP filters work on the sample itself as it plays. An envelope follower runs on the filtered sample, and its level sets how far the track is turned down. Depth is measured against the unfiltered sample's peak over the region: with the filters off, the track ducks by exactly Depth at the sample's loudest point. Filtering part of the sample away makes the duck shallower, and changes what you hear through Blend.
 
 ## Controls
 
 | Control | What it does |
 | --- | --- |
 | Waveform | Shows the loaded sample. Drag the **S** and **E** handles to set the region. The orange line is the playhead. |
-| Load… | Opens a file picker for WAV or AIFF. You can also drag a file onto the window. |
-| Mode | **One-shot** plays the region once per trigger. **Loop** repeats the region until the next trigger, which restarts it from Start. |
-| Invert | Flips the shape, so the track is quiet between hits and opens up at the sample's peak. |
+| Load | Opens a file picker for WAV or AIFF. You can also drag a file onto the window. |
+| Restart | On by default. On: the region plays once from Start on every Rate step. Off: the region loops continuously while the transport plays, and Rate is disabled. |
+| Reverse | Plays the region backwards, from E to S. The ducking follows the reversed shape. |
 | Gain reduction | Shows how far the track is turned down, in dB, before Output. |
-| Rate | Grid spacing: 1/1, 1/2, 1/4, 1/8, 1/16, each also dotted or triplet. The default is 1/4. |
+| Rate | Grid spacing: 1/1, 1/2, 1/4, 1/8, 1/16, each also dotted or triplet. The default is 1/4. Only used while Restart is on. |
 | Depth | 0–100%. How far the track ducks at the sample's peak. The default is 75%. |
 | Attack | 0.1–100 ms. How quickly the follower rises. Longer values soften the start of the duck. |
 | Release | 5–1000 ms. How quickly the follower falls. Longer values make the track recover more slowly. |
 | Mix | Dry/wet for the ducking. At 50%, the track ducks half as far. |
-| HP | High-pass on the sample before the follower, 20 Hz (Off) to 2 kHz. |
-| LP | Low-pass on the sample before the follower, 50 Hz to 20 kHz (Off). Lower it to duck from only the kick's low end. |
-| Sample Vol | The sample's level, −48 to +12 dB. |
+| HP | High-pass on the sample, 20 Hz (Off) to 2 kHz. Affects both the ducking and the blended sample. Raise it on a kick to make the duck shallower. |
+| LP | Low-pass on the sample, 50 Hz to 20 kHz (Off). Affects both the ducking and the blended sample. |
+| Sample Vol | The sample's level, −48 to +12 dB. The default is 0.0 dB. |
 | Blend | How much of the sample is added to the output. The default is 0%, so you only hear the duck. |
 | Output | Output gain, −24 to +12 dB. |
 
 Start and End are automatable parameters too. They show times in milliseconds, measured within the loaded sample. Double-click a knob to reset it. Hold Shift while dragging for fine adjustment.
+
+Projects saved with version 1.0 load with One-shot mode as Restart on and Loop mode as Restart off. Invert no longer exists, so it is dropped when an old project loads.
 
 ## Samples and project state
 
@@ -62,10 +64,11 @@ The unit tests cover:
 
 - The envelope follower's attack and release times.
 - Grid timing for straight, dotted, and triplet rates, including transport start, cycle jumps, and block-size independence.
-- One-shot versus loop playback, the Start and End region, and Depth, Invert, Mix, and the sidechain filter.
+- Restart on versus off, Reverse, the Start and End region, and Depth and Mix.
+- HP and LP measurably changing both the blended sample and the ducking.
 - WAV and AIFF decoding and resampling.
-- Saving and restoring the state with the embedded sample.
-- A headless check that the editor fits its window.
+- Saving and restoring the state with the embedded sample, default values, and loading 1.0 states.
+- Headless editor checks: everything fits the window, simulated clicks on Restart and Reverse reach the host, and the Rate knob ignores input while disabled.
 
 `cargo run --release --features standalone --example standalone -- --backend dummy` opens the editor without a host. Set `GHOSTPUMP_PREVIEW_SAMPLE` to a WAV path to load it at startup.
 

@@ -89,16 +89,6 @@ impl SyncRate {
     }
 }
 
-#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlayMode {
-    #[id = "one-shot"]
-    #[name = "One-shot"]
-    OneShot,
-    #[id = "loop"]
-    #[name = "Loop"]
-    Loop,
-}
-
 /// Fires once for every grid line, on the frame nearest to it.
 #[derive(Debug, Default, Clone)]
 pub struct GridClock {
@@ -164,19 +154,27 @@ impl Svf {
     }
 }
 
-/// High-pass then low-pass on the sample before it reaches the follower.
+/// High-pass then low-pass on the sample as it plays, before it is heard or followed.
 #[derive(Debug, Clone, Default)]
-pub struct KeyFilter {
+pub struct SampleFilter {
     high_pass: Svf,
     low_pass: Svf,
     high_pass_on: bool,
     low_pass_on: bool,
 }
 
-impl KeyFilter {
+impl SampleFilter {
     pub fn set(&mut self, high_pass_hz: f32, low_pass_hz: f32, sample_rate: f64) {
-        self.high_pass_on = high_pass_hz > HP_OFF_HZ;
-        self.low_pass_on = low_pass_hz < LP_OFF_HZ;
+        let (high_pass_on, low_pass_on) = (high_pass_hz > HP_OFF_HZ, low_pass_hz < LP_OFF_HZ);
+        // A bypassed filter's state is stale, so it starts from silence when switched back in.
+        if high_pass_on && !self.high_pass_on {
+            self.high_pass.reset();
+        }
+        if low_pass_on && !self.low_pass_on {
+            self.low_pass.reset();
+        }
+        self.high_pass_on = high_pass_on;
+        self.low_pass_on = low_pass_on;
         self.high_pass.set(high_pass_hz as f64, sample_rate);
         self.low_pass.set(low_pass_hz as f64, sample_rate);
     }
@@ -233,7 +231,11 @@ impl EnvelopeFollower {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     pub rate: SyncRate,
-    pub mode: PlayMode,
+    /// On: the region plays once from the top on every grid line. Off: it loops continuously
+    /// while the transport plays, and Rate is ignored.
+    pub restart: bool,
+    /// Plays the region backwards, from End to Start.
+    pub reverse: bool,
     /// Region start as a fraction of the sample length.
     pub start: f32,
     /// Region end as a fraction of the sample length.
@@ -242,21 +244,20 @@ pub struct Settings {
     pub release_ms: f32,
     pub high_pass_hz: f32,
     pub low_pass_hz: f32,
-    pub invert: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             rate: SyncRate::Quarter,
-            mode: PlayMode::OneShot,
+            restart: true,
+            reverse: false,
             start: 0.0,
             end: 1.0,
             attack_ms: 1.0,
             release_ms: 80.0,
             high_pass_hz: HP_OFF_HZ,
             low_pass_hz: LP_OFF_HZ,
-            invert: false,
         }
     }
 }
@@ -305,11 +306,81 @@ pub struct BlockReport {
     pub playhead: Option<f32>,
 }
 
+type Region = (usize, usize);
+
+/// One pass through the region, forwards or backwards.
 #[derive(Debug, Clone, Copy)]
 struct Voice {
+    /// Forwards, the next frame to play. Backwards, one past it, so a pass starts at `end`.
     pos: usize,
+    reverse: bool,
     /// Where a fade-in started, after a trigger into the middle of the sample or a loop wrap.
     fade_in_from: Option<usize>,
+}
+
+impl Voice {
+    /// Starts at the top of the region, fading in if that is mid-sample.
+    fn trigger((start, end): Region, frames: usize, reverse: bool) -> Self {
+        let (pos, mid_sample) = if reverse { (end, end < frames) } else { (start, start > 0) };
+        Voice { pos, reverse, fade_in_from: mid_sample.then_some(pos) }
+    }
+
+    /// Starts at the top of the region again, always fading in.
+    fn wrap(region: Region, frames: usize, reverse: bool) -> Self {
+        let voice = Self::trigger(region, frames, reverse);
+        Voice { fade_in_from: Some(voice.pos), ..voice }
+    }
+
+    /// Moves a voice that the region was dragged past to the top of the region.
+    fn enter(&mut self, (start, end): Region) {
+        if self.reverse && self.pos > end {
+            *self = Voice { pos: end, reverse: true, fade_in_from: Some(end) };
+        } else if !self.reverse && self.pos < start {
+            *self = Voice { pos: start, reverse: false, fade_in_from: Some(start) };
+        }
+    }
+
+    /// Frames left in the region, counting the one about to play.
+    fn remaining(&self, (start, end): Region) -> usize {
+        if self.reverse {
+            self.pos.saturating_sub(start)
+        } else {
+            end.saturating_sub(self.pos)
+        }
+    }
+
+    /// The sample frame to play now. Only valid while `remaining` is above zero.
+    fn frame(&self) -> usize {
+        if self.reverse {
+            self.pos - 1
+        } else {
+            self.pos
+        }
+    }
+
+    fn advance(&mut self) {
+        if self.reverse {
+            self.pos -= 1;
+        } else {
+            self.pos += 1;
+        }
+    }
+
+    /// Short linear fades that stop clicks where playback starts or stops mid-waveform.
+    fn declick_gain(&self, region: Region, fades_out: bool, declick: usize) -> f32 {
+        let mut gain = 1.0;
+        if let Some(from) = self.fade_in_from {
+            let done = from.abs_diff(self.pos) + 1;
+            if done < declick {
+                gain *= done as f32 / declick as f32;
+            }
+        }
+        let left = self.remaining(region);
+        if fades_out && left < declick {
+            gain *= left as f32 / declick as f32;
+        }
+        gain
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -318,31 +389,14 @@ struct Tail {
     remaining: usize,
 }
 
-/// Short linear fades that stop clicks where playback starts or stops mid-waveform.
-fn declick_gain(pos: usize, fade_in_from: Option<usize>, end: usize, fades_out: bool, declick: usize) -> f32 {
-    let mut gain = 1.0;
-    if let Some(from) = fade_in_from {
-        let done = pos.saturating_sub(from) + 1;
-        if done < declick {
-            gain *= done as f32 / declick as f32;
-        }
-    }
-    let left = end.saturating_sub(pos);
-    if fades_out && left < declick {
-        gain *= left as f32 / declick as f32;
-    }
-    gain
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct AnalysisKey {
     sample_id: u64,
     start: usize,
     end: usize,
+    reverse: bool,
     fades_out: bool,
     declick: usize,
-    high_pass_hz: f32,
-    low_pass_hz: f32,
     attack_ms: f32,
     release_ms: f32,
 }
@@ -350,14 +404,14 @@ struct AnalysisKey {
 #[derive(Debug, Clone)]
 struct RunningAnalysis {
     key: AnalysisKey,
-    pos: usize,
-    filter: KeyFilter,
+    voice: Voice,
     follower: EnvelopeFollower,
     peak: f64,
 }
 
-/// Finds the follower's peak over the region, so Depth means "this much at the sample's peak".
-/// Runs a few thousand frames per block; settings that change mid-run start a fresh run after.
+/// Finds the follower's peak over one unfiltered pass of the region, so Depth means "this much at
+/// the sample's peak" and the filters can only take ducking away. Runs a few thousand frames per
+/// block; settings that change mid-run start a fresh run after.
 #[derive(Debug, Clone, Default)]
 struct PeakAnalysis {
     done: Option<(AnalysisKey, f64)>,
@@ -372,28 +426,26 @@ impl PeakAnalysis {
                 if self.done.map(|(key, _)| key) == Some(wanted) {
                     return;
                 }
-                let mut filter = KeyFilter::default();
-                filter.set(wanted.high_pass_hz, wanted.low_pass_hz, sample_rate);
                 let mut follower = EnvelopeFollower::default();
                 follower.set(wanted.attack_ms, wanted.release_ms, sample_rate);
-                self.running = Some(RunningAnalysis { key: wanted, pos: wanted.start, filter, follower, peak: 0.0 });
+                let voice = Voice::trigger((wanted.start, wanted.end), sample.frames(), wanted.reverse);
+                self.running = Some(RunningAnalysis { key: wanted, voice, follower, peak: 0.0 });
             }
             let run = self.running.as_mut().unwrap();
             if run.key.sample_id != sample.id {
                 self.running = None;
                 continue;
             }
-            let stop = run.key.end.min(sample.frames()).min(run.pos.saturating_add(budget));
             let key = run.key;
-            let fade_in_from = (key.start > 0).then_some(key.start);
-            for frame in run.pos..stop {
-                let gain = declick_gain(frame, fade_in_from, key.end, key.fades_out, key.declick);
-                let level = run.follower.process(run.filter.process((sample.key[frame] * gain) as f64));
+            let region = (key.start, key.end);
+            while budget > 0 && run.voice.remaining(region) > 0 {
+                let gain = run.voice.declick_gain(region, key.fades_out, key.declick);
+                let level = run.follower.process((sample.key[run.voice.frame()] * gain) as f64);
                 run.peak = run.peak.max(level);
+                run.voice.advance();
+                budget -= 1;
             }
-            budget -= stop - run.pos;
-            run.pos = stop;
-            if run.pos < run.key.end.min(sample.frames()) {
+            if run.voice.remaining(region) > 0 {
                 return;
             }
             self.done = Some((run.key, run.peak));
@@ -416,13 +468,19 @@ pub struct Engine {
     clock: GridClock,
     voice: Option<Voice>,
     tail: Option<Tail>,
-    filter: KeyFilter,
+    /// Left and right.
+    filters: [SampleFilter; 2],
+    /// Follows the filtered sample and sets the ducking.
     follower: EnvelopeFollower,
+    /// Follows the unfiltered sample, for `live_peak`.
+    raw_follower: EnvelopeFollower,
     analysis: PeakAnalysis,
-    /// Highest follower level since the sample changed, used until the analysis finishes.
+    /// Highest unfiltered follower level since the sample changed, used until the analysis
+    /// finishes.
     live_peak: f64,
     declick: usize,
-    region: (usize, usize),
+    region: Region,
+    was_playing: bool,
 }
 
 impl Engine {
@@ -434,12 +492,14 @@ impl Engine {
             clock: GridClock::default(),
             voice: None,
             tail: None,
-            filter: KeyFilter::default(),
+            filters: Default::default(),
             follower: EnvelopeFollower::default(),
+            raw_follower: EnvelopeFollower::default(),
             analysis: PeakAnalysis::default(),
             live_peak: 0.0,
             declick: 1,
             region: (0, 0),
+            was_playing: false,
         };
         engine.prepare(sample_rate);
         engine
@@ -455,8 +515,12 @@ impl Engine {
         self.clock.reset();
         self.voice = None;
         self.tail = None;
-        self.filter.reset();
+        for filter in &mut self.filters {
+            filter.reset();
+        }
         self.follower.reset();
+        self.raw_follower.reset();
+        self.was_playing = false;
     }
 
     pub fn sample_rate(&self) -> f64 {
@@ -502,19 +566,22 @@ impl Engine {
         self.region = Self::region_frames(self.settings.start, self.settings.end, frames);
     }
 
-    fn fades_out(&self, frames: usize) -> bool {
-        self.settings.mode == PlayMode::Loop || self.region.1 < frames
+    /// Whether a pass fades out at its last frame: always when looping, otherwise only when it
+    /// stops mid-sample.
+    fn fades_out(&self, reverse: bool, frames: usize) -> bool {
+        let (start, end) = self.region;
+        !self.settings.restart || if reverse { start > 0 } else { end < frames }
     }
 
     fn analysis_key(&self, sample: &PreparedSample) -> AnalysisKey {
+        let reverse = self.settings.reverse;
         AnalysisKey {
             sample_id: sample.id,
             start: self.region.0,
             end: self.region.1,
-            fades_out: self.fades_out(sample.frames()),
+            reverse,
+            fades_out: self.fades_out(reverse, sample.frames()),
             declick: self.declick,
-            high_pass_hz: self.settings.high_pass_hz,
-            low_pass_hz: self.settings.low_pass_hz,
             attack_ms: self.settings.attack_ms,
             release_ms: self.settings.release_ms,
         }
@@ -529,8 +596,11 @@ impl Engine {
 
     fn begin_block(&mut self) {
         let settings = self.settings;
-        self.filter.set(settings.high_pass_hz, settings.low_pass_hz, self.sample_rate);
+        for filter in &mut self.filters {
+            filter.set(settings.high_pass_hz, settings.low_pass_hz, self.sample_rate);
+        }
         self.follower.set(settings.attack_ms, settings.release_ms, self.sample_rate);
+        self.raw_follower.set(settings.attack_ms, settings.release_ms, self.sample_rate);
         if let Some(sample) = self.sample.clone() {
             self.update_region(sample.frames());
             let key = self.analysis_key(&sample);
@@ -549,19 +619,23 @@ impl Engine {
         let frames = channels.first().map_or(0, |channel| channel.len());
         let channel_count = channels.len();
         let interval = self.settings.rate.beats();
-        let grid = match (transport.playing, transport.beat, transport.beats_per_frame) {
-            (true, Some(beat), Some(step)) if step > 0.0 => Some((beat, step)),
+        let grid = match (self.settings.restart, transport.playing, transport.beat, transport.beats_per_frame) {
+            (true, true, Some(beat), Some(step)) if step > 0.0 => Some((beat, step)),
             _ => None,
         };
         if grid.is_none() {
             self.clock.reset();
         }
+        // Without Restart, the loop starts from the top when the transport starts, or as soon as
+        // it is needed if nothing is sounding.
+        let mut start_loop = !self.settings.restart && transport.playing && (!self.was_playing || self.voice.is_none());
+        self.was_playing = transport.playing;
 
         let mut min_track_gain = 1.0f32;
         for frame in 0..frames {
             let trigger = match grid {
                 Some((beat, step)) => self.clock.tick(beat + frame as f64 * step, step, interval),
-                None => false,
+                None => std::mem::take(&mut start_loop),
             };
             let gains = gains();
             let (track_gain, add_left, add_right) = self.frame(trigger, transport.playing, &gains);
@@ -585,7 +659,7 @@ impl Engine {
     }
 
     fn fade_gain(&self, voice: &Voice, frames: usize) -> f32 {
-        declick_gain(voice.pos, voice.fade_in_from, self.region.1, self.fades_out(frames), self.declick)
+        voice.declick_gain(self.region, self.fades_out(voice.reverse, frames), self.declick)
     }
 
     /// Returns (track gain, sample left, sample right) for one frame.
@@ -594,42 +668,43 @@ impl Engine {
             return (1.0, 0.0, 0.0);
         };
         let frames = sample.frames();
-        let (start, end) = self.region;
+        let region = self.region;
+        let reverse = self.settings.reverse;
 
         if trigger {
             if let Some(voice) = self.voice.take() {
                 self.tail = Some(Tail { voice, remaining: self.declick });
             }
-            self.voice = Some(Voice { pos: start, fade_in_from: (start > 0).then_some(start) });
+            self.voice = Some(Voice::trigger(region, frames, reverse));
         }
 
-        let (mut left, mut right, mut key) = (0.0f32, 0.0f32, 0.0f32);
+        let (mut left, mut right, mut raw_key) = (0.0f32, 0.0f32, 0.0f32);
         if let Some(mut voice) = self.voice {
-            if voice.pos < start {
-                voice = Voice { pos: start, fade_in_from: Some(start) };
-            }
-            if voice.pos < end {
+            voice.enter(region);
+            if voice.remaining(region) > 0 {
                 let gain = self.fade_gain(&voice, frames);
-                left += sample.left[voice.pos] * gain;
-                right += sample.right[voice.pos] * gain;
-                key += sample.key[voice.pos] * gain;
-                voice.pos += 1;
+                let at = voice.frame();
+                left += sample.left[at] * gain;
+                right += sample.right[at] * gain;
+                raw_key += sample.key[at] * gain;
+                voice.advance();
             }
-            self.voice = if voice.pos < end {
+            self.voice = if voice.remaining(region) > 0 {
                 Some(voice)
-            } else if self.settings.mode == PlayMode::Loop && playing {
-                Some(Voice { pos: start, fade_in_from: Some(start) })
+            } else if !self.settings.restart && playing {
+                Some(Voice::wrap(region, frames, reverse))
             } else {
                 None
             };
         }
         if let Some(mut tail) = self.tail {
-            if tail.voice.pos < end && tail.remaining > 0 {
+            if tail.voice.remaining(region) > 0 && tail.remaining > 0 {
                 let gain = self.fade_gain(&tail.voice, frames) * tail.remaining as f32 / self.declick as f32;
-                left += sample.left[tail.voice.pos] * gain;
-                right += sample.right[tail.voice.pos] * gain;
-                key += sample.key[tail.voice.pos] * gain;
-                tail.voice.pos += 1;
+                let at = tail.voice.frame();
+                left += sample.left[at] * gain;
+                right += sample.right[at] * gain;
+                raw_key += sample.key[at] * gain;
+                tail.voice.advance();
                 tail.remaining -= 1;
                 self.tail = Some(tail);
             } else {
@@ -637,14 +712,15 @@ impl Engine {
             }
         }
 
-        let level = self.follower.process(self.filter.process(key as f64));
-        self.live_peak = self.live_peak.max(level);
+        let left = self.filters[0].process(left as f64);
+        let right = self.filters[1].process(right as f64);
+        let level = self.follower.process(0.5 * (left + right));
+        self.live_peak = self.live_peak.max(self.raw_follower.process(raw_key as f64));
         let peak = self.normaliser();
         let normalised = if peak > 1e-9 { (level / peak).min(1.0) as f32 } else { 0.0 };
-        let shape = if self.settings.invert { 1.0 - normalised } else { normalised };
-        let ducked = 1.0 - gains.depth * shape;
+        let ducked = 1.0 - gains.depth * normalised;
         let track_gain = 1.0 - gains.mix * (1.0 - ducked);
-        (track_gain, left * gains.sample_level, right * gains.sample_level)
+        (track_gain, left as f32 * gains.sample_level, right as f32 * gains.sample_level)
     }
 }
 
@@ -837,16 +913,79 @@ mod tests {
     }
 
     #[test]
-    fn invert_opens_the_track_at_the_peak() {
+    fn reverse_ducks_with_the_backwards_shape() {
         let mut engine = Engine::new(RATE);
-        engine.settings.invert = true;
+        engine.settings.reverse = true;
         engine.set_sample(Some(prepared(vec![kick(400.0)])));
         engine.finish_analysis();
-        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, output: 1.0 };
+        let gains = FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, output: 1.0 };
         let (left, _) = run(&mut engine, 24_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
-        let highest = left.iter().cloned().fold(f32::MIN, f32::max);
-        assert!((highest - 1.0).abs() < 1e-4);
-        assert!(left[0] < 0.1 && left[23_999] < 0.01, "quiet sample means a ducked track");
+        let (deepest, lowest) =
+            left.iter().cloned().enumerate().fold((0, f32::MAX), |best, (n, v)| if v < best.1 { (n, v) } else { best });
+        assert!((lowest - 0.25).abs() < 1e-3, "Depth still lands at the reversed peak, got {lowest}");
+        assert!(left[100] > 0.9, "the quiet tail comes first: {}", left[100]);
+        assert!((18_000..19_200).contains(&deepest), "the kick's attack comes last, at frame {deepest}");
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        (samples.iter().map(|v| v * v).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    fn sine(freq: f64, frames: usize) -> Vec<f32> {
+        (0..frames).map(|n| (2.0 * std::f64::consts::PI * freq * n as f64 / RATE).sin() as f32).collect()
+    }
+
+    #[test]
+    fn high_and_low_pass_filter_the_blended_sample() {
+        let heard = |freq: f64, high_pass_hz: f32, low_pass_hz: f32| {
+            let mut engine = Engine::new(RATE);
+            engine.settings.high_pass_hz = high_pass_hz;
+            engine.settings.low_pass_hz = low_pass_hz;
+            engine.set_sample(Some(prepared(vec![sine(freq, 12_000)])));
+            rms(&play(&mut engine, 12_000, TransportInfo::playing_at(0.0, 120.0, RATE))[2_400..])
+        };
+        let db = |filtered: f32, open: f32| 20.0 * (filtered / open).log10();
+        let low_open = heard(60.0, HP_OFF_HZ, LP_OFF_HZ);
+        let high_open = heard(5_000.0, HP_OFF_HZ, LP_OFF_HZ);
+        assert!((low_open - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01, "Off means unfiltered: {low_open}");
+        let high_passed = db(heard(60.0, 1_000.0, LP_OFF_HZ), low_open);
+        let low_passed = db(heard(5_000.0, HP_OFF_HZ, 500.0), high_open);
+        assert!(high_passed < -30.0, "HP at 1 kHz removes a 60 Hz sample: {high_passed} dB");
+        assert!(low_passed < -30.0, "LP at 500 Hz removes a 5 kHz sample: {low_passed} dB");
+        assert!(db(heard(5_000.0, 1_000.0, LP_OFF_HZ), high_open) > -0.5, "HP passes what is above it");
+    }
+
+    #[test]
+    fn high_and_low_pass_change_the_ducking() {
+        let deepest = |high_pass_hz: f32, low_pass_hz: f32| {
+            let mut engine = Engine::new(RATE);
+            engine.settings.high_pass_hz = high_pass_hz;
+            engine.settings.low_pass_hz = low_pass_hz;
+            engine.set_sample(Some(prepared(vec![kick(300.0)])));
+            engine.finish_analysis();
+            let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, output: 1.0 };
+            let (left, _) = run(&mut engine, 14_400, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
+            left.iter().cloned().fold(f32::MAX, f32::min)
+        };
+        let open = deepest(HP_OFF_HZ, LP_OFF_HZ);
+        let high_passed = deepest(500.0, LP_OFF_HZ);
+        let low_passed = deepest(HP_OFF_HZ, 50.0);
+        assert!(open < 0.01, "full depth at the unfiltered peak: {open}");
+        assert!(high_passed > 0.7, "a 60 Hz kick barely ducks once high-passed at 500 Hz: {high_passed}");
+        assert!(low_passed > open + 0.1 && low_passed < 0.9, "LP at 50 Hz softens the duck: {low_passed}");
+    }
+
+    #[test]
+    fn switching_a_filter_back_in_starts_it_from_silence() {
+        let mut filter = SampleFilter::default();
+        filter.set(500.0, LP_OFF_HZ, RATE);
+        for _ in 0..1_000 {
+            filter.process(1.0);
+        }
+        filter.set(HP_OFF_HZ, LP_OFF_HZ, RATE);
+        assert_eq!(filter.process(0.0), 0.0);
+        filter.set(500.0, LP_OFF_HZ, RATE);
+        assert_eq!(filter.process(0.0), 0.0, "no leftover state from before it was bypassed");
     }
 
     #[test]
@@ -861,60 +1000,23 @@ mod tests {
     }
 
     #[test]
-    fn high_pass_removes_a_low_kick_from_the_key() {
+    fn restart_plays_the_region_once_per_grid_step() {
         let mut engine = Engine::new(RATE);
-        let mut sample = kick(300.0);
-        // A short 4 kHz click at the end of the kick.
-        for (n, value) in sample.iter_mut().enumerate().skip(9_600).take(480) {
-            *value += 0.05 * (2.0 * std::f64::consts::PI * 4000.0 * n as f64 / RATE).sin() as f32;
-        }
-        engine.settings.high_pass_hz = 1500.0;
-        engine.settings.release_ms = 5.0;
-        engine.set_sample(Some(prepared(vec![sample])));
-        engine.finish_analysis();
-        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, output: 1.0 };
-        let (left, _) = run(&mut engine, 14_400, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
-        let early = left[..4_800].iter().cloned().fold(f32::MAX, f32::min);
-        let click = left[9_600..10_080].iter().cloned().fold(f32::MAX, f32::min);
-        assert!(early > 0.8, "the kick's low end barely ducks once high-passed: {early}");
-        assert!(click < 0.05, "the click becomes the key: {click}");
-    }
-
-    #[test]
-    fn one_shot_plays_the_region_once_per_trigger() {
-        let mut engine = Engine::new(RATE);
+        assert!(engine.settings.restart, "Restart is on by default");
         engine.set_sample(Some(prepared(vec![ramp(1_000)])));
-        let left = play(&mut engine, 24_000, TransportInfo::playing_at(0.0, 120.0, RATE));
+        let left = play(&mut engine, 25_000, TransportInfo::playing_at(0.0, 120.0, RATE));
         for n in 0..1_000 {
             assert_eq!(left[n], (n + 1) as f32 / 1_000.0);
         }
-        assert!(left[1_000..].iter().all(|&v| v == 0.0), "silent after one pass");
+        assert!(left[1_000..24_000].iter().all(|&v| v == 0.0), "silent after one pass");
+        assert_eq!(left[24_000 + 500], 501.0 / 1_000.0, "the next quarter note starts it again");
     }
 
     #[test]
-    fn loop_repeats_the_region_until_the_next_trigger() {
+    fn restart_cuts_a_long_region_off_at_the_next_step() {
         let mut engine = Engine::new(RATE);
-        engine.settings.mode = PlayMode::Loop;
-        engine.set_sample(Some(prepared(vec![vec![0.5; 1_000]])));
-        let left = play(&mut engine, 30_000, TransportInfo::playing_at(0.0, 120.0, RATE));
-        let declick = (DECLICK_SECONDS * RATE) as usize;
-        // Away from the 1 ms fades at each wrap, the loop plays continuously.
-        for pass in 0..20 {
-            let middle = pass * 1_000 + 500;
-            assert_eq!(left[middle], 0.5, "pass {pass}");
-        }
-        assert!(left[999] < 0.5 && left[1_000] < 0.5, "wraps are declicked");
-        assert_eq!(left[1_000 + declick + 1], 0.5);
-        // The trigger at frame 24000 restarts the region from its start.
-        assert_eq!(left[24_000 + 500], 0.5);
-    }
-
-    #[test]
-    fn loop_restarts_from_the_region_start_on_each_trigger() {
-        let mut engine = Engine::new(RATE);
-        engine.settings.mode = PlayMode::Loop;
         engine.set_sample(Some(prepared(vec![ramp(10_000)])));
-        // 1/16 at 120 bpm is 6000 frames, shorter than the 10000-frame loop.
+        // 1/16 at 120 bpm is 6000 frames, shorter than the 10000-frame region.
         engine.settings.rate = SyncRate::Sixteenth;
         let left = play(&mut engine, 12_000, TransportInfo::playing_at(0.0, 120.0, RATE));
         let declick = (DECLICK_SECONDS * RATE) as usize;
@@ -924,14 +1026,94 @@ mod tests {
     }
 
     #[test]
-    fn loop_finishes_its_pass_when_the_transport_stops() {
+    fn without_restart_the_region_loops_and_ignores_the_grid() {
         let mut engine = Engine::new(RATE);
-        engine.settings.mode = PlayMode::Loop;
+        engine.settings.restart = false;
+        engine.settings.rate = SyncRate::Sixteenth;
+        engine.set_sample(Some(prepared(vec![ramp(10_000)])));
+        let left = play(&mut engine, 30_000, TransportInfo::playing_at(0.0, 120.0, RATE));
+        let declick = (DECLICK_SECONDS * RATE) as usize;
+        // No restart at the 1/16 lines (every 6000 frames): the ramp just keeps going.
+        for n in [5_999, 6_000, 6_000 + declick + 10, 12_000, 18_000, 24_000] {
+            let expected = ((n % 10_000) + 1) as f32 / 10_000.0;
+            assert_eq!(left[n], expected, "frame {n}");
+        }
+        assert!(left[9_999] < 1.0 && left[10_000] < 1.0 / 10_000.0, "wraps are declicked");
+        assert_eq!(left[10_000 + declick + 1], (declick + 2) as f32 / 10_000.0);
+        assert_eq!(left[25_000], 5_001.0 / 10_000.0, "still looping in the third pass");
+    }
+
+    #[test]
+    fn without_restart_the_loop_starts_with_the_transport() {
+        let mut engine = Engine::new(RATE);
+        engine.settings.restart = false;
+        engine.set_sample(Some(prepared(vec![ramp(1_000)])));
+        assert!(play(&mut engine, 500, TransportInfo::stopped()).iter().all(|&v| v == 0.0));
+        // Between grid lines, which only matter with Restart on.
+        let left = play(&mut engine, 2_500, TransportInfo::playing_at(0.3, 120.0, RATE));
+        assert_eq!(left[0], 1.0 / 1_000.0);
+        assert_eq!(left[500], 501.0 / 1_000.0);
+        assert_eq!(left[2_400], 401.0 / 1_000.0);
+
+        // Stopping and starting again goes back to the top of the region.
+        play(&mut engine, 100, TransportInfo::stopped());
+        let left = play(&mut engine, 100, TransportInfo::playing_at(8.0, 120.0, RATE));
+        let declick = (DECLICK_SECONDS * RATE) as usize;
+        assert_eq!(left[declick + 10], (declick + 11) as f32 / 1_000.0);
+    }
+
+    #[test]
+    fn without_restart_the_loop_finishes_its_pass_when_the_transport_stops() {
+        let mut engine = Engine::new(RATE);
+        engine.settings.restart = false;
         engine.set_sample(Some(prepared(vec![vec![0.5; 1_000]])));
         play(&mut engine, 500, TransportInfo::playing_at(0.0, 120.0, RATE));
         let left = play(&mut engine, 2_000, TransportInfo::stopped());
         assert_eq!(left[100], 0.5);
         assert!(left[500..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn reverse_plays_the_region_backwards() {
+        let mut engine = Engine::new(RATE);
+        engine.settings.reverse = true;
+        engine.set_sample(Some(prepared(vec![ramp(1_000)])));
+        let left = play(&mut engine, 2_000, TransportInfo::playing_at(0.0, 120.0, RATE));
+        // The whole sample needs no fades: it starts at the file's end and stops at its start.
+        for n in 0..1_000 {
+            assert_eq!(left[n], (1_000 - n) as f32 / 1_000.0, "frame {n}");
+        }
+        assert!(left[1_000..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn reverse_plays_a_region_from_end_to_start() {
+        let mut engine = Engine::new(RATE);
+        engine.settings.reverse = true;
+        engine.settings.start = 0.25;
+        engine.settings.end = 0.75;
+        engine.set_sample(Some(prepared(vec![ramp(8_000)])));
+        let left = play(&mut engine, 8_000, TransportInfo::playing_at(0.0, 120.0, RATE));
+        let declick = (DECLICK_SECONDS * RATE) as usize;
+        // Frame 0 plays sample frame 5999 after a short fade-in, and the pass ends at frame 2000.
+        assert!(left[0] < 6_000.0 / 8_000.0 / declick as f32 + 1e-6);
+        for n in declick..(4_000 - declick) {
+            assert_eq!(left[n], (6_000 - n) as f32 / 8_000.0, "frame {n}");
+        }
+        assert!(left[3_999] < left[4_000 - declick - 1], "fades out at the start handle");
+        assert!(left[4_000..].iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn reverse_loops_backwards_without_restart() {
+        let mut engine = Engine::new(RATE);
+        engine.settings.reverse = true;
+        engine.settings.restart = false;
+        engine.set_sample(Some(prepared(vec![ramp(1_000)])));
+        let left = play(&mut engine, 3_000, TransportInfo::playing_at(0.0, 120.0, RATE));
+        for pass in 0..3 {
+            assert_eq!(left[pass * 1_000 + 300], 700.0 / 1_000.0, "pass {pass}");
+        }
     }
 
     #[test]

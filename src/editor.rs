@@ -7,7 +7,6 @@ use nih_plug_egui::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::dsp::PlayMode;
 use crate::{load_file, GhostpumpParams, Shared};
 
 pub const WIDTH: u32 = 760;
@@ -50,6 +49,7 @@ pub fn create(params: Arc<GhostpumpParams>, shared: Arc<Shared>, state: Arc<Egui
             visuals.panel_fill = Color32::from_rgb(0xec, 0xec, 0xec);
             visuals.window_fill = Color32::from_rgb(0xd6, 0xd6, 0xd6);
             context.set_visuals(visuals);
+            configure(context);
         },
         move |context, setter, state| {
             draw(context, setter, &params, &shared, state);
@@ -58,14 +58,27 @@ pub fn create(params: Arc<GhostpumpParams>, shared: Arc<Shared>, state: Arc<Egui
     )
 }
 
-/// Builds one frame of the editor and returns the area the controls used.
+fn configure(context: &egui::Context) {
+    // Selectable labels take clicks, so one overlapping a button would swallow them.
+    context.style_mut(|style| style.interaction.selectable_labels = false);
+}
+
+/// Where one frame of the editor put things.
+#[cfg_attr(not(test), allow(dead_code))]
+struct Drawn {
+    used: Rect,
+    restart: Rect,
+    reverse: Rect,
+}
+
+/// Builds one frame of the editor.
 fn draw(
     context: &egui::Context,
     setter: &ParamSetter,
     params: &Arc<GhostpumpParams>,
     shared: &Arc<Shared>,
     state: &mut EditorState,
-) -> Rect {
+) -> Drawn {
     if shared.reset_region.swap(false, Ordering::AcqRel) {
         for (param, value) in [(&params.start, 0.0), (&params.end, 1.0)] {
             setter.begin_set_parameter(param);
@@ -87,23 +100,25 @@ fn draw(
             ui.add_space(8.0);
             waveform(ui, setter, params, shared, state, hovering_files);
             ui.add_space(10.0);
-            toggles_and_meter(ui, setter, params, shared, state);
+            let [restart, reverse] = toggles_and_meter(ui, setter, params, shared, state);
             ui.add_space(8.0);
+            // Without Restart the region just loops, so the grid spacing does nothing.
+            let rate_enabled = params.restart.value();
             knob_row(ui, setter, &[
-                ("Rate", &params.rate),
-                ("Depth", &params.depth),
-                ("Attack", &params.attack),
-                ("Release", &params.release),
-                ("Mix", &params.mix),
+                ("Rate", &params.rate, rate_enabled),
+                ("Depth", &params.depth, true),
+                ("Attack", &params.attack, true),
+                ("Release", &params.release, true),
+                ("Mix", &params.mix, true),
             ]);
             knob_row(ui, setter, &[
-                ("HP", &params.high_pass),
-                ("LP", &params.low_pass),
-                ("Sample Vol", &params.sample_volume),
-                ("Blend", &params.blend),
-                ("Output", &params.output),
+                ("HP", &params.high_pass, true),
+                ("LP", &params.low_pass, true),
+                ("Sample Vol", &params.sample_volume, true),
+                ("Blend", &params.blend, true),
+                ("Output", &params.output, true),
             ]);
-            ui.min_rect()
+            Drawn { used: ui.min_rect(), restart, reverse }
         })
         .inner
 }
@@ -119,7 +134,7 @@ fn header(ui: &mut egui::Ui, params: &Arc<GhostpumpParams>, shared: &Arc<Shared>
         ui.label(egui::RichText::new("Ghostpump").size(22.0).strong().color(INK));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = shared.loading.load(Ordering::Acquire) || state.dialog_open.load(Ordering::Acquire);
-            let button = egui::Button::new(egui::RichText::new("Load…").size(14.0).color(INK))
+            let button = egui::Button::new(egui::RichText::new("Load").size(14.0).color(INK))
                 .min_size(egui::vec2(86.0, 26.0))
                 .fill(DISC)
                 .stroke(Stroke::new(1.0_f32, OUTLINE));
@@ -283,40 +298,40 @@ fn drop_overlay(painter: &egui::Painter, rect: Rect, hovering_files: bool) {
     }
 }
 
-fn segment(ui: &mut egui::Ui, selected: bool, text: &str) -> egui::Response {
-    let (fill, color) = if selected { (ARC, DISC) } else { (DISC, INK) };
-    ui.add(
-        egui::Button::new(egui::RichText::new(text).size(13.0).color(color))
-            .min_size(egui::vec2(78.0, 26.0))
-            .fill(fill)
-            .stroke(Stroke::new(1.0_f32, OUTLINE)),
-    )
+/// A button that flips `param` and is lit while it is on. Returns where it was drawn.
+fn toggle(ui: &mut egui::Ui, setter: &ParamSetter, param: &BoolParam, text: &str, help: &str) -> Rect {
+    let on = param.value();
+    let (fill, color) = if on { (ARC, DISC) } else { (DISC, INK) };
+    let button = egui::Button::new(egui::RichText::new(text).size(13.0).color(color))
+        .min_size(egui::vec2(86.0, 26.0))
+        .fill(fill)
+        .stroke(Stroke::new(1.0_f32, OUTLINE));
+    let response = ui.add(button).on_hover_text(help);
+    if response.clicked() {
+        setter.begin_set_parameter(param);
+        setter.set_parameter(param, !on);
+        setter.end_set_parameter(param);
+    }
+    response.rect
 }
 
+/// Returns where the Restart and Reverse toggles were drawn.
 fn toggles_and_meter(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
     params: &GhostpumpParams,
     shared: &Shared,
     state: &mut EditorState,
-) {
+) -> [Rect; 2] {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("MODE").size(11.0).color(SUBTLE));
-        let mode = params.mode.value();
-        for (choice, text) in [(PlayMode::OneShot, "One-shot"), (PlayMode::Loop, "Loop")] {
-            if segment(ui, mode == choice, text).clicked() && mode != choice {
-                setter.begin_set_parameter(&params.mode);
-                setter.set_parameter(&params.mode, choice);
-                setter.end_set_parameter(&params.mode);
-            }
-        }
-        ui.add_space(16.0);
-        let invert = params.invert.value();
-        if segment(ui, invert, "Invert").clicked() {
-            setter.begin_set_parameter(&params.invert);
-            setter.set_parameter(&params.invert, !invert);
-            setter.end_set_parameter(&params.invert);
-        }
+        let restart = toggle(
+            ui,
+            setter,
+            &params.restart,
+            "Restart",
+            "On: the region starts again on every Rate step.\nOff: it loops continuously and Rate is ignored.",
+        );
+        let reverse = toggle(ui, setter, &params.reverse, "Reverse", "Plays the region backwards, from E to S.");
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let latest = shared.gain_reduction_db.swap(0.0, Ordering::Relaxed);
@@ -337,7 +352,9 @@ fn toggles_and_meter(
             ui.label(egui::RichText::new(format!("{:>5.1} dB", -state.meter_db)).monospace().color(INK));
             ui.label(egui::RichText::new("GAIN REDUCTION").size(11.0).color(SUBTLE));
         });
-    });
+        [restart, reverse]
+    })
+    .inner
 }
 
 fn arc_points(center: Pos2, radius: f32, start: f32, end: f32) -> Vec<Pos2> {
@@ -396,45 +413,72 @@ fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name:
         setter.end_set_parameter(param);
     }
 
+    let enabled = ui.is_enabled();
+    let tint = |color: Color32| if enabled { color } else { color.gamma_multiply(0.35) };
     let dial = 74.0_f32.min(rect.width() - 8.0);
     let center = Pos2::new(rect.center().x, rect.top() + dial * 0.5 + 2.0);
     let radius = dial * 0.5 - 3.0;
     let angle = ROTARY_START + normalized * (ROTARY_END - ROTARY_START);
     let painter = ui.painter();
-    painter.circle_filled(center, radius - 1.0, DISC);
-    painter.circle_stroke(center, radius - 1.0, Stroke::new(1.0_f32, OUTLINE));
-    painter.line(arc_points(center, radius - 5.0, ROTARY_START, ROTARY_END), Stroke::new(2.0_f32, TRACK));
+    painter.circle_filled(center, radius - 1.0, tint(DISC));
+    painter.circle_stroke(center, radius - 1.0, Stroke::new(1.0_f32, tint(OUTLINE)));
+    painter.line(arc_points(center, radius - 5.0, ROTARY_START, ROTARY_END), Stroke::new(2.0_f32, tint(TRACK)));
     if normalized > 0.004 {
-        painter.line(arc_points(center, radius - 5.0, ROTARY_START, angle), Stroke::new(2.0_f32, ARC));
+        painter.line(arc_points(center, radius - 5.0, ROTARY_START, angle), Stroke::new(2.0_f32, tint(ARC)));
     }
     let inner = Pos2::new(center.x + angle.sin() * dial * 0.18, center.y - angle.cos() * dial * 0.18);
     let outer = Pos2::new(center.x + angle.sin() * dial * 0.36, center.y - angle.cos() * dial * 0.36);
-    painter.line_segment([inner, outer], Stroke::new(1.5_f32, INK));
+    painter.line_segment([inner, outer], Stroke::new(1.5_f32, tint(INK)));
 
     painter.text(
         Pos2::new(rect.center().x, rect.top() + dial + 14.0),
         egui::Align2::CENTER_CENTER,
         param.to_string(),
         egui::FontId::proportional(13.0),
-        INK,
+        tint(INK),
     );
     painter.text(
         Pos2::new(rect.center().x, rect.top() + dial + 30.0),
         egui::Align2::CENTER_CENTER,
         name.to_uppercase(),
         egui::FontId::proportional(11.0),
-        SUBTLE,
+        tint(SUBTLE),
     );
+}
+
+/// Draws a row of knobs, each with whether it can be used. Returns the row's area.
+fn knob_row(ui: &mut egui::Ui, setter: &ParamSetter, knobs: &[(&str, &dyn KnobParam, bool)]) -> Rect {
+    let width = ui.available_width();
+    let height = 118.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    for (index, (name, param, enabled)) in knobs.iter().enumerate() {
+        let center_x = rect.left() + width * (index as f32 + 0.5) / KNOB_COLUMNS;
+        let slot = Rect::from_center_size(Pos2::new(center_x, rect.center().y), egui::vec2(120.0, height));
+        let mut builder = egui::UiBuilder::new()
+            .id_salt(*name)
+            .max_rect(slot)
+            .layout(egui::Layout::top_down(egui::Align::Center));
+        if !enabled {
+            builder = builder.disabled();
+        }
+        ui.allocate_new_ui(builder, |ui| param.draw(ui, setter, name));
+    }
+    rect
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
-    struct NoHost;
+    /// Records the parameter changes the editor asks the host for.
+    #[derive(Default)]
+    struct Host {
+        edits: Mutex<Vec<(ParamPtr, f32)>>,
+    }
 
-    impl GuiContext for NoHost {
+    impl GuiContext for Host {
         fn plugin_api(&self) -> PluginApi {
             PluginApi::Vst3
         }
@@ -442,7 +486,9 @@ mod tests {
             false
         }
         unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
-        unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, _normalized: f32) {}
+        unsafe fn raw_set_parameter_normalized(&self, param: ParamPtr, normalized: f32) {
+            self.edits.lock().unwrap().push((param, normalized));
+        }
         unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
         fn get_state(&self) -> PluginState {
             PluginState { version: String::new(), params: BTreeMap::new(), fields: BTreeMap::new() }
@@ -450,57 +496,156 @@ mod tests {
         fn set_state(&self, _state: PluginState) {}
     }
 
-    fn used_area(with_sample: bool) -> Rect {
-        let plugin = crate::Ghostpump::default();
-        if with_sample {
-            let kick = (0..4_800).map(|n| (n as f32 * 0.01).sin() * (1.0 - n as f32 / 4_800.0)).collect();
-            let sample = crate::sample::EmbeddedSample { name: "kick.wav".into(), sample_rate: 48_000.0, channels: vec![kick] };
-            crate::install_sample(sample, &plugin.params, &plugin.shared);
-            plugin.shared.playhead.store(0.3, Ordering::Relaxed);
-            plugin.shared.gain_reduction_db.store(9.0, Ordering::Relaxed);
+    /// A headless egui window the size of the editor.
+    struct Screen {
+        host: Host,
+        context: egui::Context,
+        time: f64,
+    }
+
+    impl Screen {
+        fn new() -> Self {
+            let context = egui::Context::default();
+            configure(&context);
+            Screen { host: Host::default(), context, time: 0.0 }
         }
-        let host = NoHost;
-        let setter = ParamSetter::new(&host);
-        let context = egui::Context::default();
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(WIDTH as f32, HEIGHT as f32))),
-            ..Default::default()
-        };
-        let mut state = EditorState::default();
-        let mut used = Rect::NOTHING;
-        // The first pass measures text, the second lays out with those sizes.
-        for _ in 0..2 {
-            let _ = context.run(input.clone(), |context| {
-                used = draw(context, &setter, &plugin.params, &plugin.shared, &mut state);
-            });
+
+        fn frame<R>(&mut self, events: Vec<egui::Event>, mut ui: impl FnMut(&egui::Context, &ParamSetter) -> R) -> R {
+            self.time += 1.0 / 60.0;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(WIDTH as f32, HEIGHT as f32))),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let setter = ParamSetter::new(&self.host);
+            let mut result = None;
+            let _ = self.context.run(input, |context| result = Some(ui(context, &setter)));
+            result.unwrap()
         }
-        used
+
+        fn take_edits(&self) -> Vec<(ParamPtr, f32)> {
+            std::mem::take(&mut *self.host.edits.lock().unwrap())
+        }
+    }
+
+    fn moved(pos: Pos2) -> Vec<egui::Event> {
+        vec![egui::Event::PointerMoved(pos)]
+    }
+
+    fn button(pos: Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }]
+    }
+
+    fn click(pos: Pos2) -> Vec<Vec<egui::Event>> {
+        vec![moved(pos), button(pos, true), button(pos, false)]
+    }
+
+    struct Editor {
+        plugin: crate::Ghostpump,
+        screen: Screen,
+        state: EditorState,
+    }
+
+    impl Editor {
+        fn new(with_sample: bool) -> Self {
+            let plugin = crate::Ghostpump::default();
+            if with_sample {
+                let kick = (0..4_800).map(|n| (n as f32 * 0.01).sin() * (1.0 - n as f32 / 4_800.0)).collect();
+                let sample =
+                    crate::sample::EmbeddedSample { name: "kick.wav".into(), sample_rate: 48_000.0, channels: vec![kick] };
+                crate::install_sample(sample, &plugin.params, &plugin.shared);
+                plugin.shared.playhead.store(0.3, Ordering::Relaxed);
+                plugin.shared.gain_reduction_db.store(9.0, Ordering::Relaxed);
+            }
+            Editor { plugin, screen: Screen::new(), state: EditorState::default() }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> Drawn {
+            let Editor { plugin, screen, state } = self;
+            screen.frame(events, |context, setter| draw(context, setter, &plugin.params, &plugin.shared, state))
+        }
+
+        /// The first pass measures text, the second lays out with those sizes.
+        fn settle(&mut self) -> Drawn {
+            self.frame(Vec::new());
+            self.frame(Vec::new())
+        }
+
+        fn play(&mut self, frames: Vec<Vec<egui::Event>>) {
+            for events in frames {
+                self.frame(events);
+            }
+        }
     }
 
     #[test]
     fn every_control_fits_in_the_window() {
         for with_sample in [false, true] {
-            let used = used_area(with_sample);
+            let used = Editor::new(with_sample).settle().used;
             assert!(used.max.x <= WIDTH as f32, "too wide: {used:?}");
             assert!(used.max.y <= HEIGHT as f32, "too tall: {used:?}");
             assert!(used.max.y > HEIGHT as f32 * 0.8, "unexpectedly short layout: {used:?}");
         }
     }
-}
 
-fn knob_row(ui: &mut egui::Ui, setter: &ParamSetter, knobs: &[(&str, &dyn KnobParam)]) {
-    let width = ui.available_width();
-    let height = 118.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    for (index, (name, param)) in knobs.iter().enumerate() {
-        let center_x = rect.left() + width * (index as f32 + 0.5) / KNOB_COLUMNS;
-        let slot = Rect::from_center_size(Pos2::new(center_x, rect.center().y), egui::vec2(120.0, height));
-        ui.allocate_new_ui(
-            egui::UiBuilder::new()
-                .id_salt(*name)
-                .max_rect(slot)
-                .layout(egui::Layout::top_down(egui::Align::Center)),
-            |ui| param.draw(ui, setter, name),
-        );
+    #[test]
+    fn restart_and_reverse_toggle_when_clicked_anywhere_on_them() {
+        let mut editor = Editor::new(true);
+        let drawn = editor.settle();
+        editor.screen.take_edits();
+        assert!(drawn.restart.width() >= 80.0 && drawn.reverse.width() >= 80.0);
+        assert!(!drawn.restart.intersects(drawn.reverse));
+        let restart = editor.plugin.params.restart.as_ptr();
+        let reverse = editor.plugin.params.reverse.as_ptr();
+
+        for rect in [drawn.reverse, drawn.reverse.shrink(3.0)] {
+            for pos in [rect.center(), rect.left_top(), rect.right_bottom()] {
+                editor.play(click(pos));
+                assert_eq!(editor.screen.take_edits(), vec![(reverse, 1.0)], "Reverse clicked at {pos:?}");
+            }
+        }
+        editor.play(click(drawn.restart.center()));
+        assert_eq!(editor.screen.take_edits(), vec![(restart, 0.0)], "Restart starts on, so a click turns it off");
+
+        // A quick click where the press and release land in the same frame.
+        let pos = drawn.reverse.center();
+        editor.frame(moved(pos));
+        editor.frame([button(pos, true), button(pos, false)].concat());
+        assert_eq!(editor.screen.take_edits(), vec![(reverse, 1.0)]);
+
+        editor.play(click(Pos2::new(drawn.reverse.right() + 20.0, drawn.reverse.center().y)));
+        assert!(editor.screen.take_edits().is_empty(), "the space beside the toggles does nothing");
+    }
+
+    #[test]
+    fn a_disabled_knob_ignores_drags_and_double_clicks() {
+        let plugin = crate::Ghostpump::default();
+        let rate = plugin.params.rate.as_ptr();
+        for enabled in [true, false] {
+            let mut screen = Screen::new();
+            let row = |screen: &mut Screen, events| {
+                screen.frame(events, |context, setter| {
+                    egui::CentralPanel::default()
+                        .show(context, |ui| knob_row(ui, setter, &[("Rate", &plugin.params.rate, enabled)]))
+                        .inner
+                })
+            };
+            let rect = row(&mut screen, Vec::new());
+            let knob = Pos2::new(rect.left() + rect.width() * 0.5 / KNOB_COLUMNS, rect.top() + 40.0);
+            for events in [moved(knob), button(knob, true), moved(knob - egui::vec2(0.0, 20.0)), moved(knob - egui::vec2(0.0, 40.0))] {
+                row(&mut screen, events);
+            }
+            row(&mut screen, button(knob - egui::vec2(0.0, 40.0), false));
+            for events in [click(knob), click(knob)].concat() {
+                row(&mut screen, events);
+            }
+            let edits = screen.take_edits();
+            if enabled {
+                assert!(edits.iter().any(|&(param, _)| param == rate), "an enabled knob turns");
+            } else {
+                assert!(edits.is_empty(), "a disabled knob does nothing: {edits:?}");
+            }
+        }
     }
 }

@@ -9,7 +9,7 @@ The plugin is `release/Haunter.vst3`.
 1. Copy the whole `release\Haunter.vst3` folder to `C:\Program Files\Common Files\VST3\`. You need administrator rights for that folder.
 2. In Cubase, open Studio > VST Plug-in Manager and rescan, or restart Cubase.
 3. Insert Haunter on an audio, group, or FX channel. It is listed under Dynamics.
-4. Choose **Water** from the preset menu, drag a WAV or AIFF onto the plugin window, or click **Load**, then press play.
+4. Choose a factory preset such as **Water** from the preset menu, drag a WAV or AIFF onto the plugin window, or click **Load**, then press play.
 
 The plugin works in stereo or mono and adds no latency. The C runtime is linked statically, so nothing else needs installing.
 
@@ -27,7 +27,7 @@ The output is always at unity gain. There is no output level control.
 
 | Control | What it does |
 | --- | --- |
-| Preset menu | `--` (no sample, default settings), the factory preset **Water**, then your saved presets. A `*` after the name means something has changed since the preset was loaded or saved. |
+| Preset menu | **Init** (no sample, default settings), the factory presets **Paper**, **Stone**, **Umber**, **Water**, and **Wind**, then your saved presets. A `*` after the name means something has changed since the preset was loaded or saved. |
 | Save | Asks for a name in place of the preset controls. Type it and press Enter or OK. Escape or Cancel closes the prompt without saving. |
 | Load | Opens a file picker for WAV or AIFF. You can also drag a file onto the window. |
 | Waveform | Shows the loaded sample. Drag the **S** and **E** handles to set the region. The orange line is the playhead. |
@@ -53,11 +53,11 @@ Projects saved with version 1.0 load with One-shot mode as Restart on and Loop m
 
 The preset menu sits left of **Save** and **Load**.
 
-- `--` is the empty preset: no sample, every setting at its default. A new Haunter starts on it. Load a sample from there as usual.
-- **Water** is a factory preset. Its sample, a 4.2-second water texture, is built into the plugin, so it works on any machine. It uses the default settings. The sample shows as "Water".
-- **Save** stores the loaded sample's audio and every setting (Start, End, Restart, Reverse, and all the knobs) as a preset with the name you type. Saved presets are listed after the factory ones and are there in every project. Saving under an existing name replaces that preset. Names can't contain `< > : " / \ | ? *` and can't be `--` or a factory preset's name. When the selected preset is one of yours, the prompt starts with its name, so pressing Enter updates it.
+- **Init** is the empty preset: no sample, every setting at its default. A new Haunter starts on it. Load a sample from there as usual. Versions before 1.4 called it `--`; projects saved on `--` reopen on Init.
+- **Paper** (20.6 s), **Stone** (8.3 s), **Umber** (10.4 s), **Water** (4.2 s), and **Wind** (5.6 s) are the factory presets, listed alphabetically. Each one's sample is built into the plugin, so they work on any machine. They use the default settings, and the sample shows under the preset's name.
+- **Save** stores the loaded sample's audio and every setting (Start, End, Restart, Reverse, and all the knobs) as a preset with the name you type. Saved presets are listed after the factory ones and are there in every project. Saving under an existing name replaces that preset. Names can't contain `< > : " / \ | ? *` and can't be `Init`, `--`, or a factory preset's name. A preset you saved before 1.4 under a name that is now a factory preset's still shows among your presets. When the selected preset is one of yours, the prompt starts with its name, so pressing Enter updates it.
 - Choosing a preset sends each setting to Cubase the same way turning a knob does, and loads its sample. Choosing the selected preset again puts it back the way it was saved.
-- The name gets a `*`, as in `Water*`, when any setting, Start or End, Restart or Reverse, or the sample differs from the preset. Choosing the preset again or saving clears it.
+- The name gets a `*`, as in `Water*` or `Init*`, when any setting, Start or End, Restart or Reverse, or the sample differs from the preset. Choosing the preset again or saving clears it.
 - The selected preset's name, and what it set, are saved in the Cubase project, so a project reopens showing the same name, with the `*` if it was changed.
 
 User presets are kept in `%APPDATA%\Haunter\Presets`, one `<name>.json` per preset. Each file holds the settings by parameter ID and the sample in the same format as the project state. To share a preset, copy its file into the same folder on another machine. To delete one, delete its file. A save is written to a temporary file first and then moved into place, so a failed save never leaves a damaged preset behind.
@@ -89,15 +89,17 @@ The unit tests cover:
 - HP and LP measurably changing both the blended sample and the ducking.
 - Dream Eater: Off is a bit-exact bypass, even right after it was on. Below 55% the comb's settings are exactly those of 1.3. Turning it up changes the track more, and 100% changes it a lot while staying within 1 dB of Off and no brighter. The comb sweeps on the sample's hits and lets go between them. At 50%, 80%, and 100%, with full-scale noise and a full-scale tone on the comb's resonance, the output stays finite and at or under full scale, and dies away in silence. A DC offset comes out no larger than it went in.
 - WAV and AIFF decoding and resampling.
-- Saving and restoring the state with the embedded sample and the selected preset, default values, and loading 1.0 and 1.1 states.
-- Presets: the Water preset decodes its built-in sample. Saving a user preset to a temporary folder and reading it back returns the same sample, bit for bit, and every parameter, including values away from the defaults. Saving under an existing name replaces it. Bad and reserved names are refused, and missing or damaged files report an error.
+- Saving and restoring the state with the embedded sample and the selected preset, default values, loading 1.0 and 1.1 states, and 1.3 projects saved on Water or `--` reopening on Water and Init, unchanged.
+- Presets: the factory presets are in alphabetical order and each decodes its built-in sample. Saving a user preset to a temporary folder and reading it back returns the same sample, bit for bit, and every parameter, including values away from the defaults. Saving under an existing name replaces it. Bad and reserved names are refused, and missing or damaged files report an error.
 - Headless editor checks that feed raw pointer and key events through the real editor, the way egui-baseview does, at 1x and 1.5x scale. The fake host never applies edits, like nih-plug's VST3 wrapper while the host is processing. They check that:
   - everything fits the window, with the preset menu, Save, and Load in that order;
   - one click flips Restart and Reverse, lights them, and sends a begin, set, and end to the host;
   - with Restart off, Rate keeps its face, reads a grey ∞ (and egui's font has that glyph), and ignores drags, double-clicks, and the scroll wheel, and with Restart on again it reads 1/4 and turns;
   - every knob turns when dragged, and Dream Eater sits in Output's old place with its dark face, reads Off, and turns;
-  - choosing Water from the menu loads its built-in sample, sends every parameter at its default, and the audio thread plays it, and `--` clears it;
-  - choosing a saved preset sends its values and loads its sample;
+  - a new instance shows Init, and the menu lists Init, Paper, Stone, Umber, Water, Wind, then saved presets;
+  - choosing Water from the menu loads its built-in sample, sends every parameter at its default, and the audio thread plays it, Init clears it, and loading a sample then shows `Init*`;
+  - choosing each factory preset loads its own built-in sample;
+  - choosing a saved preset sends its values and loads its sample, and a preset saved after the menu was last opened is shown in it;
   - the name gets a `*` after the sample, a setting, Start, Restart, or Reverse changes, and loses it after choosing the preset again or saving through the prompt (Enter, OK, and Escape), and factory names are refused there.
 
 `cargo run --release --features standalone --example standalone -- --backend dummy` opens the editor without a host. Set `HAUNTER_PREVIEW_SAMPLE` to a WAV path to load it at startup.

@@ -226,7 +226,7 @@ fn preset_label(params: &HaunterParams, shared: &Shared, state: &EditorState) ->
     format!("{}{}", selection.choice.name(), if modified { "*" } else { "" })
 }
 
-/// The preset menu: `--`, the factory presets, then the user's. Returns where it was drawn.
+/// The preset menu: Init, the factory presets, then the user's. Returns where it was drawn.
 fn preset_menu(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
@@ -248,6 +248,8 @@ fn preset_menu(
             }
             egui::ComboBox::from_id_salt("preset")
                 .width(190.0)
+                // Room for the factory presets and a dozen saved ones before it scrolls.
+                .height(480.0)
                 .truncate()
                 .selected_text(egui::RichText::new(label).size(14.0).color(INK))
                 .show_ui(ui, |ui| {
@@ -272,7 +274,13 @@ fn preset_menu(
                 })
         })
         .inner;
+    let was_open = state.menu_open;
     state.menu_open = menu.inner.is_some();
+    if was_open && !state.menu_open {
+        // egui caps a reopened popup at the size it had last time, which would scroll presets
+        // saved since then out of view.
+        ui.memory_mut(|memory| memory.reset_areas());
+    }
     if let Some(choice) = picked {
         select_preset(choice, setter, params, shared, state);
     }
@@ -1336,9 +1344,9 @@ mod tests {
     fn choosing_water_loads_its_embedded_sample_with_default_settings() {
         let mut editor = Editor::new(false);
         editor.settle();
-        assert_eq!(shown_preset(&mut editor), "--", "a new instance has no preset and no sample");
+        assert_eq!(shown_preset(&mut editor), "Init", "a new instance has no preset and no sample");
         let entries: Vec<String> = open_preset_menu(&mut editor).into_iter().map(|(text, _)| text).collect();
-        assert_eq!(entries, ["--", "Water"]);
+        assert_eq!(entries, ["Init", "Paper", "Stone", "Umber", "Water", "Wind"]);
         close_preset_menu(&mut editor);
         editor.screen.take_edits();
 
@@ -1366,11 +1374,29 @@ mod tests {
         let playing = editor.plugin.engine.sample().expect("the audio thread plays it");
         assert_eq!(playing.frames(), (184_275.0 * 48_000.0 / 44_100.0f64).round() as usize, "resampled to the host rate");
 
-        pick_preset(&mut editor, "--");
-        assert!(params.sample.read(|s| s.is_none()), "-- means no sample");
-        assert_eq!(shown_preset(&mut editor), "--");
+        pick_preset(&mut editor, "Init");
+        assert!(params.sample.read(|s| s.is_none()), "Init means no sample");
+        assert_eq!(params.preset.get().choice, Choice::None);
+        assert_eq!(shown_preset(&mut editor), "Init");
         editor.plugin.adopt_pending_sample();
         assert!(editor.plugin.engine.sample().is_none());
+
+        crate::install_sample(another_sample(), &params, &editor.plugin.shared);
+        assert_eq!(shown_preset(&mut editor), "Init*", "a loaded sample changes Init");
+    }
+
+    #[test]
+    fn every_factory_preset_loads_its_own_sample() {
+        let mut editor = Editor::new(false);
+        editor.settle();
+        for name in ["Paper", "Stone", "Umber", "Water", "Wind"] {
+            pick_preset(&mut editor, name);
+            let params = editor.plugin.params.clone();
+            assert_eq!(params.preset.get().choice, Choice::Factory(name.into()));
+            let sample = params.sample.read(|s| s.cloned()).unwrap_or_else(|| panic!("{name} loads a sample"));
+            assert_eq!(sample, crate::preset::Preset::factory(name).unwrap().sample.unwrap(), "{name}");
+            assert_eq!(shown_preset(&mut editor), name);
+        }
     }
 
     #[test]
@@ -1383,7 +1409,11 @@ mod tests {
         }
         editor.plugin.shared.user_presets.save("Snare Gate", &preset).unwrap();
         let entries: Vec<String> = open_preset_menu(&mut editor).into_iter().map(|(text, _)| text).collect();
-        assert_eq!(entries, ["--", "Water", "Snare Gate"], "user presets come after the factory ones");
+        assert_eq!(
+            entries,
+            ["Init", "Paper", "Stone", "Umber", "Water", "Wind", "Snare Gate"],
+            "user presets come after the factory ones"
+        );
         close_preset_menu(&mut editor);
         editor.screen.take_edits();
 

@@ -755,6 +755,33 @@ mod tests {
     }
 
     #[test]
+    fn projects_saved_with_water_or_no_preset_reopen_the_same() {
+        let water = Preset::factory("Water").unwrap().sample.unwrap();
+        let donor = Haunter::default();
+        install_sample(water.clone(), &donor.params, &donor.shared);
+        let mut fields = donor.params.serialize_fields();
+        // The preset field exactly as 1.3 wrote it.
+        let selection = format!(r#"{{"choice":{{"kind":"factory","name":"Water"}},"values":{{}},"sample":{}}}"#, water.fingerprint());
+        fields.insert("preset".to_owned(), selection);
+        let restored = Haunter::default();
+        restored.params.deserialize_fields(&fields);
+        let selection = restored.params.preset.get();
+        assert_eq!(selection.choice, Choice::Factory("Water".into()));
+        assert_eq!(selection.choice.name(), "Water");
+        assert!(!selection.is_modified(restored.params.as_ref(), restored.params.sample.fingerprint(), false));
+        assert_eq!(read_preset(&selection.choice, &restored.shared).unwrap().sample, Some(water));
+
+        let mut fields = Haunter::default().params.serialize_fields();
+        fields.insert("preset".to_owned(), r#"{"choice":{"kind":"none"},"values":{},"sample":0}"#.to_owned());
+        let restored = Haunter::default();
+        restored.params.deserialize_fields(&fields);
+        let selection = restored.params.preset.get();
+        assert_eq!(selection.choice, Choice::None);
+        assert_eq!(selection.choice.name(), "Init", "what 1.3 showed as --");
+        assert!(!selection.is_modified(restored.params.as_ref(), restored.params.sample.fingerprint(), false));
+    }
+
+    #[test]
     fn defaults() {
         let params = &Haunter::default().params;
         let volume = &params.sample_volume;

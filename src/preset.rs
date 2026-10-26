@@ -11,10 +11,18 @@ use crate::audio_file;
 use crate::sample::EmbeddedSample;
 
 /// What the preset menu shows when no preset is selected: no sample and default settings.
-pub const NO_PRESET: &str = "--";
+pub const NO_PRESET: &str = "Init";
+/// What 1.3 called [`NO_PRESET`]. Still refused as a user preset name.
+const OLD_NO_PRESET: &str = "--";
 
 /// Factory presets, in menu order, with the sample each one loads. They use default settings.
-const FACTORY: &[(&str, &[u8])] = &[("Water", include_bytes!("../presets/Water.wav"))];
+const FACTORY: &[(&str, &[u8])] = &[
+    ("Paper", include_bytes!("../presets/Paper.wav")),
+    ("Stone", include_bytes!("../presets/Stone.wav")),
+    ("Umber", include_bytes!("../presets/Umber.wav")),
+    ("Water", include_bytes!("../presets/Water.wav")),
+    ("Wind", include_bytes!("../presets/Wind.wav")),
+];
 
 /// Bumped if the preset file format ever changes in a way older versions can't read.
 const FILE_FORMAT: u32 = 1;
@@ -198,7 +206,8 @@ impl UserPresets {
                     return None;
                 }
                 let name = path.file_stem()?.to_str()?.to_owned();
-                check_name(&name).is_ok().then_some(name)
+                // Not `check_name`: presets saved before a factory preset took their name stay listed.
+                check_file_name(&name).is_ok().then_some(name)
             })
             .collect();
         names.sort_by_key(|name| name.to_lowercase());
@@ -244,6 +253,16 @@ impl UserPresets {
 
 /// Trims `name` and checks it can be a preset name and a file name.
 pub fn check_name(name: &str) -> Result<&str, String> {
+    let name = check_file_name(name)?;
+    let reserved = [NO_PRESET, OLD_NO_PRESET].into_iter().chain(factory_names());
+    if reserved.into_iter().any(|taken| taken.eq_ignore_ascii_case(name)) {
+        return Err(format!("{name} is a factory preset; choose another name"));
+    }
+    Ok(name)
+}
+
+/// Trims `name` and checks it can be a file name.
+fn check_file_name(name: &str) -> Result<&str, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("Type a name for the preset".to_owned());
@@ -262,9 +281,6 @@ pub fn check_name(name: &str) -> Result<&str, String> {
     if reserved {
         return Err(format!("Windows doesn't allow {name} as a file name"));
     }
-    if name == NO_PRESET || factory_names().any(|factory| factory.eq_ignore_ascii_case(name)) {
-        return Err(format!("{name} is a factory preset; choose another name"));
-    }
     Ok(name)
 }
 
@@ -275,7 +291,10 @@ mod tests {
     #[test]
     fn names_must_work_as_file_names() {
         assert_eq!(check_name("  Big Room  "), Ok("Big Room"));
-        for bad in ["", "   ", "a/b", "a\\b", "what?", "con", "COM1", "lpt9.txt", "dots.", "--", "water", "Water"] {
+        for bad in [
+            "", "   ", "a/b", "a\\b", "what?", "con", "COM1", "lpt9.txt", "dots.", "--", "Init", "init", "water", "Water",
+            "Paper", "stone", "UMBER", "Wind",
+        ] {
             assert!(check_name(bad).is_err(), "{bad:?} was accepted");
         }
         assert!(check_name(&"x".repeat(64)).is_ok());
@@ -283,15 +302,27 @@ mod tests {
     }
 
     #[test]
-    fn the_water_preset_decodes_its_embedded_sample() {
-        let water = Preset::factory("Water").unwrap();
-        let sample = water.sample.unwrap();
-        assert_eq!(sample.name, "Water");
-        assert_eq!(sample.sample_rate, 44_100.0);
-        assert_eq!(sample.channels.len(), 2);
-        assert_eq!(sample.frames(), 184_275);
-        assert!(water.values.is_empty(), "default settings");
+    fn factory_presets_are_listed_alphabetically() {
+        assert_eq!(factory_names().collect::<Vec<_>>(), ["Paper", "Stone", "Umber", "Water", "Wind"]);
+        assert_eq!(Choice::None.name(), "Init");
+    }
+
+    #[test]
+    fn every_factory_preset_decodes_its_embedded_sample() {
+        for name in factory_names() {
+            let preset = Preset::factory(name).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert!(preset.values.is_empty(), "{name} uses the default settings");
+            let sample = preset.sample.unwrap();
+            assert_eq!(sample.name, name);
+            assert!(sample.sample_rate > 0.0 && !sample.channels.is_empty() && sample.frames() > 0, "{name}");
+            assert!(sample.channels.iter().flatten().any(|&v| v.abs() > 1e-3), "{name} is not silent");
+        }
+        let water = Preset::factory("Water").unwrap().sample.unwrap();
+        assert_eq!(water.sample_rate, 44_100.0);
+        assert_eq!(water.channels.len(), 2);
+        assert_eq!(water.frames(), 184_275);
         assert!(Preset::factory("Fire").is_err());
+        assert!(Preset::factory("Init").is_err(), "Init is no preset at all, not a factory one");
     }
 
     #[test]
@@ -300,5 +331,15 @@ mod tests {
         assert_eq!(user, r#"{"kind":"user","name":"Mine"}"#);
         assert_eq!(serde_json::to_string(&Choice::None).unwrap(), r#"{"kind":"none"}"#);
         assert_eq!(serde_json::from_str::<Choice>(r#"{"kind":"factory","name":"Water"}"#).unwrap(), Choice::Factory("Water".into()));
+    }
+
+    #[test]
+    fn user_presets_saved_before_a_factory_preset_took_their_name_stay_listed() {
+        let folder = crate::test_support::TempDir::new();
+        std::fs::create_dir_all(folder.path()).unwrap();
+        for name in ["Paper", "Init", "con", "Mine"] {
+            std::fs::write(folder.path().join(format!("{name}.json")), "{}").unwrap();
+        }
+        assert_eq!(UserPresets::new(folder.path().to_owned()).list(), ["Init", "Mine", "Paper"]);
     }
 }

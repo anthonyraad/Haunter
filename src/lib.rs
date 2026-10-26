@@ -76,6 +76,9 @@ pub struct Shared {
     playhead: AtomicF32,
     /// 0..1, how far the sample is sweeping the Dream Eater comb right now.
     dream_level: AtomicF32,
+    /// Blocks processed so far. While the host runs the plugin, an edit from the editor only
+    /// reaches the parameter in a later block, so this tells the editor whether it has had one.
+    processed_blocks: AtomicU64,
 }
 
 impl Shared {
@@ -92,6 +95,7 @@ impl Shared {
             gain_reduction_db: AtomicF32::new(0.0),
             playhead: AtomicF32::new(-1.0),
             dream_level: AtomicF32::new(0.0),
+            processed_blocks: AtomicU64::new(0),
         }
     }
 
@@ -450,6 +454,7 @@ impl Plugin for Haunter {
         _aux: &mut AuxiliaryBuffers,
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        self.shared.processed_blocks.fetch_add(1, Ordering::Relaxed);
         self.adopt_pending_sample();
         self.engine.settings = self.params.settings();
 

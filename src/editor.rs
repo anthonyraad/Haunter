@@ -74,6 +74,8 @@ struct Drawn {
     used: Rect,
     restart: Rect,
     reverse: Rect,
+    /// The first row of knobs, which starts with Rate.
+    upper_knobs: Rect,
     /// The second row of knobs, which ends with Dream Eater.
     lower_knobs: Rect,
 }
@@ -107,11 +109,10 @@ fn draw(
             ui.add_space(8.0);
             waveform(ui, setter, params, shared, state, hovering_files);
             ui.add_space(10.0);
-            let [restart, reverse] = toggles_and_meter(ui, setter, params, shared, state);
+            let ([restart, reverse], rate_enabled) = toggles_and_meter(ui, setter, params, shared, state);
             ui.add_space(8.0);
             // Without Restart the region just loops, so the grid spacing does nothing.
-            let rate_enabled = params.restart.value();
-            knob_row(ui, setter, &[
+            let upper_knobs = knob_row(ui, setter, &[
                 ("Rate", &params.rate, rate_enabled, Face::Plain),
                 ("Depth", &params.depth, true, Face::Plain),
                 ("Attack", &params.attack, true, Face::Plain),
@@ -126,7 +127,7 @@ fn draw(
                 ("Blend", &params.blend, true, Face::Plain),
                 ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level }),
             ]);
-            Drawn { used: ui.min_rect(), restart, reverse, lower_knobs }
+            Drawn { used: ui.min_rect(), restart, reverse, upper_knobs, lower_knobs }
         })
         .inner
 }
@@ -306,40 +307,87 @@ fn drop_overlay(painter: &egui::Painter, rect: Rect, hovering_files: bool) {
     }
 }
 
-/// A button that flips `param` and is lit while it is on. Returns where it was drawn.
-fn toggle(ui: &mut egui::Ui, setter: &ParamSetter, param: &BoolParam, text: &str, help: &str) -> Rect {
-    let on = param.value();
+/// Blocks the host gets to apply a toggle's edit before the toggle shows the parameter again.
+const TOGGLE_GRACE_BLOCKS: u64 = 3;
+
+/// A toggle edit the host has been sent but has not applied to the parameter yet.
+#[derive(Clone, Copy)]
+struct Toggling {
+    target: bool,
+    /// The mouse button is still down, so the edit is still open.
+    held: bool,
+    /// `Shared::processed_blocks` when the edit was closed.
+    closed_at: u64,
+}
+
+/// A button that flips `param` and is lit while it is on. Returns where it was drawn and whether
+/// it shows on.
+///
+/// While the host is processing, nih-plug leaves the parameter alone and waits for the host to send
+/// the edit back in a later block. So the edit opens on the press and is sent every frame until the
+/// release, the way a knob drag is, and the button shows the new state until the host applies it.
+fn toggle(ui: &mut egui::Ui, setter: &ParamSetter, param: &BoolParam, shared: &Shared, text: &str, help: &str) -> (Rect, bool) {
+    let memory = ui.make_persistent_id(text);
+    let blocks = shared.processed_blocks.load(Ordering::Relaxed);
+    let mut toggling = ui.memory(|mem| mem.data.get_temp::<Toggling>(memory)).filter(|edit| {
+        edit.held || (param.value() != edit.target && blocks < edit.closed_at + TOGGLE_GRACE_BLOCKS)
+    });
+    let on = toggling.map_or(param.value(), |edit| edit.target);
+
     let (fill, color) = if on { (ARC, DISC) } else { (DISC, INK) };
     let button = egui::Button::new(egui::RichText::new(text).size(13.0).color(color))
         .min_size(egui::vec2(86.0, 26.0))
         .fill(fill)
         .stroke(Stroke::new(1.0_f32, OUTLINE));
     let response = ui.add(button).on_hover_text(help);
-    if response.clicked() {
-        setter.begin_set_parameter(param);
-        setter.set_parameter(param, !on);
-        setter.end_set_parameter(param);
+    let pressed = response.is_pointer_button_down_on();
+
+    match toggling {
+        Some(edit) if edit.held => {
+            setter.set_parameter(param, edit.target);
+            if !pressed {
+                setter.end_set_parameter(param);
+                toggling = Some(Toggling { held: false, closed_at: blocks, ..edit });
+            }
+        }
+        // A press and release inside one frame only shows up as the click.
+        _ if pressed || response.clicked() => {
+            let target = !on;
+            setter.begin_set_parameter(param);
+            setter.set_parameter(param, target);
+            if !pressed {
+                setter.end_set_parameter(param);
+            }
+            toggling = Some(Toggling { target, held: pressed, closed_at: blocks });
+        }
+        _ => {}
     }
-    response.rect
+    ui.memory_mut(|mem| match toggling {
+        Some(edit) => mem.data.insert_temp(memory, edit),
+        None => mem.data.remove::<Toggling>(memory),
+    });
+    (response.rect, toggling.map_or(param.value(), |edit| edit.target))
 }
 
-/// Returns where the Restart and Reverse toggles were drawn.
+/// Returns where the Restart and Reverse toggles were drawn, and whether Restart shows on.
 fn toggles_and_meter(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
     params: &HaunterParams,
     shared: &Shared,
     state: &mut EditorState,
-) -> [Rect; 2] {
+) -> ([Rect; 2], bool) {
     ui.horizontal(|ui| {
-        let restart = toggle(
+        let (restart, restart_on) = toggle(
             ui,
             setter,
             &params.restart,
+            shared,
             "Restart",
             "On: the region starts again on every Rate step.\nOff: it loops continuously and Rate is ignored.",
         );
-        let reverse = toggle(ui, setter, &params.reverse, "Reverse", "Plays the region backwards, from E to S.");
+        let (reverse, _) =
+            toggle(ui, setter, &params.reverse, shared, "Reverse", "Plays the region backwards, from E to S.");
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let latest = shared.gain_reduction_db.swap(0.0, Ordering::Relaxed);
@@ -360,7 +408,7 @@ fn toggles_and_meter(
             ui.label(egui::RichText::new(format!("{:>5.1} dB", -state.meter_db)).monospace().color(INK));
             ui.label(egui::RichText::new("GAIN REDUCTION").size(11.0).color(SUBTLE));
         });
-        [restart, reverse]
+        ([restart, reverse], restart_on)
     })
     .inner
 }
@@ -500,10 +548,20 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
-    /// Records the parameter changes the editor asks the host for.
+    /// One call the editor made to the host.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Edit {
+        Begin(ParamPtr),
+        Set(ParamPtr, f32),
+        End(ParamPtr),
+    }
+
+    /// Records what the editor asks of the host. Like nih-plug's VST3 wrapper while the host is
+    /// processing, it leaves the parameters alone: they would only change once the host sent the
+    /// edit back in a later block.
     #[derive(Default)]
     struct Host {
-        edits: Mutex<Vec<(ParamPtr, f32)>>,
+        edits: Mutex<Vec<Edit>>,
     }
 
     impl GuiContext for Host {
@@ -513,44 +571,73 @@ mod tests {
         fn request_resize(&self) -> bool {
             false
         }
-        unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
-        unsafe fn raw_set_parameter_normalized(&self, param: ParamPtr, normalized: f32) {
-            self.edits.lock().unwrap().push((param, normalized));
+        unsafe fn raw_begin_set_parameter(&self, param: ParamPtr) {
+            self.edits.lock().unwrap().push(Edit::Begin(param));
         }
-        unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+        unsafe fn raw_set_parameter_normalized(&self, param: ParamPtr, normalized: f32) {
+            self.edits.lock().unwrap().push(Edit::Set(param, normalized));
+        }
+        unsafe fn raw_end_set_parameter(&self, param: ParamPtr) {
+            self.edits.lock().unwrap().push(Edit::End(param));
+        }
         fn get_state(&self) -> PluginState {
             PluginState { version: String::new(), params: BTreeMap::new(), fields: BTreeMap::new() }
         }
         fn set_state(&self, _state: PluginState) {}
     }
 
-    /// A headless egui window the size of the editor.
+    /// The editor's egui context, driven the way `vendor/egui-baseview` drives it in a host:
+    /// baseview's cursor and button events become egui pointer events, a button event takes the
+    /// last cursor position and is dropped without one, and each tick of baseview's 15 ms frame
+    /// timer runs a single `begin_pass`/`end_pass` with the clock and the screen rect.
     struct Screen {
         host: Host,
         context: egui::Context,
+        input: egui::RawInput,
+        cursor: Option<Pos2>,
         time: f64,
         /// Everything painted in the last frame.
         shapes: Vec<egui::Shape>,
     }
 
     impl Screen {
-        fn new() -> Self {
+        fn new(pixels_per_point: f32) -> Self {
             let context = egui::Context::default();
             configure(&context);
-            Screen { host: Host::default(), context, time: 0.0, shapes: Vec::new() }
-        }
-
-        fn frame<R>(&mut self, events: Vec<egui::Event>, mut ui: impl FnMut(&egui::Context, &ParamSetter) -> R) -> R {
-            self.time += 1.0 / 60.0;
-            let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(WIDTH as f32, HEIGHT as f32))),
-                time: Some(self.time),
-                events,
+            let mut input = egui::RawInput { max_texture_side: Some(8192), ..Default::default() };
+            let viewport = egui::ViewportInfo {
+                native_pixels_per_point: Some(pixels_per_point),
+                focused: Some(true),
                 ..Default::default()
             };
+            input.viewports.insert(egui::ViewportId::ROOT, viewport);
+            Screen { host: Host::default(), context, input, cursor: None, time: 0.0, shapes: Vec::new() }
+        }
+
+        /// baseview's `CursorMoved`.
+        fn cursor_moved(&mut self, pos: Pos2) {
+            self.cursor = Some(pos);
+            self.input.events.push(egui::Event::PointerMoved(pos));
+        }
+
+        /// baseview's `ButtonPressed` or `ButtonReleased` for the left button.
+        fn left_button(&mut self, pressed: bool) {
+            if let Some(pos) = self.cursor {
+                let modifiers = self.input.modifiers;
+                let button = egui::PointerButton::Primary;
+                self.input.events.push(egui::Event::PointerButton { pos, button, pressed, modifiers });
+            }
+        }
+
+        /// One tick of baseview's frame timer.
+        fn frame<R>(&mut self, ui: impl FnOnce(&egui::Context, &ParamSetter) -> R) -> R {
+            self.time += 0.015;
+            self.input.time = Some(self.time);
+            self.input.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(WIDTH as f32, HEIGHT as f32)));
+            self.context.begin_pass(self.input.take());
             let setter = ParamSetter::new(&self.host);
-            let mut result = None;
-            let output = self.context.run(input, |context| result = Some(ui(context, &setter)));
+            let result = ui(&self.context, &setter);
+            let output = self.context.end_pass();
             fn flatten(shape: egui::Shape, into: &mut Vec<egui::Shape>) {
                 match shape {
                     egui::Shape::Vec(shapes) => shapes.into_iter().for_each(|shape| flatten(shape, into)),
@@ -561,7 +648,7 @@ mod tests {
             for clipped in output.shapes {
                 flatten(clipped.shape, &mut self.shapes);
             }
-            result.unwrap()
+            result
         }
 
         /// Centres of the filled discs painted in `color`.
@@ -575,21 +662,26 @@ mod tests {
                 .collect()
         }
 
-        fn take_edits(&self) -> Vec<(ParamPtr, f32)> {
+        /// Whether a button lit in the "on" colour covers the middle of `rect`.
+        fn lit(&self, rect: Rect) -> bool {
+            self.shapes.iter().any(|shape| {
+                matches!(shape, egui::Shape::Rect(button) if button.fill == ARC && button.rect.contains(rect.center()))
+            })
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.shapes
+                .iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn take_edits(&self) -> Vec<Edit> {
             std::mem::take(&mut *self.host.edits.lock().unwrap())
         }
-    }
-
-    fn moved(pos: Pos2) -> Vec<egui::Event> {
-        vec![egui::Event::PointerMoved(pos)]
-    }
-
-    fn button(pos: Pos2, pressed: bool) -> Vec<egui::Event> {
-        vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }]
-    }
-
-    fn click(pos: Pos2) -> Vec<Vec<egui::Event>> {
-        vec![moved(pos), button(pos, true), button(pos, false)]
     }
 
     struct Editor {
@@ -600,6 +692,10 @@ mod tests {
 
     impl Editor {
         fn new(with_sample: bool) -> Self {
+            Self::scaled(with_sample, 1.0)
+        }
+
+        fn scaled(with_sample: bool, pixels_per_point: f32) -> Self {
             let plugin = crate::Haunter::default();
             if with_sample {
                 let kick = (0..4_800).map(|n| (n as f32 * 0.01).sin() * (1.0 - n as f32 / 4_800.0)).collect();
@@ -609,25 +705,72 @@ mod tests {
                 plugin.shared.playhead.store(0.3, Ordering::Relaxed);
                 plugin.shared.gain_reduction_db.store(9.0, Ordering::Relaxed);
             }
-            Editor { plugin, screen: Screen::new(), state: EditorState::default() }
+            Editor { plugin, screen: Screen::new(pixels_per_point), state: EditorState::default() }
         }
 
-        fn frame(&mut self, events: Vec<egui::Event>) -> Drawn {
+        fn frame(&mut self) -> Drawn {
             let Editor { plugin, screen, state } = self;
-            screen.frame(events, |context, setter| draw(context, setter, &plugin.params, &plugin.shared, state))
+            screen.frame(|context, setter| draw(context, setter, &plugin.params, &plugin.shared, state))
         }
 
         /// The first pass measures text, the second lays out with those sizes.
         fn settle(&mut self) -> Drawn {
-            self.frame(Vec::new());
-            self.frame(Vec::new())
+            self.frame();
+            self.frame()
         }
 
-        fn play(&mut self, frames: Vec<Vec<egui::Event>>) {
-            for events in frames {
-                self.frame(events);
+        /// Slides the cursor onto `to` over a few frames, the way a hand moves it.
+        fn move_to(&mut self, to: Pos2) {
+            let from = self.screen.cursor.unwrap_or(Pos2::new(WIDTH as f32 * 0.5, 4.0));
+            for step in 1..=6 {
+                self.screen.cursor_moved(from.lerp(to, step as f32 / 6.0));
+                self.frame();
             }
         }
+
+        fn wait(&mut self, seconds: f64) {
+            for _ in 0..(seconds / 0.015).ceil() as usize {
+                self.frame();
+            }
+        }
+
+        /// Clicks the way people do: moves onto `pos`, rests there long enough for the tooltip,
+        /// holds the button down for about a tenth of a second, and lets go.
+        fn click_at(&mut self, pos: Pos2) {
+            self.move_to(pos);
+            self.wait(0.7);
+            self.screen.left_button(true);
+            self.wait(0.1);
+            self.screen.left_button(false);
+            self.frame();
+        }
+
+        /// Presses where the cursor is, drags by `by`, and lets go.
+        fn drag(&mut self, by: egui::Vec2) {
+            let from = self.screen.cursor.expect("the cursor is over the window");
+            self.screen.left_button(true);
+            self.frame();
+            for step in 1..=4 {
+                self.screen.cursor_moved(from + by * (step as f32 / 4.0));
+                self.frame();
+            }
+            self.screen.left_button(false);
+            self.frame();
+        }
+    }
+
+    /// The knob centres of a row drawn by `knob_row`.
+    fn knob_centres(row: Rect) -> impl Iterator<Item = Pos2> {
+        (0..KNOB_COLUMNS as usize)
+            .map(move |index| Pos2::new(row.left() + row.width() * (index as f32 + 0.5) / KNOB_COLUMNS, row.top() + 40.0))
+    }
+
+    /// Asserts `edits` is one open, held, and closed edit of `param` to `value`.
+    fn assert_one_edit(edits: &[Edit], param: ParamPtr, value: f32) {
+        assert!(edits.len() >= 3, "{edits:?}");
+        assert_eq!(edits[0], Edit::Begin(param), "{edits:?}");
+        assert_eq!(edits[edits.len() - 1], Edit::End(param), "{edits:?}");
+        assert!(edits[1..edits.len() - 1].iter().all(|edit| *edit == Edit::Set(param, value)), "{edits:?}");
     }
 
     #[test]
@@ -641,32 +784,132 @@ mod tests {
     }
 
     #[test]
-    fn restart_and_reverse_toggle_when_clicked_anywhere_on_them() {
+    fn a_click_flips_restart_and_reverse_before_the_host_answers() {
         let mut editor = Editor::new(true);
         let drawn = editor.settle();
         editor.screen.take_edits();
-        assert!(drawn.restart.width() >= 80.0 && drawn.reverse.width() >= 80.0);
-        assert!(!drawn.restart.intersects(drawn.reverse));
         let restart = editor.plugin.params.restart.as_ptr();
         let reverse = editor.plugin.params.reverse.as_ptr();
+        let rate = knob_centres(drawn.upper_knobs).next().unwrap();
+        let rate_lit = |screen: &Screen| screen.discs(DISC).iter().any(|disc| disc.distance(rate) < 20.0);
+        assert!(editor.screen.lit(drawn.restart) && !editor.screen.lit(drawn.reverse));
+        assert!(rate_lit(&editor.screen), "Rate starts enabled");
 
-        for rect in [drawn.reverse, drawn.reverse.shrink(3.0)] {
-            for pos in [rect.center(), rect.left_top(), rect.right_bottom()] {
-                editor.play(click(pos));
-                assert_eq!(editor.screen.take_edits(), vec![(reverse, 1.0)], "Reverse clicked at {pos:?}");
+        editor.move_to(drawn.reverse.center());
+        editor.wait(0.7);
+        assert!(
+            editor.screen.texts().iter().any(|text| text.starts_with("Plays the region backwards")),
+            "the tooltip is up, as it is when someone rests on the button before clicking"
+        );
+        editor.screen.left_button(true);
+        editor.frame();
+        assert_eq!(editor.screen.take_edits(), [Edit::Begin(reverse), Edit::Set(reverse, 1.0)], "the press opens the edit");
+        for _ in 0..5 {
+            editor.frame();
+        }
+        assert_eq!(editor.screen.take_edits(), [Edit::Set(reverse, 1.0); 5], "held open like a knob drag");
+        assert!(editor.screen.lit(drawn.reverse), "lit while the button is still down");
+        editor.screen.left_button(false);
+        editor.frame();
+        assert_eq!(editor.screen.take_edits(), [Edit::Set(reverse, 1.0), Edit::End(reverse)], "the release closes it");
+        editor.wait(1.0);
+        assert!(editor.screen.take_edits().is_empty());
+        assert!(!editor.plugin.params.reverse.value(), "the host has not sent the edit back yet");
+        assert!(editor.screen.lit(drawn.reverse), "but Reverse shows on");
+
+        editor.click_at(drawn.restart.center());
+        assert_one_edit(&editor.screen.take_edits(), restart, 0.0);
+        assert!(!editor.screen.lit(drawn.restart), "Restart shows off");
+        assert!(!rate_lit(&editor.screen), "and Rate is greyed out");
+        assert_eq!(editor.screen.discs(DISC).len(), 8, "only Rate");
+
+        editor.click_at(drawn.reverse.center());
+        assert_one_edit(&editor.screen.take_edits(), reverse, 0.0);
+        assert!(!editor.screen.lit(drawn.reverse), "a second click turns Reverse back off");
+    }
+
+    #[test]
+    fn a_press_and_release_inside_one_frame_still_flips() {
+        let mut editor = Editor::new(true);
+        let drawn = editor.settle();
+        let reverse = editor.plugin.params.reverse.as_ptr();
+        editor.move_to(drawn.reverse.center());
+        editor.screen.take_edits();
+        editor.screen.left_button(true);
+        editor.screen.left_button(false);
+        editor.frame();
+        assert_eq!(editor.screen.take_edits(), [Edit::Begin(reverse), Edit::Set(reverse, 1.0), Edit::End(reverse)]);
+        editor.frame();
+        assert!(editor.screen.lit(drawn.reverse));
+    }
+
+    #[test]
+    fn a_toggle_shows_the_parameter_again_once_the_host_has_had_blocks_to_apply_it() {
+        let mut editor = Editor::new(true);
+        let drawn = editor.settle();
+        editor.click_at(drawn.reverse.center());
+        editor.wait(2.0);
+        assert!(editor.screen.lit(drawn.reverse), "no blocks yet, so the host has not had its chance");
+
+        let blocks = &editor.plugin.shared.processed_blocks;
+        blocks.fetch_add(TOGGLE_GRACE_BLOCKS - 1, Ordering::Relaxed);
+        editor.frame();
+        assert!(editor.screen.lit(drawn.reverse));
+        editor.plugin.shared.processed_blocks.fetch_add(1, Ordering::Relaxed);
+        editor.frame();
+        assert!(!editor.screen.lit(drawn.reverse), "the host dropped the edit, so the button shows the real value");
+    }
+
+    #[test]
+    fn the_press_decides_what_a_click_does() {
+        let mut editor = Editor::new(true);
+        let drawn = editor.settle();
+        let reverse = editor.plugin.params.reverse.as_ptr();
+        editor.screen.take_edits();
+
+        editor.move_to(drawn.reverse.center());
+        editor.drag(egui::vec2(60.0, 0.0));
+        assert_one_edit(&editor.screen.take_edits(), reverse, 1.0);
+
+        let beside = Pos2::new(drawn.reverse.right() + 20.0, drawn.reverse.center().y);
+        editor.click_at(beside);
+        editor.drag(drawn.reverse.center() - beside);
+        assert!(editor.screen.take_edits().is_empty(), "pressing beside the toggles does nothing");
+    }
+
+    #[test]
+    fn the_toggles_work_on_a_scaled_display() {
+        let mut editor = Editor::scaled(true, 1.5);
+        let drawn = editor.settle();
+        editor.screen.take_edits();
+        editor.click_at(drawn.reverse.center());
+        assert_one_edit(&editor.screen.take_edits(), editor.plugin.params.reverse.as_ptr(), 1.0);
+        assert!(editor.screen.lit(drawn.reverse));
+    }
+
+    #[test]
+    fn every_knob_turns_when_dragged() {
+        let mut editor = Editor::new(true);
+        let drawn = editor.settle();
+        let p = &editor.plugin.params;
+        let rows = [
+            (drawn.upper_knobs, [p.rate.as_ptr(), p.depth.as_ptr(), p.attack.as_ptr(), p.release.as_ptr(), p.mix.as_ptr()]),
+            (
+                drawn.lower_knobs,
+                [p.high_pass.as_ptr(), p.low_pass.as_ptr(), p.sample_volume.as_ptr(), p.blend.as_ptr(), p.dream_eater.as_ptr()],
+            ),
+        ];
+        editor.screen.take_edits();
+        for (row, knobs) in rows {
+            for (centre, param) in knob_centres(row).zip(knobs) {
+                editor.move_to(centre);
+                editor.drag(egui::vec2(0.0, -40.0));
+                let edits = editor.screen.take_edits();
+                assert_eq!(edits.first(), Some(&Edit::Begin(param)), "{edits:?}");
+                assert_eq!(edits.last(), Some(&Edit::End(param)), "{edits:?}");
+                assert!(edits.iter().any(|edit| matches!(edit, Edit::Set(p, _) if *p == param)), "{edits:?}");
             }
         }
-        editor.play(click(drawn.restart.center()));
-        assert_eq!(editor.screen.take_edits(), vec![(restart, 0.0)], "Restart starts on, so a click turns it off");
-
-        // A quick click where the press and release land in the same frame.
-        let pos = drawn.reverse.center();
-        editor.frame(moved(pos));
-        editor.frame([button(pos, true), button(pos, false)].concat());
-        assert_eq!(editor.screen.take_edits(), vec![(reverse, 1.0)]);
-
-        editor.play(click(Pos2::new(drawn.reverse.right() + 20.0, drawn.reverse.center().y)));
-        assert!(editor.screen.take_edits().is_empty(), "the space beside the toggles does nothing");
     }
 
     #[test]
@@ -674,26 +917,38 @@ mod tests {
         let plugin = crate::Haunter::default();
         let rate = plugin.params.rate.as_ptr();
         for enabled in [true, false] {
-            let mut screen = Screen::new();
-            let row = |screen: &mut Screen, events| {
-                screen.frame(events, |context, setter| {
+            let mut screen = Screen::new(1.0);
+            let row = |screen: &mut Screen| {
+                screen.frame(|context, setter| {
                     egui::CentralPanel::default()
                         .show(context, |ui| knob_row(ui, setter, &[("Rate", &plugin.params.rate, enabled, Face::Plain)]))
                         .inner
                 })
             };
-            let rect = row(&mut screen, Vec::new());
-            let knob = Pos2::new(rect.left() + rect.width() * 0.5 / KNOB_COLUMNS, rect.top() + 40.0);
-            for events in [moved(knob), button(knob, true), moved(knob - egui::vec2(0.0, 20.0)), moved(knob - egui::vec2(0.0, 40.0))] {
-                row(&mut screen, events);
+            row(&mut screen);
+            let rect = row(&mut screen);
+            let knob = knob_centres(rect).next().unwrap();
+            screen.cursor_moved(knob);
+            row(&mut screen);
+            screen.left_button(true);
+            row(&mut screen);
+            for up in [20.0, 40.0] {
+                screen.cursor_moved(knob - egui::vec2(0.0, up));
+                row(&mut screen);
             }
-            row(&mut screen, button(knob - egui::vec2(0.0, 40.0), false));
-            for events in [click(knob), click(knob)].concat() {
-                row(&mut screen, events);
+            screen.left_button(false);
+            row(&mut screen);
+            screen.cursor_moved(knob);
+            row(&mut screen);
+            for _ in 0..2 {
+                for pressed in [true, false] {
+                    screen.left_button(pressed);
+                    row(&mut screen);
+                }
             }
             let edits = screen.take_edits();
             if enabled {
-                assert!(edits.iter().any(|&(param, _)| param == rate), "an enabled knob turns");
+                assert!(edits.iter().any(|edit| matches!(edit, Edit::Set(p, _) if *p == rate)), "an enabled knob turns");
             } else {
                 assert!(edits.is_empty(), "a disabled knob does nothing: {edits:?}");
             }
@@ -728,11 +983,10 @@ mod tests {
         assert!(texts.contains(&"Off".to_owned()) && texts.contains(&"DREAM EATER".to_owned()), "{texts:?}");
 
         editor.screen.take_edits();
-        let knob = Pos2::new(last_column, row.top() + 40.0);
-        let up = |by: f32| knob - egui::vec2(0.0, by);
-        editor.play(vec![moved(knob), button(knob, true), moved(up(20.0)), moved(up(40.0)), button(up(40.0), false)]);
+        editor.move_to(Pos2::new(last_column, row.top() + 40.0));
+        editor.drag(egui::vec2(0.0, -40.0));
         let dream = editor.plugin.params.dream_eater.as_ptr();
         let edits = editor.screen.take_edits();
-        assert!(edits.iter().any(|&(param, value)| param == dream && value > 0.0), "{edits:?}");
+        assert!(edits.iter().any(|edit| matches!(edit, Edit::Set(p, value) if *p == dream && *value > 0.0)), "{edits:?}");
     }
 }

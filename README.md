@@ -73,7 +73,7 @@ The unit tests cover:
 - Dream Eater: Off is a bit-exact bypass, even right after it was on. Turning it up changes the track more. The comb sweeps on the sample's hits and lets go between them. At full, with full-scale noise and a full-scale tone on the comb's resonance, the output stays finite, below +6 dB, and dies away in silence.
 - WAV and AIFF decoding and resampling.
 - Saving and restoring the state with the embedded sample, default values, and loading 1.0 and 1.1 states.
-- Headless editor checks: everything fits the window, simulated clicks on Restart and Reverse reach the host, the Rate knob ignores input while disabled, and Dream Eater sits in Output's old place with its dark face, reads Off, and turns.
+- Headless editor checks that feed raw pointer events through the real editor, the way egui-baseview does, at 1x and 1.5x scale. The fake host never applies edits, like nih-plug's VST3 wrapper while the host is processing. They check that everything fits the window, that one click flips Restart and Reverse, lights them, and sends a begin, set, and end to the host, that Restart off greys out Rate, that every knob turns when dragged, that the disabled Rate knob ignores input, and that Dream Eater sits in Output's old place with its dark face, reads Off, and turns.
 
 `cargo run --release --features standalone --example standalone -- --backend dummy` opens the editor without a host. Set `HAUNTER_PREVIEW_SAMPLE` to a WAV path to load it at startup.
 

@@ -7,7 +7,7 @@ use nih_plug_egui::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::{load_file, GhostpumpParams, Shared};
+use crate::{load_file, HaunterParams, Shared};
 
 pub const WIDTH: u32 = 760;
 pub const HEIGHT: u32 = 600;
@@ -45,7 +45,7 @@ struct EditorState {
     dialog_open: Arc<AtomicBool>,
 }
 
-pub fn create(params: Arc<GhostpumpParams>, shared: Arc<Shared>, state: Arc<EguiState>) -> Option<Box<dyn Editor>> {
+pub fn create(params: Arc<HaunterParams>, shared: Arc<Shared>, state: Arc<EguiState>) -> Option<Box<dyn Editor>> {
     create_egui_editor(
         state,
         EditorState::default(),
@@ -82,7 +82,7 @@ struct Drawn {
 fn draw(
     context: &egui::Context,
     setter: &ParamSetter,
-    params: &Arc<GhostpumpParams>,
+    params: &Arc<HaunterParams>,
     shared: &Arc<Shared>,
     state: &mut EditorState,
 ) -> Drawn {
@@ -137,9 +137,9 @@ fn is_audio_file(path: &std::path::Path) -> bool {
         .is_some_and(|ext| AUDIO_EXTENSIONS.iter().any(|known| ext.eq_ignore_ascii_case(known)))
 }
 
-fn header(ui: &mut egui::Ui, params: &Arc<GhostpumpParams>, shared: &Arc<Shared>, state: &mut EditorState) {
+fn header(ui: &mut egui::Ui, params: &Arc<HaunterParams>, shared: &Arc<Shared>, state: &mut EditorState) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Ghostpump").size(22.0).strong().color(INK));
+        ui.label(egui::RichText::new("Haunter").size(22.0).strong().color(INK));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let busy = shared.loading.load(Ordering::Acquire) || state.dialog_open.load(Ordering::Acquire);
             let button = egui::Button::new(egui::RichText::new("Load").size(14.0).color(INK))
@@ -162,13 +162,13 @@ fn header(ui: &mut egui::Ui, params: &Arc<GhostpumpParams>, shared: &Arc<Shared>
     ui.label(egui::RichText::new(line).color(SUBTLE));
 }
 
-fn open_file_dialog(params: Arc<GhostpumpParams>, shared: Arc<Shared>, dialog_open: Arc<AtomicBool>) {
+fn open_file_dialog(params: Arc<HaunterParams>, shared: Arc<Shared>, dialog_open: Arc<AtomicBool>) {
     if dialog_open.swap(true, Ordering::AcqRel) {
         return;
     }
     std::thread::spawn(move || {
         let picked = rfd::FileDialog::new()
-            .set_title("Load a sample into Ghostpump")
+            .set_title("Load a sample into Haunter")
             .add_filter("WAV or AIFF", &AUDIO_EXTENSIONS)
             .pick_file();
         dialog_open.store(false, Ordering::Release);
@@ -181,7 +181,7 @@ fn open_file_dialog(params: Arc<GhostpumpParams>, shared: Arc<Shared>, dialog_op
 fn waveform(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
-    params: &GhostpumpParams,
+    params: &HaunterParams,
     shared: &Shared,
     state: &mut EditorState,
     hovering_files: bool,
@@ -292,7 +292,7 @@ fn waveform(
     drop_overlay(&painter, rect, hovering_files);
 }
 
-fn handle_param(params: &GhostpumpParams, handle: Handle) -> &FloatParam {
+fn handle_param(params: &HaunterParams, handle: Handle) -> &FloatParam {
     match handle {
         Handle::Start => &params.start,
         Handle::End => &params.end,
@@ -327,7 +327,7 @@ fn toggle(ui: &mut egui::Ui, setter: &ParamSetter, param: &BoolParam, text: &str
 fn toggles_and_meter(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
-    params: &GhostpumpParams,
+    params: &HaunterParams,
     shared: &Shared,
     state: &mut EditorState,
 ) -> [Rect; 2] {
@@ -593,14 +593,14 @@ mod tests {
     }
 
     struct Editor {
-        plugin: crate::Ghostpump,
+        plugin: crate::Haunter,
         screen: Screen,
         state: EditorState,
     }
 
     impl Editor {
         fn new(with_sample: bool) -> Self {
-            let plugin = crate::Ghostpump::default();
+            let plugin = crate::Haunter::default();
             if with_sample {
                 let kick = (0..4_800).map(|n| (n as f32 * 0.01).sin() * (1.0 - n as f32 / 4_800.0)).collect();
                 let sample =
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn a_disabled_knob_ignores_drags_and_double_clicks() {
-        let plugin = crate::Ghostpump::default();
+        let plugin = crate::Haunter::default();
         let rate = plugin.params.rate.as_ptr();
         for enabled in [true, false] {
             let mut screen = Screen::new();

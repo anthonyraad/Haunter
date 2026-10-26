@@ -1,6 +1,6 @@
-﻿# Ghostpump: build brief
+﻿# Haunter: build brief
 
-Build a Windows 64-bit **VST3 audio effect** (not an instrument) for Cubase called **Ghostpump**. The user loads a sample (typically a kick or any one-shot), and the sample's volume shape ducks the incoming track, like a ghost-kick sidechain. The sample can also be blended into the output.
+Build a Windows 64-bit **VST3 audio effect** (not an instrument) for Cubase called **Haunter**. The user loads a sample (typically a kick or any one-shot), and the sample's volume shape ducks the incoming track, like a ghost-kick sidechain. The sample can also be blended into the output.
 
 Follow the same Rust approach as `..\Sparkletop\plugin` (look at its Cargo.toml, .cargo config, static CRT, and VST3 bundle layout) and the knob look of the Dropout plugin (`..\Sparkletop` commit 56acf79 copied Dropout's disc, track, and blue arc knobs; reuse that style).
 
@@ -22,6 +22,6 @@ Follow the same Rust approach as `..\Sparkletop\plugin` (look at its Cargo.toml,
 
 ## Deliverables
 1. Source in this repo, with DSP unit tests (envelope follower, tempo-grid trigger timing, Restart on vs off, Reverse, HP and LP changing the output, start/end, Dream Eater Off being a bypass, Dream Eater changing the output more as it turns up and staying stable at max, state save/restore with the embedded sample, loading old states).
-2. `cargo build --release` produces the DLL. Package it as `release\Ghostpump.vst3\Contents\x86_64-win\Ghostpump.vst3` with the proper bundle layout.
+2. `cargo build --release` produces the DLL. Package it as `release\Haunter.vst3\Contents\x86_64-win\Haunter.vst3` with the proper bundle layout.
 3. README with the controls and the install steps.
 4. Commit when it builds and the tests pass.

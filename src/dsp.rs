@@ -1,4 +1,4 @@
-//! Ghostpump's audio engine. Nothing here allocates while processing.
+//! Haunter's audio engine. Nothing here allocates while processing.
 
 use nih_plug::prelude::Enum;
 use std::sync::Arc;

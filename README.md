@@ -1,21 +1,21 @@
-# Ghostpump
+# Haunter
 
-Ghostpump is a 64-bit Windows VST3 audio effect for Cubase. You load a sample, usually a kick or another one-shot. On every beat of a tempo-synced grid, the sample's volume shape ducks the track Ghostpump is inserted on, like sidechaining to a ghost kick. You can also blend the sample into the output, but by default you only hear the ducking.
+Haunter is a 64-bit Windows VST3 audio effect for Cubase. You load a sample, usually a kick or another one-shot. On every beat of a tempo-synced grid, the sample's volume shape ducks the track Haunter is inserted on, like sidechaining to a ghost kick. You can also blend the sample into the output, but by default you only hear the ducking.
 
-The plugin is `release/Ghostpump.vst3`.
+The plugin is `release/Haunter.vst3`.
 
 ## Install in Cubase
 
-1. Copy the whole `release\Ghostpump.vst3` folder to `C:\Program Files\Common Files\VST3\`. You need administrator rights for that folder.
+1. Copy the whole `release\Haunter.vst3` folder to `C:\Program Files\Common Files\VST3\`. You need administrator rights for that folder.
 2. In Cubase, open Studio > VST Plug-in Manager and rescan, or restart Cubase.
-3. Insert Ghostpump on an audio, group, or FX channel. It is listed under Dynamics.
+3. Insert Haunter on an audio, group, or FX channel. It is listed under Dynamics.
 4. Drag a WAV or AIFF onto the plugin window, or click **Load**, then press play.
 
 The plugin works in stereo or mono and adds no latency. The C runtime is linked statically, so nothing else needs installing.
 
 ## How it works
 
-With **Restart** on (the default), Ghostpump plays the selected region once from Start on every line of the tempo grid while the transport plays. Grid lines are counted from the start of the project. With Restart off, the Rate knob is greyed out and the region loops continuously from the moment the transport starts. Either way, nothing starts while the transport is stopped, and a pass that is already playing finishes, then stops.
+With **Restart** on (the default), Haunter plays the selected region once from Start on every line of the tempo grid while the transport plays. Grid lines are counted from the start of the project. With Restart off, the Rate knob is greyed out and the region loops continuously from the moment the transport starts. Either way, nothing starts while the transport is stopped, and a pass that is already playing finishes, then stops.
 
 The HP and LP filters work on the sample itself as it plays. An envelope follower runs on the filtered sample, and its level sets how far the track is turned down. Depth is measured against the unfiltered sample's peak over the region: with the filters off, the track ducks by exactly Depth at the sample's loudest point. Filtering part of the sample away makes the duck shallower, and changes what you hear through Blend.
 
@@ -62,7 +62,7 @@ cargo test --release
 .\scripts\package.ps1
 ```
 
-`package.ps1` runs `cargo build --release` and copies `target\release\ghostpump.dll` to `release\Ghostpump.vst3\Contents\x86_64-win\Ghostpump.vst3`.
+`package.ps1` runs `cargo build --release` and copies `target\release\haunter.dll` to `release\Haunter.vst3\Contents\x86_64-win\Haunter.vst3`.
 
 The unit tests cover:
 
@@ -75,6 +75,6 @@ The unit tests cover:
 - Saving and restoring the state with the embedded sample, default values, and loading 1.0 and 1.1 states.
 - Headless editor checks: everything fits the window, simulated clicks on Restart and Reverse reach the host, the Rate knob ignores input while disabled, and Dream Eater sits in Output's old place with its dark face, reads Off, and turns.
 
-`cargo run --release --features standalone --example standalone -- --backend dummy` opens the editor without a host. Set `GHOSTPUMP_PREVIEW_SAMPLE` to a WAV path to load it at startup.
+`cargo run --release --features standalone --example standalone -- --backend dummy` opens the editor without a host. Set `HAUNTER_PREVIEW_SAMPLE` to a WAV path to load it at startup.
 
 Upstream egui-baseview ignores file drops. `vendor/egui-baseview` is a copy of the revision nih-plug uses, patched to pass dropped files to egui. See `vendor/egui-baseview/PATCHED.md`.

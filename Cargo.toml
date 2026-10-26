@@ -1,13 +1,13 @@
 [package]
-name = "ghostpump_vst"
+name = "haunter_vst"
 version = "1.2.0"
 edition = "2021"
 license = "MIT"
-description = "Ghostpump, a VST3 effect that ducks a track with the volume shape of a loaded sample."
+description = "Haunter, a VST3 effect that ducks a track with the volume shape of a loaded sample."
 publish = false
 
 [lib]
-name = "ghostpump"
+name = "haunter"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]

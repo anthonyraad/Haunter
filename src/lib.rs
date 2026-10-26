@@ -106,7 +106,7 @@ impl Shared {
 }
 
 /// Decodes and installs a WAV or AIFF on a background thread.
-pub fn load_file(path: PathBuf, params: Arc<GhostpumpParams>, shared: Arc<Shared>) {
+pub fn load_file(path: PathBuf, params: Arc<HaunterParams>, shared: Arc<Shared>) {
     if shared.loading.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -130,7 +130,7 @@ pub fn load_file(path: PathBuf, params: Arc<GhostpumpParams>, shared: Arc<Shared
     });
 }
 
-pub fn install_sample(sample: EmbeddedSample, params: &GhostpumpParams, shared: &Shared) {
+pub fn install_sample(sample: EmbeddedSample, params: &HaunterParams, shared: &Shared) {
     let host_rate = shared.host_rate.load(Ordering::Acquire) as f64;
     let prepared = Arc::new(PreparedSample::new(&sample, host_rate));
     shared.show_sample(Some(&sample));
@@ -141,7 +141,7 @@ pub fn install_sample(sample: EmbeddedSample, params: &GhostpumpParams, shared: 
 }
 
 #[derive(Params)]
-pub struct GhostpumpParams {
+pub struct HaunterParams {
     #[persist = "editor-state"]
     editor_state: Arc<EguiState>,
 
@@ -274,9 +274,9 @@ fn dream_eater_param() -> FloatParam {
         }))
 }
 
-impl GhostpumpParams {
+impl HaunterParams {
     fn new(sample_seconds: Arc<AtomicF32>) -> Self {
-        GhostpumpParams {
+        HaunterParams {
             editor_state: EguiState::from_size(editor::WIDTH, editor::HEIGHT),
             sample: SampleSlot::default(),
             rate: EnumParam::new("Rate", SyncRate::Quarter),
@@ -325,23 +325,23 @@ fn migrate_state(state: &mut PluginState) {
     state.params.entry("dream-eater".to_owned()).or_insert(ParamValue::F32(0.0));
 }
 
-pub struct Ghostpump {
-    params: Arc<GhostpumpParams>,
+pub struct Haunter {
+    params: Arc<HaunterParams>,
     shared: Arc<Shared>,
     engine: Engine,
     /// The sample generation the engine is playing.
     engine_generation: u64,
 }
 
-impl Default for Ghostpump {
+impl Default for Haunter {
     fn default() -> Self {
         let shared = Arc::new(Shared::new());
-        let params = Arc::new(GhostpumpParams::new(shared.sample_seconds.clone()));
+        let params = Arc::new(HaunterParams::new(shared.sample_seconds.clone()));
         #[cfg(feature = "standalone")]
-        if let Some(path) = std::env::var_os("GHOSTPUMP_PREVIEW_SAMPLE") {
+        if let Some(path) = std::env::var_os("HAUNTER_PREVIEW_SAMPLE") {
             load_file(path.into(), params.clone(), shared.clone());
         }
-        Ghostpump {
+        Haunter {
             params,
             shared,
             engine: Engine::new(48_000.0),
@@ -350,7 +350,7 @@ impl Default for Ghostpump {
     }
 }
 
-impl Ghostpump {
+impl Haunter {
     /// Rebuilds the playback copy from the persisted sample if it or the host rate changed.
     fn sync_sample(&mut self, sample_rate: f64) {
         let generation = self.params.sample.generation();
@@ -388,9 +388,9 @@ impl Ghostpump {
     }
 }
 
-impl Plugin for Ghostpump {
-    const NAME: &'static str = "Ghostpump";
-    const VENDOR: &'static str = "Ghostpump";
+impl Plugin for Haunter {
+    const NAME: &'static str = "Haunter";
+    const VENDOR: &'static str = "Haunter";
     const URL: &'static str = "";
     const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -487,12 +487,15 @@ impl Plugin for Ghostpump {
     }
 }
 
-impl Vst3Plugin for Ghostpump {
-    const VST3_CLASS_ID: [u8; 16] = *b"GhostpumpDuckFx1";
+impl Vst3Plugin for Haunter {
+    // Never change these bytes: hosts find the plugin in saved projects by this ID.
+    const VST3_CLASS_ID: [u8; 16] = [
+        0x47, 0x68, 0x6F, 0x73, 0x74, 0x70, 0x75, 0x6D, 0x70, 0x44, 0x75, 0x63, 0x6B, 0x46, 0x78, 0x31,
+    ];
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx, Vst3SubCategory::Dynamics];
 }
 
-nih_export_vst3!(Ghostpump);
+nih_export_vst3!(Haunter);
 
 #[cfg(test)]
 mod tests {
@@ -513,7 +516,7 @@ mod tests {
 
     /// Plays two beats at 120 bpm through the plugin's engine and returns the left output for a
     /// track held at 1.0 with the sample blended in.
-    fn render(plugin: &mut Ghostpump, host_rate: f64) -> Vec<f32> {
+    fn render(plugin: &mut Haunter, host_rate: f64) -> Vec<f32> {
         plugin.engine.prepare(host_rate);
         plugin.sync_sample(host_rate);
         plugin.engine.finish_analysis();
@@ -531,23 +534,23 @@ mod tests {
 
     /// The non-parameter part of the plugin state, serialized the way nih-plug's wrapper does it:
     /// each persisted field as a JSON string, inside the JSON state object.
-    fn save_state(plugin: &Ghostpump) -> String {
+    fn save_state(plugin: &Haunter) -> String {
         serde_json::to_string(&plugin.params.serialize_fields()).unwrap()
     }
 
-    fn load_state(plugin: &Ghostpump, state: &str) {
+    fn load_state(plugin: &Haunter, state: &str) {
         let fields: BTreeMap<String, String> = serde_json::from_str(state).unwrap();
         plugin.params.deserialize_fields(&fields);
     }
 
     #[test]
     fn state_embeds_the_sample_and_restores_it() {
-        let mut original = Ghostpump::default();
+        let mut original = Haunter::default();
         install_sample(kick(44_100.0), &original.params, &original.shared);
         let state = save_state(&original);
         assert!(state.contains("ghost kick.wav"));
 
-        let mut restored = Ghostpump::default();
+        let mut restored = Haunter::default();
         assert!(restored.params.sample.read(|s| s.is_none()));
         load_state(&restored, &state);
 
@@ -566,7 +569,7 @@ mod tests {
 
     #[test]
     fn parameter_ids_are_stable() {
-        let plugin = Ghostpump::default();
+        let plugin = Haunter::default();
         let ids: Vec<String> = plugin.params.param_map().into_iter().map(|(id, _, _)| id).collect();
         for id in [
             "rate", "restart", "reverse", "start", "end", "depth", "attack", "release", "hp", "lp",
@@ -582,7 +585,7 @@ mod tests {
 
     #[test]
     fn defaults() {
-        let params = &Ghostpump::default().params;
+        let params = &Haunter::default().params;
         let volume = &params.sample_volume;
         assert_eq!(volume.default_plain_value(), 1.0);
         assert_eq!(volume.to_string(), "0.0 dB");
@@ -622,7 +625,7 @@ mod tests {
             (ParamValue::I32(1), false),
         ] {
             let mut state = old_state(mode.clone());
-            Ghostpump::filter_state(&mut state);
+            Haunter::filter_state(&mut state);
             assert!(matches!(state.params.get("restart"), Some(ParamValue::Bool(r)) if *r == restart), "{mode:?}");
             assert!(!state.params.contains_key("mode") && !state.params.contains_key("invert"));
             assert!(matches!(state.params.get("depth"), Some(ParamValue::F32(v)) if *v == 0.5), "other parameters are kept");
@@ -632,7 +635,7 @@ mod tests {
         current.params.insert("restart".to_owned(), ParamValue::Bool(false));
         current.params.insert("dream-eater".to_owned(), ParamValue::F32(0.4));
         let before = format!("{:?}", current.params);
-        Ghostpump::filter_state(&mut current);
+        Haunter::filter_state(&mut current);
         assert_eq!(format!("{:?}", current.params), before, "new states are left alone");
     }
 
@@ -657,7 +660,7 @@ mod tests {
         ] {
             params.insert(id.to_owned(), value);
         }
-        let donor = Ghostpump::default();
+        let donor = Haunter::default();
         install_sample(kick(44_100.0), &donor.params, &donor.shared);
         PluginState { version: "1.1.0".into(), params, fields: donor.params.serialize_fields() }
     }
@@ -665,14 +668,14 @@ mod tests {
     #[test]
     fn states_from_1_1_load_with_output_dropped_and_dream_eater_off() {
         let mut state = state_from_1_1();
-        Ghostpump::filter_state(&mut state);
+        Haunter::filter_state(&mut state);
         assert!(!state.params.contains_key("output"), "Output no longer exists");
         assert!(matches!(state.params.get("depth"), Some(ParamValue::F32(v)) if *v == 0.5), "other parameters are kept");
         assert!(matches!(state.params.get("dream-eater"), Some(ParamValue::F32(v)) if *v == 0.0));
 
         // The wrapper looks each saved parameter up by ID and skips any it doesn't know, so every
         // one must still exist with a matching type.
-        let plugin = Ghostpump::default();
+        let plugin = Haunter::default();
         let known: BTreeMap<String, ParamPtr> =
             plugin.params.param_map().into_iter().map(|(id, ptr, _)| (id, ptr)).collect();
         for (id, value) in &state.params {
@@ -694,18 +697,18 @@ mod tests {
 
     #[test]
     fn restoring_state_replaces_the_playing_sample() {
-        let mut plugin = Ghostpump::default();
+        let mut plugin = Haunter::default();
         render(&mut plugin, 48_000.0);
         assert!(plugin.engine.sample().is_none());
 
-        let donor = Ghostpump::default();
+        let donor = Haunter::default();
         install_sample(kick(48_000.0), &donor.params, &donor.shared);
         load_state(&plugin, &save_state(&donor));
         let output = render(&mut plugin, 48_000.0);
         assert!(plugin.engine.sample().is_some());
         assert!(output.iter().any(|&v| v < 0.5), "the restored sample ducks the track");
 
-        let empty = Ghostpump::default();
+        let empty = Haunter::default();
         load_state(&plugin, &save_state(&empty));
         render(&mut plugin, 48_000.0);
         assert!(plugin.engine.sample().is_none(), "a state without a sample clears it");
@@ -713,7 +716,7 @@ mod tests {
 
     #[test]
     fn samples_are_resampled_to_the_host_rate() {
-        let mut plugin = Ghostpump::default();
+        let mut plugin = Haunter::default();
         plugin.params.sample.replace(Some(kick(44_100.0)));
         render(&mut plugin, 96_000.0);
         let prepared = plugin.engine.sample().unwrap();
@@ -725,7 +728,7 @@ mod tests {
 
     #[test]
     fn the_audio_thread_adopts_a_loaded_sample() {
-        let mut plugin = Ghostpump::default();
+        let mut plugin = Haunter::default();
         plugin.engine.prepare(48_000.0);
         plugin.shared.host_rate.store(48_000.0, Ordering::Release);
         install_sample(kick(48_000.0), &plugin.params, &plugin.shared);
@@ -743,7 +746,7 @@ mod tests {
 
     #[test]
     fn region_readouts_use_the_sample_length() {
-        let plugin = Ghostpump::default();
+        let plugin = Haunter::default();
         assert_eq!(plugin.params.end.to_string(), "100%");
         plugin.shared.sample_seconds.store(0.5, Ordering::Relaxed);
         assert_eq!(plugin.params.end.to_string(), "500 ms");

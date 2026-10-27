@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::dream::KeyChoice;
+use crate::dsp::Direction;
 use crate::preset::{self, Choice};
 use crate::{apply_preset, load_file, read_preset, save_preset, HaunterParams, Shared};
 
@@ -109,7 +110,7 @@ struct Drawn {
     /// The waveform was clicked to choose a file.
     browse: bool,
     restart: Rect,
-    reverse: Rect,
+    direction: Rect,
     /// The first row of knobs, which starts with Rate.
     upper_knobs: Rect,
     /// The second row of knobs, which ends with Dream Eater.
@@ -147,7 +148,7 @@ fn draw(
             let can_browse = !busy && !hovering_files;
             let (waveform, browse) = waveform(ui, setter, params, shared, state, hovering_files, can_browse);
             ui.add_space(10.0);
-            let ([restart, reverse], restart_on) = toggles_and_meter(ui, setter, params, shared, state);
+            let ([restart, direction], restart_on) = toggles_and_meter(ui, setter, params, shared, state);
             ui.add_space(8.0);
             // Without Restart the region just loops, so the grid spacing does nothing.
             let (upper_knobs, _) = knob_row(ui, setter, &[
@@ -166,7 +167,7 @@ fn draw(
                 ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level }),
             ]);
             key_menu(&lower[4], params);
-            Drawn { used: ui.min_rect(), preset_menu, save, waveform, browse, restart, reverse, upper_knobs, lower_knobs }
+            Drawn { used: ui.min_rect(), preset_menu, save, waveform, browse, restart, direction, upper_knobs, lower_knobs }
         })
         .inner
 }
@@ -570,7 +571,70 @@ fn toggle(ui: &mut egui::Ui, setter: &ParamSetter, param: &BoolParam, shared: &S
     (response.rect, toggling.map_or(param.value(), |edit| edit.target))
 }
 
-/// Returns where the Restart and Reverse toggles were drawn, and whether Restart shows on.
+/// A Direction edit the host has been sent but has not applied to the parameter yet.
+#[derive(Clone, Copy)]
+struct Choosing {
+    target: Direction,
+    /// `Shared::processed_blocks` when the edit was sent.
+    sent_at: u64,
+}
+
+/// The Direction menu, looking like the preset menu. Returns where it was drawn.
+///
+/// A choice is sent as one whole edit, and the menu shows it until the host applies it, the way a
+/// toggle does.
+fn direction_menu(ui: &mut egui::Ui, setter: &ParamSetter, param: &EnumParam<Direction>, shared: &Shared) -> Rect {
+    let memory = ui.make_persistent_id("direction");
+    let blocks = shared.processed_blocks.load(Ordering::Relaxed);
+    let choosing = ui
+        .memory(|mem| mem.data.get_temp::<Choosing>(memory))
+        .filter(|edit| param.value() != edit.target && blocks < edit.sent_at + HOST_GRACE_BLOCKS);
+    let shown = choosing.map_or(param.value(), |edit| edit.target);
+    let name = |direction: Direction| Direction::variants()[direction.to_index()];
+
+    let mut picked = None;
+    let menu = ui
+        .scope(|ui| {
+            ui.spacing_mut().interact_size.y = 26.0;
+            let widgets = &mut ui.visuals_mut().widgets;
+            for look in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
+                look.weak_bg_fill = DISC;
+                look.bg_stroke = Stroke::new(1.0_f32, OUTLINE);
+            }
+            egui::ComboBox::from_id_salt("direction")
+                .width(110.0)
+                .selected_text(egui::RichText::new(name(shown)).size(13.0).color(INK))
+                .show_ui(ui, |ui| {
+                    for direction in [Direction::Forward, Direction::Backward, Direction::Levitate] {
+                        if ui.selectable_label(direction == shown, name(direction)).clicked() {
+                            picked = Some(direction);
+                        }
+                    }
+                })
+        })
+        .inner;
+    menu.response.clone().on_hover_text(
+        "Forward plays the region from S to E.\nBackward plays it from E to S, turning round at once when chosen.\nLevitate bounces between S and E.",
+    );
+
+    let choosing = match picked {
+        Some(target) => {
+            setter.begin_set_parameter(param);
+            setter.set_parameter(param, target);
+            setter.end_set_parameter(param);
+            Some(Choosing { target, sent_at: blocks })
+        }
+        None => choosing,
+    };
+    ui.memory_mut(|mem| match choosing {
+        Some(edit) => mem.data.insert_temp(memory, edit),
+        None => mem.data.remove::<Choosing>(memory),
+    });
+    menu.response.rect
+}
+
+/// Returns where the Restart toggle and the Direction menu were drawn, and whether Restart shows
+/// on.
 fn toggles_and_meter(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
@@ -587,8 +651,7 @@ fn toggles_and_meter(
             "Restart",
             "On: the region starts again on every Rate step.\nOff: it loops continuously and Rate is ignored.",
         );
-        let (reverse, _) =
-            toggle(ui, setter, &params.reverse, shared, "Reverse", "Plays the region backwards, from E to S.");
+        let direction = direction_menu(ui, setter, &params.direction, shared);
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let latest = shared.gain_reduction_db.swap(0.0, Ordering::Relaxed);
@@ -609,7 +672,7 @@ fn toggles_and_meter(
             ui.label(egui::RichText::new(format!("{:>5.1} dB", -state.meter_db)).monospace().color(INK));
             ui.label(egui::RichText::new("GAIN REDUCTION").size(11.0).color(SUBTLE));
         });
-        ([restart, reverse], restart_on)
+        ([restart, direction], restart_on)
     })
     .inner
 }
@@ -1202,91 +1265,86 @@ mod tests {
     }
 
     #[test]
-    fn a_click_flips_restart_and_reverse_before_the_host_answers() {
+    fn a_click_flips_restart_before_the_host_answers() {
         let mut editor = Editor::new(true);
         let drawn = editor.settle();
         editor.screen.take_edits();
         let restart = editor.plugin.params.restart.as_ptr();
-        let reverse = editor.plugin.params.reverse.as_ptr();
-        assert!(editor.screen.lit(drawn.restart) && !editor.screen.lit(drawn.reverse));
+        assert!(editor.screen.lit(drawn.restart));
 
-        editor.move_to(drawn.reverse.center());
+        editor.move_to(drawn.restart.center());
         editor.wait(0.7);
         assert!(
-            editor.screen.texts().iter().any(|text| text.starts_with("Plays the region backwards")),
+            editor.screen.texts().iter().any(|text| text.starts_with("On: the region starts again")),
             "the tooltip is up, as it is when someone rests on the button before clicking"
         );
         editor.screen.left_button(true);
         editor.frame();
-        assert_eq!(editor.screen.take_edits(), [Edit::Begin(reverse), Edit::Set(reverse, 1.0)], "the press opens the edit");
+        assert_eq!(editor.screen.take_edits(), [Edit::Begin(restart), Edit::Set(restart, 0.0)], "the press opens the edit");
         for _ in 0..5 {
             editor.frame();
         }
-        assert_eq!(editor.screen.take_edits(), [Edit::Set(reverse, 1.0); 5], "held open like a knob drag");
-        assert!(editor.screen.lit(drawn.reverse), "lit while the button is still down");
+        assert_eq!(editor.screen.take_edits(), [Edit::Set(restart, 0.0); 5], "held open like a knob drag");
+        assert!(!editor.screen.lit(drawn.restart), "off while the button is still down");
         editor.screen.left_button(false);
         editor.frame();
-        assert_eq!(editor.screen.take_edits(), [Edit::Set(reverse, 1.0), Edit::End(reverse)], "the release closes it");
+        assert_eq!(editor.screen.take_edits(), [Edit::Set(restart, 0.0), Edit::End(restart)], "the release closes it");
         editor.wait(1.0);
         assert!(editor.screen.take_edits().is_empty());
-        assert!(!editor.plugin.params.reverse.value(), "the host has not sent the edit back yet");
-        assert!(editor.screen.lit(drawn.reverse), "but Reverse shows on");
+        assert!(editor.plugin.params.restart.value(), "the host has not sent the edit back yet");
+        assert!(!editor.screen.lit(drawn.restart), "but Restart shows off");
 
         editor.click_at(drawn.restart.center());
-        assert_one_edit(&editor.screen.take_edits(), restart, 0.0);
-        assert!(!editor.screen.lit(drawn.restart), "Restart shows off");
-
-        editor.click_at(drawn.reverse.center());
-        assert_one_edit(&editor.screen.take_edits(), reverse, 0.0);
-        assert!(!editor.screen.lit(drawn.reverse), "a second click turns Reverse back off");
+        assert_one_edit(&editor.screen.take_edits(), restart, 1.0);
+        assert!(editor.screen.lit(drawn.restart), "a second click turns Restart back on");
     }
 
     #[test]
     fn a_press_and_release_inside_one_frame_still_flips() {
         let mut editor = Editor::new(true);
         let drawn = editor.settle();
-        let reverse = editor.plugin.params.reverse.as_ptr();
-        editor.move_to(drawn.reverse.center());
+        let restart = editor.plugin.params.restart.as_ptr();
+        editor.move_to(drawn.restart.center());
         editor.screen.take_edits();
         editor.screen.left_button(true);
         editor.screen.left_button(false);
         editor.frame();
-        assert_eq!(editor.screen.take_edits(), [Edit::Begin(reverse), Edit::Set(reverse, 1.0), Edit::End(reverse)]);
+        assert_eq!(editor.screen.take_edits(), [Edit::Begin(restart), Edit::Set(restart, 0.0), Edit::End(restart)]);
         editor.frame();
-        assert!(editor.screen.lit(drawn.reverse));
+        assert!(!editor.screen.lit(drawn.restart));
     }
 
     #[test]
     fn a_toggle_shows_the_parameter_again_once_the_host_has_had_blocks_to_apply_it() {
         let mut editor = Editor::new(true);
         let drawn = editor.settle();
-        editor.click_at(drawn.reverse.center());
+        editor.click_at(drawn.restart.center());
         editor.wait(2.0);
-        assert!(editor.screen.lit(drawn.reverse), "no blocks yet, so the host has not had its chance");
+        assert!(!editor.screen.lit(drawn.restart), "no blocks yet, so the host has not had its chance");
 
         let blocks = &editor.plugin.shared.processed_blocks;
         blocks.fetch_add(HOST_GRACE_BLOCKS - 1, Ordering::Relaxed);
         editor.frame();
-        assert!(editor.screen.lit(drawn.reverse));
+        assert!(!editor.screen.lit(drawn.restart));
         editor.plugin.shared.processed_blocks.fetch_add(1, Ordering::Relaxed);
         editor.frame();
-        assert!(!editor.screen.lit(drawn.reverse), "the host dropped the edit, so the button shows the real value");
+        assert!(editor.screen.lit(drawn.restart), "the host dropped the edit, so the button shows the real value");
     }
 
     #[test]
     fn the_press_decides_what_a_click_does() {
         let mut editor = Editor::new(true);
         let drawn = editor.settle();
-        let reverse = editor.plugin.params.reverse.as_ptr();
+        let restart = editor.plugin.params.restart.as_ptr();
         editor.screen.take_edits();
 
-        editor.move_to(drawn.reverse.center());
+        editor.move_to(drawn.restart.center());
         editor.drag(egui::vec2(60.0, 0.0));
-        assert_one_edit(&editor.screen.take_edits(), reverse, 1.0);
+        assert_one_edit(&editor.screen.take_edits(), restart, 0.0);
 
-        let beside = Pos2::new(drawn.reverse.right() + 20.0, drawn.reverse.center().y);
+        let beside = Pos2::new(drawn.direction.right() + 20.0, drawn.restart.center().y);
         editor.click_at(beside);
-        editor.drag(drawn.reverse.center() - beside);
+        editor.drag(drawn.restart.center() - beside);
         assert!(editor.screen.take_edits().is_empty(), "pressing beside the toggles does nothing");
     }
 
@@ -1295,9 +1353,74 @@ mod tests {
         let mut editor = Editor::scaled(true, 1.5);
         let drawn = editor.settle();
         editor.screen.take_edits();
-        editor.click_at(drawn.reverse.center());
-        assert_one_edit(&editor.screen.take_edits(), editor.plugin.params.reverse.as_ptr(), 1.0);
-        assert!(editor.screen.lit(drawn.reverse));
+        editor.click_at(drawn.restart.center());
+        assert_one_edit(&editor.screen.take_edits(), editor.plugin.params.restart.as_ptr(), 0.0);
+        assert!(!editor.screen.lit(drawn.restart));
+        pick_direction(&mut editor, "Levitate");
+        assert_one_edit(&editor.screen.take_edits(), editor.plugin.params.direction.as_ptr(), 1.0);
+    }
+
+    /// The text the Direction menu shows.
+    fn shown_direction(editor: &mut Editor) -> String {
+        let menu = editor.frame().direction;
+        let texts: Vec<String> = editor
+            .screen
+            .text_shapes()
+            .into_iter()
+            .filter(|(_, rect, _)| menu.contains(rect.center()))
+            .map(|(text, _, _)| text)
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        texts[0].clone()
+    }
+
+    fn pick_direction(editor: &mut Editor, name: &str) {
+        let menu = editor.frame().direction;
+        editor.click_at(menu.center());
+        editor.frame();
+        let entries: Vec<(String, Rect)> = editor
+            .screen
+            .text_shapes()
+            .into_iter()
+            .filter(|(_, rect, _)| rect.top() > menu.bottom() - 1.0)
+            .map(|(text, rect, _)| (text, rect))
+            .collect();
+        let names: Vec<&str> = entries.iter().map(|(text, _)| text.as_str()).filter(|text| ["Forward", "Backward", "Levitate"].contains(text)).collect();
+        assert_eq!(names, ["Forward", "Backward", "Levitate"], "the menu lists the directions in order");
+        let (_, rect) = entries.iter().find(|(text, _)| text == name).unwrap();
+        editor.click_at(rect.center());
+        editor.frame();
+    }
+
+    #[test]
+    fn the_direction_menu_sends_the_choice_and_shows_it_until_the_host_answers() {
+        let mut editor = Editor::new(true);
+        editor.settle();
+        editor.screen.take_edits();
+        let direction = editor.plugin.params.direction.as_ptr();
+        assert_eq!(shown_direction(&mut editor), "Forward");
+
+        let menu = editor.frame().direction;
+        editor.move_to(menu.center());
+        editor.wait(0.7);
+        assert!(
+            editor.screen.texts().iter().any(|text| text.starts_with("Forward plays")),
+            "the menu explains the choices"
+        );
+
+        pick_direction(&mut editor, "Backward");
+        assert_eq!(editor.screen.take_edits(), [Edit::Begin(direction), Edit::Set(direction, 0.5), Edit::End(direction)]);
+        editor.wait(1.0);
+        assert!(editor.screen.take_edits().is_empty(), "one edit per choice");
+        assert_eq!(editor.plugin.params.direction.value(), Direction::Forward, "the host has not sent the edit back yet");
+        assert_eq!(shown_direction(&mut editor), "Backward", "but the menu shows the choice");
+
+        editor.plugin.shared.processed_blocks.fetch_add(HOST_GRACE_BLOCKS, Ordering::Relaxed);
+        assert_eq!(shown_direction(&mut editor), "Forward", "the host dropped the edit, so the menu shows the real value");
+
+        pick_direction(&mut editor, "Levitate");
+        assert_one_edit(&editor.screen.take_edits(), direction, 1.0);
+        assert_eq!(shown_direction(&mut editor), "Levitate");
     }
 
     #[test]
@@ -1638,7 +1761,7 @@ mod tests {
         editor.settle();
         let mut preset =
             crate::preset::Preset { sample: Some(another_sample()), dream_key: KeyChoice::Fixed(7), ..Default::default() };
-        for (id, value) in [("rate", 4.0), ("restart", 0.0), ("reverse", 1.0), ("start", 0.125), ("depth", 0.4), ("release", 321.5)] {
+        for (id, value) in [("rate", 4.0), ("restart", 0.0), ("direction", 1.0), ("start", 0.125), ("depth", 0.4), ("release", 321.5)] {
             preset.values.insert(id.to_owned(), value);
         }
         editor.plugin.shared.user_presets.save("Snare Gate", &preset).unwrap();
@@ -1685,7 +1808,7 @@ mod tests {
 
         // The test host never applies edits, so move what the preset set instead of the knob.
         editor.plugin.shared.processed_blocks.fetch_add(HOST_GRACE_BLOCKS, Ordering::Relaxed);
-        for (id, value) in [("depth", 0.3), ("restart", 0.0), ("reverse", 1.0), ("start", 0.2)] {
+        for (id, value) in [("depth", 0.3), ("restart", 0.0), ("direction", 2.0), ("start", 0.2)] {
             let params = &editor.plugin.params;
             let original = params.preset.get();
             let mut moved = original.clone();

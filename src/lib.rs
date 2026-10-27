@@ -14,7 +14,7 @@ pub mod preset;
 pub mod sample;
 
 use dream::KeyChoice;
-use dsp::{Engine, FrameGains, Settings, SyncRate, TransportInfo, HP_OFF_HZ, LP_OFF_HZ};
+use dsp::{Direction, Engine, FrameGains, Settings, SyncRate, TransportInfo, HP_OFF_HZ, LP_OFF_HZ};
 use preset::{Choice, Preset, Selection, SelectionSlot, UserPresets};
 use sample::{EmbeddedSample, Overview, PreparedSample};
 
@@ -255,8 +255,10 @@ pub struct HaunterParams {
     pub rate: EnumParam<SyncRate>,
     #[id = "restart"]
     pub restart: BoolParam,
-    #[id = "reverse"]
-    pub reverse: BoolParam,
+    /// Replaced the Reverse toggle (ID `reverse`) in 1.7. A new ID, since a toggle's saved value
+    /// and automation don't fit three choices; old states map Reverse onto it in `migrate_state`.
+    #[id = "direction"]
+    pub direction: EnumParam<Direction>,
     #[id = "start"]
     pub start: FloatParam,
     #[id = "end"]
@@ -386,7 +388,7 @@ impl HaunterParams {
             dream_key: KeyChoiceSlot::default(),
             rate: EnumParam::new("Rate", SyncRate::Quarter),
             restart: BoolParam::new("Restart", true),
-            reverse: BoolParam::new("Reverse", false),
+            direction: EnumParam::new("Direction", Direction::Forward),
             start: region_param("Start", 0.0, sample_seconds.clone()),
             end: region_param("End", 1.0, sample_seconds),
             depth: percent_param("Depth", 0.75),
@@ -405,7 +407,7 @@ impl HaunterParams {
         Settings {
             rate: self.rate.value(),
             restart: self.restart.value(),
-            reverse: self.reverse.value(),
+            direction: self.direction.value(),
             start: self.start.value(),
             end: self.end.value(),
             attack_ms: self.attack.value(),
@@ -421,8 +423,17 @@ impl HaunterParams {
 /// becomes Restart off, and Invert is dropped. Up to 1.1, the Output gain is dropped, because the
 /// output is now always at unity. A state without Dream Eater loads with it Off, and one without
 /// a Dream Eater key loads on Auto, since whatever a state leaves out would otherwise keep the
-/// value it had.
+/// value it had. Up to 1.6, Reverse on becomes Direction Backward and off becomes Forward, and a
+/// state with neither loads on Forward.
 fn migrate_state(state: &mut PluginState) {
+    if let Some(reverse) = state.params.remove("reverse") {
+        let backward = matches!(reverse, ParamValue::Bool(true))
+            || matches!(reverse, ParamValue::F32(v) if v >= 0.5)
+            || matches!(reverse, ParamValue::I32(v) if v != 0);
+        let direction = if backward { "backward" } else { "forward" };
+        state.params.entry("direction".to_owned()).or_insert(ParamValue::String(direction.to_owned()));
+    }
+    state.params.entry("direction".to_owned()).or_insert(ParamValue::String("forward".to_owned()));
     if let Some(mode) = state.params.remove("mode") {
         let looped = matches!(&mode, ParamValue::String(id) if id == "loop") || matches!(mode, ParamValue::I32(1));
         state.params.entry("restart".to_owned()).or_insert(ParamValue::Bool(!looped));
@@ -745,12 +756,12 @@ mod tests {
         let plugin = Haunter::default();
         let ids: Vec<String> = plugin.params.param_map().into_iter().map(|(id, _, _)| id).collect();
         for id in [
-            "rate", "restart", "reverse", "start", "end", "depth", "attack", "release", "hp", "lp",
+            "rate", "restart", "direction", "start", "end", "depth", "attack", "release", "hp", "lp",
             "sample-volume", "blend", "mix", "dream-eater",
         ] {
             assert!(ids.iter().any(|known| known == id), "missing parameter {id}");
         }
-        assert!(!ids.iter().any(|id| id == "mode" || id == "invert" || id == "output"));
+        assert!(!ids.iter().any(|id| id == "mode" || id == "invert" || id == "output" || id == "reverse"));
         let fields = plugin.params.serialize_fields();
         assert_eq!(fields.get("sample").map(String::as_str), Some("null"));
         assert!(fields.contains_key("editor-state"));
@@ -781,7 +792,7 @@ mod tests {
 
         // Values away from the defaults survive too, and saving under the same name replaces it.
         let mut custom = loaded.clone();
-        for (id, value) in [("rate", 4.0), ("restart", 0.0), ("reverse", 1.0), ("start", 0.125), ("end", 0.75), ("depth", 0.4)] {
+        for (id, value) in [("rate", 4.0), ("restart", 0.0), ("direction", 2.0), ("start", 0.125), ("end", 0.75), ("depth", 0.4)] {
             custom.values.insert(id.to_owned(), value);
         }
         custom.values.insert("release".to_owned(), 321.5);
@@ -915,9 +926,12 @@ mod tests {
         assert_eq!(dream.string_to_normalized_value("40%"), Some(0.4));
 
         assert!(params.restart.value() && params.restart.default_plain_value());
-        assert!(!params.reverse.value());
+        assert_eq!(params.direction.value(), Direction::Forward);
+        assert_eq!(params.direction.to_string(), "Forward");
+        let names: Vec<String> = (0..3).map(|i| params.direction.normalized_value_to_string(i as f32 / 2.0, true)).collect();
+        assert_eq!(names, ["Forward", "Backward", "Levitate"]);
         let settings = params.settings();
-        assert!(settings.restart && !settings.reverse);
+        assert!(settings.restart && settings.direction == Direction::Forward);
     }
 
     fn old_state(mode: ParamValue) -> PluginState {
@@ -946,9 +960,37 @@ mod tests {
         let mut current = PluginState { version: "1.2.0".into(), params: BTreeMap::new(), fields: BTreeMap::new() };
         current.params.insert("restart".to_owned(), ParamValue::Bool(false));
         current.params.insert("dream-eater".to_owned(), ParamValue::F32(0.4));
+        current.params.insert("direction".to_owned(), ParamValue::String("levitate".into()));
         let before = format!("{:?}", current.params);
         Haunter::filter_state(&mut current);
         assert_eq!(format!("{:?}", current.params), before, "new states are left alone");
+    }
+
+    #[test]
+    fn reverse_from_before_1_7_loads_as_a_direction() {
+        for (reverse, direction) in [
+            (Some(ParamValue::Bool(true)), "backward"),
+            (Some(ParamValue::Bool(false)), "forward"),
+            (None, "forward"),
+        ] {
+            let mut state = PluginState { version: "1.6.3".into(), params: BTreeMap::new(), fields: BTreeMap::new() };
+            if let Some(reverse) = reverse.clone() {
+                state.params.insert("reverse".to_owned(), reverse);
+            }
+            Haunter::filter_state(&mut state);
+            assert!(!state.params.contains_key("reverse"));
+            assert!(
+                matches!(state.params.get("direction"), Some(ParamValue::String(d)) if d == direction),
+                "{reverse:?} loads as {direction}: {:?}",
+                state.params
+            );
+            // The wrapper finds the value among the enum's IDs.
+            let plugin = Haunter::default();
+            let ParamValue::String(id) = &state.params["direction"] else { unreachable!() };
+            let ptr = plugin.params.direction.as_ptr();
+            let index = Direction::ids().unwrap().iter().position(|known| known == id).expect("a Direction ID");
+            assert_eq!(unsafe { ptr.preview_plain(index as f32 / 2.0) }, index as f32);
+        }
     }
 
     /// A project saved by 1.1, with Output turned down and a sample embedded.
@@ -984,6 +1026,8 @@ mod tests {
         assert!(!state.params.contains_key("output"), "Output no longer exists");
         assert!(matches!(state.params.get("depth"), Some(ParamValue::F32(v)) if *v == 0.5), "other parameters are kept");
         assert!(matches!(state.params.get("dream-eater"), Some(ParamValue::F32(v)) if *v == 0.0));
+        assert!(!state.params.contains_key("reverse"), "Reverse is now Direction");
+        assert!(matches!(state.params.get("direction"), Some(ParamValue::String(d)) if d == "backward"), "Reverse on is Backward");
 
         // The wrapper looks each saved parameter up by ID and skips any it doesn't know, so every
         // one must still exist with a matching type.

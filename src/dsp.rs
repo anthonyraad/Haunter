@@ -65,6 +65,49 @@ pub enum SyncRate {
     SixteenthTriplet,
 }
 
+/// Which way the region plays.
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// From Start to End.
+    #[id = "forward"]
+    #[name = "Forward"]
+    Forward,
+    /// From End to Start.
+    #[id = "backward"]
+    #[name = "Backward"]
+    Backward,
+    /// From Start to End, then back to Start, and so on, bouncing off each handle.
+    #[id = "levitate"]
+    #[name = "Levitate"]
+    Levitate,
+}
+
+impl Default for Direction {
+    fn default() -> Self {
+        Direction::Forward
+    }
+}
+
+impl Direction {
+    /// Whether a pass starts at End.
+    fn starts_backwards(self) -> bool {
+        self == Direction::Backward
+    }
+
+    /// The one way the region plays, if it only plays one way.
+    fn only_way(self) -> Option<bool> {
+        match self {
+            Direction::Forward => Some(false),
+            Direction::Backward => Some(true),
+            Direction::Levitate => None,
+        }
+    }
+
+    fn bounces(self) -> bool {
+        self == Direction::Levitate
+    }
+}
+
 impl SyncRate {
     /// The grid spacing in quarter notes.
     pub fn beats(self) -> f64 {
@@ -235,8 +278,8 @@ pub struct Settings {
     /// On: the region plays once from the top on every grid line. Off: it loops continuously
     /// while the transport plays, and Rate is ignored.
     pub restart: bool,
-    /// Plays the region backwards, from End to Start.
-    pub reverse: bool,
+    /// Forward, backward, or bouncing between the handles.
+    pub direction: Direction,
     /// Region start as a fraction of the sample length.
     pub start: f32,
     /// Region end as a fraction of the sample length.
@@ -254,7 +297,7 @@ impl Default for Settings {
         Settings {
             rate: SyncRate::Quarter,
             restart: true,
-            reverse: false,
+            direction: Direction::Forward,
             start: 0.0,
             end: 1.0,
             attack_ms: 1.0,
@@ -373,6 +416,12 @@ impl Voice {
         }
     }
 
+    /// Turns round where it is, so the next frame is the neighbour of the last one played, on
+    /// the side it came from.
+    fn turn(&mut self) {
+        self.reverse = !self.reverse;
+    }
+
     /// Short linear fades that stop clicks where playback starts or stops mid-waveform.
     fn declick_gain(&self, region: Region, fades_out: bool, declick: usize) -> f32 {
         let mut gain = 1.0;
@@ -401,7 +450,7 @@ struct AnalysisKey {
     sample_id: u64,
     start: usize,
     end: usize,
-    reverse: bool,
+    direction: Direction,
     fades_out: bool,
     declick: usize,
     attack_ms: f32,
@@ -414,6 +463,8 @@ struct RunningAnalysis {
     voice: Voice,
     follower: EnvelopeFollower,
     peak: f64,
+    /// Levitate has turned at End and is on its way back.
+    turned: bool,
 }
 
 /// Finds the follower's peak over one unfiltered pass of the region, so Depth means "this much at
@@ -435,8 +486,8 @@ impl PeakAnalysis {
                 }
                 let mut follower = EnvelopeFollower::default();
                 follower.set(wanted.attack_ms, wanted.release_ms, sample_rate);
-                let voice = Voice::trigger((wanted.start, wanted.end), sample.frames(), wanted.reverse);
-                self.running = Some(RunningAnalysis { key: wanted, voice, follower, peak: 0.0 });
+                let voice = Voice::trigger((wanted.start, wanted.end), sample.frames(), wanted.direction.starts_backwards());
+                self.running = Some(RunningAnalysis { key: wanted, voice, follower, peak: 0.0, turned: false });
             }
             let run = self.running.as_mut().unwrap();
             if run.key.sample_id != sample.id {
@@ -451,6 +502,12 @@ impl PeakAnalysis {
                 run.peak = run.peak.max(level);
                 run.voice.advance();
                 budget -= 1;
+                // Levitate's peak is over the way there and back.
+                if key.direction.bounces() && !run.turned && run.voice.remaining(region) == 0 {
+                    run.voice.turn();
+                    run.voice.fade_in_from = None;
+                    run.turned = true;
+                }
             }
             if run.voice.remaining(region) > 0 {
                 return;
@@ -590,20 +647,24 @@ impl Engine {
     }
 
     /// Whether a pass fades out at its last frame: always when looping, otherwise only when it
-    /// stops mid-sample.
-    fn fades_out(&self, reverse: bool, frames: usize) -> bool {
+    /// stops mid-sample. Levitate turns round at the handles instead while the transport plays,
+    /// which needs no fade: the frames either side of a turn are neighbours in the sample.
+    fn fades_out(&self, reverse: bool, frames: usize, playing: bool) -> bool {
+        if self.settings.direction.bounces() && playing {
+            return false;
+        }
         let (start, end) = self.region;
         !self.settings.restart || if reverse { start > 0 } else { end < frames }
     }
 
     fn analysis_key(&self, sample: &PreparedSample) -> AnalysisKey {
-        let reverse = self.settings.reverse;
+        let direction = self.settings.direction;
         AnalysisKey {
             sample_id: sample.id,
             start: self.region.0,
             end: self.region.1,
-            reverse,
-            fades_out: self.fades_out(reverse, sample.frames()),
+            direction,
+            fades_out: self.fades_out(direction.starts_backwards(), sample.frames(), true),
             declick: self.declick,
             attack_ms: self.settings.attack_ms,
             release_ms: self.settings.release_ms,
@@ -692,8 +753,8 @@ impl Engine {
         BlockReport { min_track_gain, playhead, dream_level: self.dream.level() }
     }
 
-    fn fade_gain(&self, voice: &Voice, frames: usize) -> f32 {
-        voice.declick_gain(self.region, self.fades_out(voice.reverse, frames), self.declick)
+    fn fade_gain(&self, voice: &Voice, frames: usize, playing: bool) -> f32 {
+        voice.declick_gain(self.region, self.fades_out(voice.reverse, frames, playing), self.declick)
     }
 
     /// Returns (track gain, sample left, sample right, normalised envelope) for one frame.
@@ -703,7 +764,8 @@ impl Engine {
         };
         let frames = sample.frames();
         let region = self.region;
-        let reverse = self.settings.reverse;
+        let direction = self.settings.direction;
+        let reverse = direction.starts_backwards();
 
         if trigger {
             if let Some(voice) = self.voice.take() {
@@ -715,13 +777,26 @@ impl Engine {
         let (mut left, mut right, mut raw_key) = (0.0f32, 0.0f32, 0.0f32);
         if let Some(mut voice) = self.voice {
             voice.enter(region);
+            // A new direction takes over at once from where the voice is, rather than at the next
+            // pass. The old way fades out as a tail while the new way fades in from the same spot,
+            // their gains adding up to one throughout.
+            if direction.only_way().is_some_and(|backwards| backwards != voice.reverse) {
+                self.tail = Some(Tail { voice, remaining: self.declick.saturating_sub(1) });
+                voice.turn();
+                voice.fade_in_from = Some(voice.pos);
+            }
             if voice.remaining(region) > 0 {
-                let gain = self.fade_gain(&voice, frames);
+                let gain = self.fade_gain(&voice, frames, playing);
                 let at = voice.frame();
                 left += sample.left[at] * gain;
                 right += sample.right[at] * gain;
                 raw_key += sample.key[at] * gain;
                 voice.advance();
+            }
+            if voice.remaining(region) == 0 && direction.bounces() && playing {
+                voice.turn();
+                // No fade-in on the way back past where it started.
+                voice.fade_in_from = None;
             }
             self.voice = if voice.remaining(region) > 0 {
                 Some(voice)
@@ -733,7 +808,7 @@ impl Engine {
         }
         if let Some(mut tail) = self.tail {
             if tail.voice.remaining(region) > 0 && tail.remaining > 0 {
-                let gain = self.fade_gain(&tail.voice, frames) * tail.remaining as f32 / self.declick as f32;
+                let gain = self.fade_gain(&tail.voice, frames, playing) * tail.remaining as f32 / self.declick as f32;
                 let at = tail.voice.frame();
                 left += sample.left[at] * gain;
                 right += sample.right[at] * gain;
@@ -949,7 +1024,7 @@ mod tests {
     #[test]
     fn reverse_ducks_with_the_backwards_shape() {
         let mut engine = Engine::new(RATE);
-        engine.settings.reverse = true;
+        engine.settings.direction = Direction::Backward;
         engine.set_sample(Some(prepared(vec![kick(400.0)])));
         engine.finish_analysis();
         let gains = FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
@@ -1110,7 +1185,7 @@ mod tests {
     #[test]
     fn reverse_plays_the_region_backwards() {
         let mut engine = Engine::new(RATE);
-        engine.settings.reverse = true;
+        engine.settings.direction = Direction::Backward;
         engine.set_sample(Some(prepared(vec![ramp(1_000)])));
         let left = play(&mut engine, 2_000, TransportInfo::playing_at(0.0, 120.0, RATE));
         // The whole sample needs no fades: it starts at the file's end and stops at its start.
@@ -1123,7 +1198,7 @@ mod tests {
     #[test]
     fn reverse_plays_a_region_from_end_to_start() {
         let mut engine = Engine::new(RATE);
-        engine.settings.reverse = true;
+        engine.settings.direction = Direction::Backward;
         engine.settings.start = 0.25;
         engine.settings.end = 0.75;
         engine.set_sample(Some(prepared(vec![ramp(8_000)])));
@@ -1138,10 +1213,152 @@ mod tests {
         assert!(left[4_000..].iter().all(|&v| v == 0.0));
     }
 
+    /// Plays `frames` in one block and returns the left channel and where the playhead ended.
+    fn play_block(engine: &mut Engine, frames: usize) -> (Vec<f32>, f32) {
+        let mut left = vec![0.0; frames];
+        let mut right = vec![0.0; frames];
+        let report = engine.process(&mut [&mut left[..], &mut right[..]], &TransportInfo::playing_at(0.0, 120.0, RATE), sample_only);
+        (left, report.playhead.expect("a voice is playing"))
+    }
+
+    /// The biggest step from one output frame to the next.
+    fn biggest_step(output: &[f32]) -> f32 {
+        output.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0, f32::max)
+    }
+
+    fn loud_sine(frames: usize, hz: f64) -> Vec<f32> {
+        (0..frames).map(|n| (2.0 * std::f64::consts::PI * hz * n as f64 / RATE).sin() as f32 * 0.8).collect()
+    }
+
+    #[test]
+    fn choosing_another_direction_turns_the_playhead_round_within_the_next_block() {
+        let mut engine = Engine::new(RATE);
+        engine.settings.restart = false;
+        engine.set_sample(Some(prepared(vec![ramp(48_000)])));
+        let (forward, before) = play_block(&mut engine, 4_800);
+        assert!((before - 0.1).abs() < 1e-4, "{before}");
+        assert!(forward[4_799] > forward[4_000]);
+
+        engine.settings.direction = Direction::Backward;
+        let (backward, after) = play_block(&mut engine, 512);
+        assert!(after < before - 0.01, "the playhead went back from {before} to {after}");
+        assert!(backward[100] > backward[400], "the sample plays backwards from where it was");
+        assert!((backward[100] - 4_700.0 / 48_000.0).abs() < 1e-4, "{}", backward[100]);
+        let joined: Vec<f32> = forward[4_700..].iter().chain(&backward).copied().collect();
+        assert!(biggest_step(&joined) < 1e-4, "no jump at the turn: {}", biggest_step(&joined));
+
+        engine.settings.direction = Direction::Forward;
+        let (forward_again, last) = play_block(&mut engine, 512);
+        assert!(last > after + 0.005, "and forward again: {after} to {last}");
+        assert!(forward_again[400] > forward_again[100]);
+    }
+
+    #[test]
+    fn turning_round_does_not_click() {
+        // A loud 3 kHz tone, whose own steps are big, turned round at a few awkward moments.
+        let tone = loud_sine(48_000, 3_000.0);
+        let natural = biggest_step(&tone);
+        let mut engine = Engine::new(RATE);
+        engine.settings.restart = false;
+        engine.set_sample(Some(prepared(vec![tone])));
+        let mut output = Vec::new();
+        for (block, direction) in [(1_001, Direction::Backward), (333, Direction::Forward), (517, Direction::Backward), (2_000, Direction::Forward)] {
+            output.extend(play_block(&mut engine, block).0);
+            engine.settings.direction = direction;
+        }
+        output.extend(play_block(&mut engine, 500).0);
+        let step = biggest_step(&output[50..]);
+        // A click would be a jump of up to twice the tone's height; the 1 ms crossfade adds a little
+        // to the tone's own steps at most.
+        assert!(step <= natural * 1.15, "{step} against the tone's own {natural}");
+    }
+
+    #[test]
+    fn levitate_bounces_between_the_handles() {
+        let mut engine = Engine::new(RATE);
+        engine.settings.direction = Direction::Levitate;
+        engine.settings.restart = false;
+        engine.set_sample(Some(prepared(vec![ramp(1_000)])));
+        let mut left = Vec::new();
+        let mut heads = Vec::new();
+        for _ in 0..16 {
+            let (block, head) = play_block(&mut engine, 250);
+            left.extend(block);
+            heads.push(head);
+        }
+        // Up from S to E, back down to S, and up again, without fading at the turns.
+        assert_eq!(left[500], 501.0 / 1_000.0);
+        assert_eq!(left[999], 1.0);
+        assert_eq!(left[1_000], 1.0, "the turn at E repeats the last frame");
+        assert_eq!(left[1_500], 500.0 / 1_000.0);
+        assert_eq!(left[1_999], 1.0 / 1_000.0);
+        assert_eq!(left[2_500], 501.0 / 1_000.0);
+        assert_eq!(left[3_500], 500.0 / 1_000.0);
+        assert!(biggest_step(&left) <= 1.0 / 1_000.0 + 1e-6);
+        let rising: Vec<bool> = heads.windows(2).map(|pair| pair[1] > pair[0]).collect();
+        assert_eq!(rising[..7], [true, true, true, false, false, false, false], "the playhead turns at E: {heads:?}");
+        assert_eq!(rising[7..11], [true, true, true, true], "and at S: {heads:?}");
+    }
+
+    #[test]
+    fn levitate_stays_between_the_handles() {
+        let tone = loud_sine(4_800, 1_234.0);
+        let natural = biggest_step(&tone);
+        let ramp_sample = ramp(1_000);
+        for (sample, check_steps) in [(ramp_sample, false), (tone, true)] {
+            let frames = sample.len();
+            let mut engine = Engine::new(RATE);
+            engine.settings.direction = Direction::Levitate;
+            engine.settings.restart = false;
+            engine.settings.start = 0.25;
+            engine.settings.end = 0.75;
+            engine.set_sample(Some(prepared(vec![sample.clone()])));
+            let left = play_block(&mut engine, frames * 4).0;
+            if check_steps {
+                let step = biggest_step(&left[60..]);
+                assert!(step <= natural * 1.001, "turns don't click: {step} against {natural}");
+            } else {
+                // Past the first frames, which fade in from the middle of the sample.
+                let settled = &left[100..];
+                let low = settled.iter().copied().fold(f32::MAX, f32::min);
+                let high = settled.iter().copied().fold(f32::MIN, f32::max);
+                assert_eq!((low, high), (251.0 / 1_000.0, 750.0 / 1_000.0), "it plays S to E and back, over and over");
+                let turns = settled.windows(3).filter(|w| (w[1] - w[0]) * (w[2] - w[1]) < 0.0 || w[1] == w[0]).count();
+                assert!(turns >= 6, "{turns} turns");
+            }
+        }
+    }
+
+    #[test]
+    fn levitate_with_restart_starts_each_step_from_s_going_forward() {
+        let mut engine = Engine::new(RATE);
+        engine.settings.direction = Direction::Levitate;
+        engine.settings.end = 0.25;
+        engine.set_sample(Some(prepared(vec![ramp(48_000)])));
+        // A quarter note at 120 bpm is 24,000 frames: up to E in 12,000, back down by 24,000.
+        let left = play(&mut engine, 30_000, TransportInfo::playing_at(0.0, 120.0, RATE));
+        assert!(left[6_000] > left[3_000], "forward from S");
+        assert_eq!(left[11_999], 12_000.0 / 48_000.0);
+        assert!(left[18_000] < left[15_000], "back from E");
+        assert!(left[23_999] < 2.0 / 48_000.0, "back at S as the next step comes");
+        assert!(left[25_000] < 0.03 && left[27_000] > left[25_000], "the step restarts it from S, going forward");
+        assert!(biggest_step(&left) < 2e-4);
+    }
+
+    #[test]
+    fn levitate_judges_its_peak_without_fades() {
+        let mut engine = Engine::new(RATE);
+        engine.settings.direction = Direction::Levitate;
+        engine.settings.restart = false;
+        engine.set_sample(Some(prepared(vec![ramp(4_800)])));
+        let key = engine.analysis_key(engine.sample().unwrap());
+        assert!(!key.fades_out, "a bounce never fades");
+    }
+
     #[test]
     fn reverse_loops_backwards_without_restart() {
         let mut engine = Engine::new(RATE);
-        engine.settings.reverse = true;
+        engine.settings.direction = Direction::Backward;
         engine.settings.restart = false;
         engine.set_sample(Some(prepared(vec![ramp(1_000)])));
         let left = play(&mut engine, 3_000, TransportInfo::playing_at(0.0, 120.0, RATE));

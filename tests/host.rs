@@ -790,11 +790,16 @@ fn dream_eater_is_clearly_audible_on_real_tracks_through_the_vst3_wrapper() {
         for (name, track) in audible_tracks(rate) {
             let result = real_change(&track, Settings { block: 512, ..Settings::at(rate, 2, 1.0) });
             let label = format!("{name} at {rate} Hz: {result}");
-            assert!(result.spectral_db > -12.0, "{label}: the spectrum changes clearly");
-            assert!(result.difference_db > -12.0, "{label}: the difference is no more than 12 dB under the track");
+            // At 100% the chord sits about 4 dB under the ducked track, so the output differs from
+            // Off by about 3 to 5 dB (1.6 had it about 7 dB under).
+            assert!(result.spectral_db > -8.0, "{label}: the spectrum changes clearly");
+            assert!(
+                result.difference_db > -6.0 && result.difference_db < -2.0,
+                "{label}: the difference is about 3 to 5 dB under the track"
+            );
             assert!(result.chord_db > 4.0, "{label}: the chord's notes come up");
             assert!(result.chord_db > result.others_db + 4.0, "{label}: and more than the other notes");
-            assert!(result.loudness_db.abs() < 1.5, "{label}: about as loud as Off");
+            assert!(result.loudness_db.abs() < 1.25, "{label}: about as loud as Off");
             assert!(result.peak <= 1.0, "{label}");
             assert!(result.spread < 0.5, "{label}: the chord is wide");
         }
@@ -805,8 +810,8 @@ fn dream_eater_is_clearly_audible_on_real_tracks_through_the_vst3_wrapper() {
 fn dream_eater_is_audible_on_mono_cello_through_the_vst3_wrapper() {
     let track = cello(&CELLO_D_MINOR, 48_000.0, 12.0, 1.5);
     let result = real_change(&track, Settings { block: 512, ..Settings::at(48_000.0, 1, 1.0) });
-    assert!(result.difference_db > -12.0 && result.chord_db > 4.0, "mono: {result}");
-    assert!(result.loudness_db.abs() < 1.5 && result.peak <= 1.0, "mono: {result}");
+    assert!(result.difference_db > -6.0 && result.difference_db < -2.0 && result.chord_db > 4.0, "mono: {result}");
+    assert!(result.loudness_db.abs() < 1.25 && result.peak <= 1.0, "mono: {result}");
 }
 
 #[test]

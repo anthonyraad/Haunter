@@ -432,10 +432,11 @@ const WET_HIGH_PASS_HZ: f64 = 180.0;
 /// A first-order shelf lifts the wet above this by `AIR_GAIN`.
 const AIR_HZ: f64 = 1_500.0;
 const AIR_GAIN: f64 = 1.41;
-/// How loud the chord is at 100%, relative to the track after the duck. The chord is added after
-/// the duck, so it blooms in the space each hit opens, and the track is turned down as the chord
-/// comes up so the output stays about as loud as Off.
-const WET_LEVEL: f64 = 0.45;
+/// How loud the chord is at 100%, relative to the track after the duck: 4 dB under it, so the
+/// output differs from Off by about 3 to 4 dB on real material. The chord is added after the duck,
+/// so it blooms in the space each hit opens, and the track is turned down as the chord comes up (by
+/// about 2.4 dB at 100%) so the output stays about as loud as Off.
+const WET_LEVEL: f64 = 0.63;
 /// The most the leveller turns the chord up, 60 dB. The resonators are only a few hertz wide, so
 /// they keep a tiny share of a real track's power: 25 to 45 dB below it for textures, drums, and
 /// strings off the chord's notes. The leveller has to be free to bring that up to `WET_LEVEL`, or
@@ -468,6 +469,11 @@ const LIMITER_RELEASE_MS: f32 = 80.0;
 /// stays quiet. So the output is brought back to the ducked track's loudness, turned down by at
 /// most this much, and up by no more than undoes `dry_gain`, so the track is never louder than Off.
 const MIN_MAKEUP: f64 = 0.7;
+/// On hits with gaps between them, such as a ride or a strummed guitar, the chord rings on through
+/// the gaps and the output comes out up to about 1.3 dB louder than Off at 100%, while sustained
+/// tracks come out a little quieter. So the makeup aims a touch under the ducked track as the chord
+/// comes up, 0.3 dB at 100%, which keeps both within about 1 dB of Off.
+const MAKEUP_TRIM: f64 = 0.17;
 /// Frames between updates of the tuning and the tail.
 const CONTROL_FRAMES: usize = 32;
 
@@ -479,6 +485,12 @@ pub fn root_hz(key: u8) -> f64 {
 
 /// How far the dry track is turned down at `amount`, so that with the chord, which has nothing
 /// to do with the track's phase, the output is about as loud as Off.
+/// The share of the ducked track's power the makeup aims the output at.
+fn makeup_aim(amount: f64) -> f64 {
+    let wet = WET_LEVEL * amount.clamp(0.0, 1.0);
+    1.0 - MAKEUP_TRIM * wet * wet
+}
+
 pub(crate) fn dry_gain(amount: f64) -> f64 {
     let wet = WET_LEVEL * amount.clamp(0.0, 1.0);
     (1.0 - wet * wet).sqrt()
@@ -1002,7 +1014,8 @@ impl DreamEater {
             block,
         );
         let most = 1.0 / dry_gain(amount);
-        let makeup = if sum_power > 1e-30 { (dry_power / sum_power).sqrt().clamp(MIN_MAKEUP, most) } else { 1.0 };
+        let aim = dry_power * makeup_aim(amount);
+        let makeup = if sum_power > 1e-30 { (aim / sum_power).sqrt().clamp(MIN_MAKEUP, most) } else { 1.0 };
         self.makeup += self.leveller_glide * (makeup - self.makeup);
         let (dry, wet) = (dry.map(|side| self.makeup * side), wet.map(|side| self.makeup * side));
         // Turns the wet down, never the track, so the output stays under the ceiling or the

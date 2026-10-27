@@ -35,6 +35,14 @@ const TOLERANCE: f32 = 1e-4;
 /// as 0 or 1.
 pub type Values = BTreeMap<String, f32>;
 
+/// Brings values saved before 1.7 up to date: the Reverse toggle (`reverse`, 0 or 1) became the
+/// Direction choice (`direction`, 0 Forward, 1 Backward, 2 Levitate).
+pub fn migrate_values(values: &mut Values) {
+    if let Some(reverse) = values.remove("reverse") {
+        values.entry("direction".to_owned()).or_insert(if reverse >= 0.5 { 1.0 } else { 0.0 });
+    }
+}
+
 pub fn factory_names() -> impl Iterator<Item = &'static str> {
     FACTORY.iter().map(|(name, _)| *name)
 }
@@ -146,7 +154,10 @@ impl SelectionSlot {
 }
 
 impl<'a> PersistentField<'a, Selection> for SelectionSlot {
-    fn set(&self, new_value: Selection) {
+    /// Restoring a state. A preset chosen before 1.7 remembers Reverse, so it is mapped the same
+    /// way as the parameter, and the preset doesn't show as changed.
+    fn set(&self, mut new_value: Selection) {
+        migrate_values(&mut new_value.values);
         SelectionSlot::set(self, new_value);
     }
 
@@ -253,7 +264,8 @@ impl UserPresets {
         if file.haunter_preset > FILE_FORMAT {
             return Err(format!("The preset {name} needs a newer version of Haunter"));
         }
-        let values = file.params.into_iter().filter(|(_, value)| value.is_finite()).collect();
+        let mut values: Values = file.params.into_iter().filter(|(_, value)| value.is_finite()).collect();
+        migrate_values(&mut values);
         Ok(Preset { values, sample: file.sample, dream_key: file.dream_key })
     }
 }
@@ -339,6 +351,33 @@ mod tests {
         assert_eq!(user, r#"{"kind":"user","name":"Mine"}"#);
         assert_eq!(serde_json::to_string(&Choice::None).unwrap(), r#"{"kind":"none"}"#);
         assert_eq!(serde_json::from_str::<Choice>(r#"{"kind":"factory","name":"Water"}"#).unwrap(), Choice::Factory("Water".into()));
+    }
+
+    #[test]
+    fn presets_saved_with_reverse_load_with_a_direction() {
+        let folder = crate::test_support::TempDir::new();
+        std::fs::create_dir_all(folder.path()).unwrap();
+        for (name, reverse) in [("Backwards", 1.0), ("Onwards", 0.0)] {
+            let file = format!(
+                r#"{{"haunter_preset":1,"name":"{name}","plugin_version":"1.6.3","params":{{"depth":0.5,"reverse":{reverse:.1}}},"sample":null,"dream_key":"auto"}}"#
+            );
+            std::fs::write(folder.path().join(format!("{name}.json")), file).unwrap();
+        }
+        let presets = UserPresets::new(folder.path().to_owned());
+        for (name, direction) in [("Backwards", 1.0), ("Onwards", 0.0)] {
+            let preset = presets.load(name).unwrap();
+            assert_eq!(preset.values.get("direction"), Some(&direction), "{name}");
+            assert!(!preset.values.contains_key("reverse"));
+            assert_eq!(preset.values.get("depth"), Some(&0.5));
+        }
+
+        // A project that had a 1.6 preset selected remembers its Reverse value too.
+        let slot = SelectionSlot::default();
+        let mut values = Values::new();
+        values.insert("reverse".to_owned(), 1.0);
+        PersistentField::set(&slot, Selection { choice: Choice::User("Backwards".into()), values, sample: 0 });
+        assert_eq!(slot.get().values.get("direction"), Some(&1.0));
+        assert!(!slot.get().values.contains_key("reverse"));
     }
 
     #[test]

@@ -632,8 +632,8 @@ impl Engine {
         }
     }
 
-    /// Runs Dream Eater over the track, ducks `channels` in place, and mixes in the sample.
-    /// `gains` is called once per frame.
+    /// Ducks `channels` in place, adds Dream Eater's chord after the duck, and mixes in the
+    /// sample. `gains` is called once per frame.
     pub fn process(
         &mut self,
         channels: &mut [&mut [f32]],
@@ -677,11 +677,10 @@ impl Engine {
                     (_, 1) => add_right,
                     _ => 0.0,
                 };
-                let track = match eaten {
-                    Some(eaten) if index < 2 => eaten[index],
-                    _ => channel[frame],
+                channel[frame] = match eaten {
+                    Some(eaten) if index < 2 => eaten[index] + add,
+                    _ => channel[frame] * track_gain + add,
                 };
-                channel[frame] = track * track_gain + add;
             }
         }
 
@@ -1371,7 +1370,7 @@ mod tests {
         let mut engine = kick_engine();
         engine.settings.dream_key = KeyChoice::Fixed(0);
         let output = process_track(&mut engine, &input, playing, full);
-        let dry_gain = 1.0 - crate::dream::DRY_DIP as f32;
+        let dry_gain = crate::dream::dry_gain(1.0) as f32;
         let wet: Vec<f32> = output.iter().zip(&input).map(|(a, b)| a - dry_gain * b).collect();
         let power = |signal: &[f32], hz: f64| {
             let coefficient = 2.0 * (2.0 * std::f64::consts::PI * hz / RATE).cos();
@@ -1521,7 +1520,7 @@ mod tests {
                 let eaten = both(&mut engine, &input, amount, skip);
                 let (eaten, dry) = (&eaten[..], &dry[..]);
                 let difference: Vec<f32> = eaten.iter().zip(dry).map(|(a, b)| a - b).collect();
-                let dip = 1.0 - crate::dream::DRY_DIP as f32 * amount * amount;
+                let dip = crate::dream::dry_gain(amount as f64) as f32;
                 let wet: Vec<f32> = eaten.iter().zip(dry).map(|(a, b)| a - dip * b).collect();
                 let correlation = wet.iter().zip(dry).map(|(w, d)| w * d).sum::<f32>()
                     / (wet.len() as f32 * rms(&wet) * rms(dry)).max(1e-20);

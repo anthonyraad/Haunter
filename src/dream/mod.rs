@@ -1,11 +1,13 @@
 //! Dream Eater: glassy resonances on the track, tuned to its key and played by the sample.
 //!
 //! The track's key is estimated from its audio. Three resonator voices, the root, fifth, and ninth
-//! of that key's major pentatonic, listen to the track, and each hit of the sample opens the track
-//! into them, so they swell and ring out in tune. Nothing here allocates while processing.
+//! of that key's major pentatonic, listen to the track and to soft noise that follows its level,
+//! and each hit of the sample opens them, so they swell and ring out in tune. Each voice is a
+//! detuned pair, one per side, for a stereo shimmer. The chord is added after the duck, so it
+//! blooms in the space each hit opens. Nothing here allocates while processing.
 
 use serde::{Deserialize, Serialize};
-use std::f64::consts::{PI, SQRT_2, TAU};
+use std::f64::consts::{PI, TAU};
 
 use crate::dsp::{one_pole, Svf};
 
@@ -394,16 +396,23 @@ const PARTIALS: [(f64, f64, f64); 2] = [(1.0, 1.0, 1.0), (2.0, 0.3, 0.5)];
 /// Pan of each voice's partials, -1 left to 1 right. The root sits in the middle and the fifth
 /// and ninth lean apart, with their octaves on the other side.
 const PAN: [[f64; 2]; VOICES] = [[0.0, 0.0], [-0.6, 0.4], [0.6, -0.4]];
-/// Slow detune on each voice, in cents and cycles per second.
-const SHIMMER_CENTS: f64 = 4.0;
+/// Every partial is a pair of resonators, one per side, detuned against each other by up to this
+/// many cents at a slow rate of its voice's own, so the chord shimmers across the stereo field.
+const SHIMMER_CENTS: f64 = 5.0;
 const SHIMMER_HZ: [f64; VOICES] = [0.13, 0.19, 0.23];
 /// How long the voices ring, to -60 dB, at the bottom and top of the knob.
 const TAIL_SHORTEST: f64 = 0.3;
-const TAIL_LONGEST: f64 = 1.2;
+const TAIL_LONGEST: f64 = 0.9;
 /// How far the track reaches the voices between hits, as a share of a full hit.
-const RESTING_OPEN: f64 = 0.25;
+const RESTING_OPEN: f64 = 0.1;
 const SWELL_ATTACK_MS: f32 = 25.0;
 const SWELL_RELEASE_MS: f32 = 140.0;
+/// Besides the track, each side's resonators hear their own soft noise that follows the track's
+/// level, so every note of the chord sounds even where the track has nothing at its pitch. This
+/// is how loud the noise alone rings a resonator, as a share of the track's level.
+const BREATH: f64 = 0.5;
+/// How quickly the noise follows the track's level.
+const BREATH_MS: f32 = 60.0;
 /// How long a new key takes to take over the track's input from the old one.
 const CROSSFADE_SECONDS: f64 = 0.4;
 /// The shortest time between retunes, so the bank being retuned has rung out.
@@ -412,11 +421,12 @@ const WET_HIGH_PASS_HZ: f64 = 180.0;
 /// A first-order shelf lifts the wet above this by `AIR_GAIN`.
 const AIR_HZ: f64 = 1_500.0;
 const AIR_GAIN: f64 = 1.41;
-/// The most the wet is turned up at 100%.
-const DRIVE: f64 = 10.0;
-/// How far the dry track is turned down at 100%. The wet fills the loudness this frees and no
-/// more, so the output stays as loud as Off.
-pub(crate) const DRY_DIP: f64 = 0.045;
+/// How loud the chord is at 100%, relative to the track after the duck. The chord is added after
+/// the duck, so it blooms in the space each hit opens, and the track is turned down as the chord
+/// comes up so the output stays about as loud as Off.
+const WET_LEVEL: f64 = 0.42;
+/// The most the leveller turns the chord up, so it never makes much of a whisper.
+const MAX_GAIN: f64 = 8.0;
 /// How long the leveller listens to judge loudness.
 /// Long enough to hear several hits, so the leveller leaves each hit's swell alone.
 const LOUDNESS_MS: f32 = 1_500.0;
@@ -427,8 +437,6 @@ const POWER_SURGE: f64 = 4.0;
 /// The leveller forgets loud power once it is gone from this many blocks of `SURGE_BLOCK_MS`.
 const POWER_BLOCKS: usize = 4;
 const SURGE_BLOCK_MS: f64 = 250.0;
-const CORRELATION_MS: f32 = 3_000.0;
-const MAX_LEAN: f64 = 1.4;
 /// The wet is turned down so it never pushes the output past this or the dry track's own peak.
 const CEILING: f64 = 1.0;
 const LIMITER_RELEASE_MS: f32 = 80.0;
@@ -441,24 +449,15 @@ pub fn root_hz(key: u8) -> f64 {
     440.0 * ((midi - 69.0) / 12.0).exp2()
 }
 
-/// How far the wet filters move the phase of a tone at `hz`, in radians.
-fn wet_phase(hz: f64, sample_rate: f64) -> f64 {
-    let warp = |hz: f64| (PI * hz.clamp(1.0, sample_rate * 0.49) / sample_rate).tan();
-    let omega = warp(hz) / warp(WET_HIGH_PASS_HZ);
-    let high_pass = PI - (SQRT_2 * omega).atan2(1.0 - omega * omega);
-    let w = TAU * hz / sample_rate;
-    let c = 1.0 - (-TAU * AIR_HZ / sample_rate).exp();
-    let (den_re, den_im) = (1.0 - (1.0 - c) * w.cos(), (1.0 - c) * w.sin());
-    let den = den_re * den_re + den_im * den_im;
-    let (low_re, low_im) = (c * den_re / den, -c * den_im / den);
-    let air = (-(AIR_GAIN - 1.0) * low_im).atan2(AIR_GAIN - (AIR_GAIN - 1.0) * low_re);
-    2.0 * high_pass + air
+/// How far the dry track is turned down at `amount`, so that with the chord, which has nothing
+/// to do with the track's phase, the output is about as loud as Off.
+pub(crate) fn dry_gain(amount: f64) -> f64 {
+    let wet = WET_LEVEL * amount.clamp(0.0, 1.0);
+    (1.0 - wet * wet).sqrt()
 }
 
-/// A two-pole resonator: a topology-preserving state variable filter, which stays stable however
-/// its tuning moves. Its band-pass and low-pass outputs are mixed so that, after the wet filters,
-/// it rings a quarter cycle away from a tone it picks up from the track, and so adds to the
-/// tone's loudness without piling onto it.
+/// A two-pole band-pass resonator with unit gain at its pitch: a topology-preserving state
+/// variable filter, which stays stable however its tuning moves.
 #[derive(Debug, Clone, Copy, Default)]
 struct Resonator {
     ic1: f64,
@@ -466,10 +465,9 @@ struct Resonator {
     a1: f64,
     a2: f64,
     a3: f64,
-    /// Output gains on the band-pass and low-pass, scaled so broadband input rings at the same
-    /// level whatever the tail.
-    band: f64,
-    low: f64,
+    k: f64,
+    /// The gain that makes unit white noise ring it at unit level, whatever its pitch and tail.
+    breath: f64,
 }
 
 impl Resonator {
@@ -481,9 +479,9 @@ impl Resonator {
         self.a1 = 1.0 / (1.0 + g * (g + k));
         self.a2 = g * self.a1;
         self.a3 = g * self.a2;
-        let shift = wet_phase(hz, sample_rate);
-        self.band = -k.sqrt() * shift.sin();
-        self.low = k.sqrt() * shift.cos();
+        self.k = k;
+        // A unit-peak band-pass passes k*pi*f/fs of white noise's power.
+        self.breath = (sample_rate / (k * PI * hz)).sqrt();
     }
 
     fn reset(&mut self) {
@@ -497,30 +495,34 @@ impl Resonator {
         let v2 = self.ic2 + self.a2 * self.ic1 + self.a3 * v3;
         self.ic1 = 2.0 * v1 - self.ic1;
         self.ic2 = 2.0 * v2 - self.ic2;
-        self.band * v1 + self.low * v2
+        self.k * v1
     }
 }
 
-/// One chord of voices tuned to one key.
+/// One chord of voices tuned to one key: each partial of each voice, on the left and the right.
 #[derive(Debug, Clone, Default)]
 struct Bank {
     key: u8,
-    voices: [[Resonator; PARTIALS.len()]; VOICES],
+    voices: [[[Resonator; 2]; PARTIALS.len()]; VOICES],
 }
 
 impl Bank {
+    /// `cents` is each voice's detune, which the left takes up and the right down.
     fn tune(&mut self, tail: f64, cents: &[f64; VOICES], sample_rate: f64) {
         let root = root_hz(self.key);
         for (voice, partials) in self.voices.iter_mut().enumerate() {
-            let hz = root * ((VOICING[voice] * 100.0 + cents[voice]) / 1200.0).exp2();
-            for (resonator, (ratio, _, share)) in partials.iter_mut().zip(PARTIALS) {
-                resonator.tune(hz * ratio, tail * share, sample_rate);
+            for (pair, (ratio, _, share)) in partials.iter_mut().zip(PARTIALS) {
+                for (side, resonator) in pair.iter_mut().enumerate() {
+                    let detune = if side == 0 { cents[voice] } else { -cents[voice] };
+                    let hz = root * ratio * ((VOICING[voice] * 100.0 + detune) / 1200.0).exp2();
+                    resonator.tune(hz, tail * share, sample_rate);
+                }
             }
         }
     }
 
     fn reset(&mut self) {
-        self.voices.iter_mut().flatten().for_each(Resonator::reset);
+        self.voices.iter_mut().flatten().flatten().for_each(Resonator::reset);
     }
 }
 
@@ -570,9 +572,8 @@ impl PowerMeter {
         *self = PowerMeter::default();
     }
 
-    /// Adds one frame's power and returns the mean, and how far loud power that is gone was
-    /// forgotten from it this frame, as a factor up to 1.
-    fn update(&mut self, power: f64, slow_rate: f64, fast_rate: f64, block_frames: usize) -> (f64, f64) {
+    /// Adds one frame's power and returns the mean.
+    fn update(&mut self, power: f64, slow_rate: f64, fast_rate: f64, block_frames: usize) -> f64 {
         let before = self.slow + slow_rate * (power - self.slow);
         self.fast += fast_rate * (power - self.fast);
         self.filling = self.filling.max(self.fast);
@@ -585,8 +586,7 @@ impl PowerMeter {
         self.countdown -= 1;
         let recent_peak = self.blocks.iter().fold(self.filling, |peak, &block| peak.max(block));
         self.slow = before.min(recent_peak);
-        let forgotten = if before > 1e-30 { self.slow / before } else { 1.0 };
-        (self.slow.max(self.fast / POWER_SURGE), forgotten)
+        self.slow.max(self.fast / POWER_SURGE)
     }
 }
 
@@ -595,6 +595,22 @@ fn pan_gains(pan: f64) -> [f64; 2] {
     let angle = (pan.clamp(-1.0, 1.0) + 1.0) * PI / 4.0;
     [angle.cos(), angle.sin()]
 }
+
+/// White noise with unit power, from a fixed seed.
+#[derive(Debug, Clone, Copy)]
+struct Noise(u32);
+
+impl Noise {
+    fn next(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 17;
+        self.0 ^= self.0 << 5;
+        // Uniform in -1..1 has a third of unit power.
+        (self.0 as f64 / u32::MAX as f64 * 2.0 - 1.0) * 3.0f64.sqrt()
+    }
+}
+
+const NOISE_SEEDS: [u32; 2] = [0x9e37_79b9, 0x7f4a_7c15];
 
 pub struct DreamEater {
     sample_rate: f64,
@@ -619,19 +635,19 @@ pub struct DreamEater {
     /// Each voice partial's level on the left and right.
     gains: [[[f64; 2]; PARTIALS.len()]; VOICES],
     countdown: usize,
+    /// The left and right noise, and the track's power that sets how loud they are.
+    noise: [Noise; 2],
+    breath_power: f64,
+    breath_rate: f64,
     wet_filters: [WetFilter; 2],
-    /// The track's power, the full wet's power, and the running mean of their product.
+    /// The track's power after the duck, and the chord's before the leveller.
     dry_power: PowerMeter,
     wet_power: PowerMeter,
-    cross_power: f64,
-    /// How far the wet lines up with the track, averaged over the shimmer's slow swings.
-    correlation: f64,
     leveller: f64,
     limiter: f64,
     loudness_rate: f64,
     surge_rate: f64,
     surge_block: usize,
-    correlation_rate: f64,
     leveller_glide: f64,
     limiter_release: f64,
 }
@@ -661,17 +677,17 @@ impl DreamEater {
             shimmer: [0.0; VOICES],
             gains,
             countdown: 0,
+            noise: NOISE_SEEDS.map(Noise),
+            breath_power: 0.0,
+            breath_rate: 0.0,
             wet_filters: Default::default(),
             dry_power: PowerMeter::default(),
             wet_power: PowerMeter::default(),
-            cross_power: 0.0,
-            correlation: 0.0,
             leveller: 0.0,
             limiter: 1.0,
             loudness_rate: 0.0,
             surge_rate: 0.0,
             surge_block: 1,
-            correlation_rate: 0.0,
             leveller_glide: 0.0,
             limiter_release: 0.0,
         };
@@ -687,13 +703,13 @@ impl DreamEater {
         self.retune_gap = (RETUNE_GAP_SECONDS * sample_rate) as usize;
         self.swell_attack = 1.0 - one_pole(SWELL_ATTACK_MS, sample_rate);
         self.swell_release = 1.0 - one_pole(SWELL_RELEASE_MS, sample_rate);
+        self.breath_rate = 1.0 - one_pole(BREATH_MS, sample_rate);
         for filter in &mut self.wet_filters {
             filter.set(sample_rate);
         }
         self.loudness_rate = 1.0 - one_pole(LOUDNESS_MS, sample_rate);
         self.surge_rate = 1.0 - one_pole(SURGE_MS, sample_rate);
         self.surge_block = ((SURGE_BLOCK_MS * 0.001 * sample_rate) as usize).max(1);
-        self.correlation_rate = 1.0 - one_pole(CORRELATION_MS, sample_rate);
         self.leveller_glide = 1.0 - one_pole(10.0, sample_rate);
         self.limiter_release = 1.0 - one_pole(LIMITER_RELEASE_MS, sample_rate);
         self.reset();
@@ -748,13 +764,13 @@ impl DreamEater {
         self.crossfade = 1.0;
         self.since_retune = self.retune_gap;
         self.shimmer = [0.0, 0.37, 0.71];
+        self.noise = NOISE_SEEDS.map(Noise);
+        self.breath_power = 0.0;
         for filter in &mut self.wet_filters {
             filter.reset();
         }
         self.dry_power.reset();
         self.wet_power.reset();
-        self.cross_power = 0.0;
-        self.correlation = 0.0;
         self.leveller = 0.0;
         self.limiter = 1.0;
         self.countdown = 0;
@@ -782,10 +798,9 @@ impl DreamEater {
         }
     }
 
-    /// Listens to one frame of the track and, unless `amount` is Off, returns it with the voices
-    /// mixed in. `channels` is 1 or 2; with 1, only `track[0]` is used. `envelope` is the sample's
-    /// normalised envelope, and `heard` the gain the output gets afterwards, which the leveller
-    /// takes into account when it judges loudness.
+    /// Listens to one frame of the track and, unless `amount` is Off, returns it ducked by
+    /// `heard` with the chord mixed in after the duck. `channels` is 1 or 2; with 1, only
+    /// `track[0]` is used. `envelope` is the sample's normalised envelope.
     pub fn process(
         &mut self,
         track: [f32; 2],
@@ -815,59 +830,45 @@ impl DreamEater {
         self.countdown -= 1;
         self.crossfade = (self.crossfade + self.crossfade_step).min(1.0);
 
-        let open = RESTING_OPEN + (1.0 - RESTING_OPEN) * self.swell.clamp(0.0, 1.0);
-        let excite = mid as f64 * open;
+        let mid = mid as f64;
+        self.breath_power += self.breath_rate * (mid * mid - self.breath_power);
+        let breath = BREATH * self.breath_power.sqrt();
+        let noise = [self.noise[0].next() * breath, self.noise[1].next() * breath];
+        // Squared, so the voices open mostly on the hit itself.
+        let open = RESTING_OPEN + (1.0 - RESTING_OPEN) * self.swell.clamp(0.0, 1.0).powi(2);
         let mut wet = [0.0f64; 2];
         for (index, bank) in self.banks.iter_mut().enumerate() {
-            let feed = if index == self.active { self.crossfade } else { 1.0 - self.crossfade };
-            let input = excite * feed;
+            let feed = open * if index == self.active { self.crossfade } else { 1.0 - self.crossfade };
             for (partials, gains) in bank.voices.iter_mut().zip(&self.gains) {
-                for (resonator, gain) in partials.iter_mut().zip(gains) {
-                    let ring = resonator.process(input);
-                    wet[0] += ring * gain[0];
-                    wet[1] += ring * gain[1];
+                for (pair, gain) in partials.iter_mut().zip(gains) {
+                    for side in 0..2 {
+                        let resonator = &mut pair[side];
+                        let ring = resonator.process(feed * (mid + noise[side] * resonator.breath));
+                        wet[side] += ring * gain[side];
+                    }
                 }
             }
         }
         for (side, filter) in wet.iter_mut().zip(&mut self.wet_filters) {
             *side = filter.process(*side);
         }
+        let heard = heard as f64;
+        let track = if stereo { [track[0] as f64, track[1] as f64] } else { [track[0] as f64; 2] };
         if !wet.iter().all(|side| side.is_finite()) {
             self.start();
-            return Some(track);
+            return Some(track.map(|side| (heard * side) as f32));
         }
+        let wet = if stereo { wet } else { [0.5 * (wet[0] + wet[1]); 2] };
 
-        let track = if stereo { [track[0] as f64, track[1] as f64] } else { [track[0] as f64; 2] };
-        let full = DRIVE * amount;
-        let wet = if stereo { wet.map(|side| full * side) } else { [full * 0.5 * (wet[0] + wet[1]); 2] };
-        // The leveller picks the most wet, up to all of it, that keeps the output's mean power at
-        // the track's once the dry dip is taken off, counting how far the wet lines up with the
-        // track: mean((d*x + g*w)^2) <= mean(x^2), solved for g. Wet that leans against the
-        // track buys a little more wet, never more than `MAX_LEAN` times what unrelated wet gets.
-        let dry_gain = 1.0 - DRY_DIP * amount * amount;
+        // The leveller holds the chord's mean power at `WET_LEVEL` squared times the ducked
+        // track's, judged over several hits so each hit's swell comes through.
         let (rate, surge_rate, block) = (self.loudness_rate, self.surge_rate, self.surge_block);
-        let heard = (heard as f64).powi(2);
-        let dry_power = track[0] * track[0] + track[1] * track[1];
-        let (dry_power, dry_forgotten) = self.dry_power.update(heard * dry_power, rate, surge_rate, block);
-        let wet_power = heard * (wet[0] * wet[0] + wet[1] * wet[1]);
-        let (wet_power, wet_forgotten) = self.wet_power.update(wet_power, rate, surge_rate, block);
-        self.cross_power *= (dry_forgotten * wet_forgotten).sqrt();
-        self.cross_power += rate * (heard * (track[0] * wet[0] + track[1] * wet[1]) - self.cross_power);
-        let slow_scale = (self.dry_power.slow * self.wet_power.slow).sqrt();
-        if slow_scale > 1e-24 {
-            let correlation = (self.cross_power / slow_scale).clamp(-1.0, 1.0);
-            self.correlation += self.correlation_rate * (correlation - self.correlation);
-        }
-        let target = if wet_power > 1e-24 {
-            let half_linear = dry_gain * self.correlation * (dry_power * wet_power).sqrt();
-            let headroom = (1.0 - dry_gain * dry_gain) * dry_power;
-            let root = (half_linear * half_linear + wet_power * headroom).max(0.0).sqrt();
-            let unrelated = (headroom / wet_power).sqrt();
-            ((root - half_linear) / wet_power).min(MAX_LEAN * unrelated).clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
+        let ducked_power = heard * heard * (track[0] * track[0] + track[1] * track[1]);
+        let dry_power = self.dry_power.update(ducked_power, rate, surge_rate, block);
+        let wet_power = self.wet_power.update(wet[0] * wet[0] + wet[1] * wet[1], rate, surge_rate, block);
+        let target = (WET_LEVEL * amount * (dry_power / wet_power.max(1e-30)).sqrt()).min(MAX_GAIN);
         self.leveller += self.leveller_glide * (target - self.leveller);
+        let dry_gain = heard * dry_gain(amount);
         let dry = track.map(|side| dry_gain * side);
         let wet = wet.map(|side| self.leveller * side);
         // Turns the wet down, never the track, so the output stays under the ceiling or the
@@ -887,7 +888,8 @@ impl DreamEater {
     #[cfg(test)]
     pub(crate) fn leveller(&self) -> f64 {
         self.leveller
-    }}
+    }
+}
 
 #[cfg(test)]
 mod tests {

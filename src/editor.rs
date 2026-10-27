@@ -17,9 +17,14 @@ pub const HEIGHT: u32 = 600;
 const INK: Color32 = Color32::from_rgb(0x14, 0x14, 0x14);
 const SUBTLE: Color32 = Color32::from_rgb(0x3a, 0x3a, 0x3a);
 const OUTLINE: Color32 = Color32::from_rgb(0x4a, 0x4a, 0x4a);
-const DISC: Color32 = Color32::from_rgb(0xf4, 0xf6, 0xff);
-const TRACK: Color32 = Color32::from_rgb(0xb4, 0xb8, 0xd0);
-const ARC: Color32 = Color32::from_rgb(0x3e, 0x4e, 0xd8);
+const DISC: Color32 = Color32::from_rgb(0xf6, 0xf5, 0xfc);
+const TRACK: Color32 = Color32::from_rgb(0xba, 0xb5, 0xd1);
+/// The accent, #7C6EBB.
+const ARC: Color32 = Color32::from_rgb(0x7c, 0x6e, 0xbb);
+/// The accent lightened, behind selected menu items and text.
+const ARC_LIGHT: Color32 = Color32::from_rgb(0xcb, 0xc5, 0xe4);
+/// The accent darkened, for selected text, focus outlines, and the text cursor.
+const ARC_DARK: Color32 = Color32::from_rgb(0x4a, 0x42, 0x70);
 const PLAYHEAD: Color32 = Color32::from_rgb(0xd8, 0x5a, 0x3e);
 /// The Rate readout while Restart is off.
 const MUTED: Color32 = Color32::from_rgb(0x8c, 0x8c, 0x8c);
@@ -72,6 +77,10 @@ pub fn create(params: Arc<HaunterParams>, shared: Arc<Shared>, state: Arc<EguiSt
             let mut visuals = egui::Visuals::light();
             visuals.panel_fill = Color32::from_rgb(0xec, 0xec, 0xec);
             visuals.window_fill = Color32::from_rgb(0xd6, 0xd6, 0xd6);
+            visuals.selection.bg_fill = ARC_LIGHT;
+            visuals.selection.stroke = Stroke::new(1.0_f32, ARC_DARK);
+            visuals.text_cursor.stroke = Stroke::new(2.0_f32, ARC_DARK);
+            visuals.hyperlink_color = ARC;
             context.set_visuals(visuals);
             configure(context);
         },
@@ -456,7 +465,7 @@ fn waveform(
         [Pos2::new(inner.left(), middle), Pos2::new(inner.right(), middle)],
         Stroke::new(1.0_f32, TRACK.gamma_multiply(0.6)),
     );
-    let shade = Color32::from_rgba_unmultiplied(0x60, 0x60, 0x70, 40);
+    let shade = Color32::from_rgba_unmultiplied(0x62, 0x5e, 0x72, 40);
     painter.rect_filled(Rect::from_min_max(rect.min, Pos2::new(x_of(low), rect.bottom())), 0.0, shade);
     painter.rect_filled(Rect::from_min_max(Pos2::new(x_of(high), rect.top()), rect.max), 0.0, shade);
 
@@ -493,7 +502,7 @@ fn handle_param(params: &HaunterParams, handle: Handle) -> &FloatParam {
 
 fn drop_overlay(painter: &egui::Painter, rect: Rect, hovering_files: bool) {
     if hovering_files {
-        painter.rect_filled(rect, CornerRadius::same(6), Color32::from_rgba_unmultiplied(0x3e, 0x4e, 0xd8, 60));
+        painter.rect_filled(rect, CornerRadius::same(6), Color32::from_rgba_unmultiplied(0x7c, 0x6e, 0xbb, 60));
         painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Drop to load", egui::FontId::proportional(18.0), INK);
     }
 }
@@ -620,7 +629,7 @@ fn arc_points(center: Pos2, radius: f32, start: f32, end: f32) -> Vec<Pos2> {
 enum Face {
     Plain,
     /// Dropout's Destroy treatment: a dark disc with a white arc and pointer, and `progress`
-    /// (0..1, the sample's live sweep) filling the white arc in blue from the start.
+    /// (0..1, the sample's live sweep) filling the white arc in the accent colour from the start.
     Eater { progress: f32 },
 }
 

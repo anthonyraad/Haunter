@@ -245,6 +245,22 @@ fn preset_label(params: &HaunterParams, shared: &Shared, state: &EditorState) ->
     format!("{}{}", selection.choice.name(), if modified { "*" } else { "" })
 }
 
+/// Paints a closed menu's text in the middle of its button. egui's ComboBox puts the text at the
+/// left, so the menu is given the same text in a transparent colour, which keeps the button the
+/// size it was, and this paints it again centred, both ways. Text too wide to centre without
+/// reaching the arrow ends just left of it.
+fn paint_menu_text(ui: &egui::Ui, button: Rect, text: egui::RichText, truncate: bool) {
+    let spacing = ui.spacing();
+    let content = button.shrink2(spacing.button_padding);
+    let room = (content.width() - spacing.icon_spacing - spacing.icon_width).max(0.0);
+    let mode = if truncate { egui::TextWrapMode::Truncate } else { egui::TextWrapMode::Extend };
+    let galley = egui::WidgetText::from(text).into_galley(ui, Some(mode), room, egui::TextStyle::Button);
+    let size = galley.size();
+    let left = (button.center().x - size.x / 2.0).min(content.left() + room - size.x).max(content.left());
+    let top = content.center().y - size.y / 2.0;
+    ui.painter().galley(Pos2::new(left, top), galley, INK);
+}
+
 /// The preset menu: `--`, the factory presets, then the user's. Returns where it was drawn.
 fn preset_menu(
     ui: &mut egui::Ui,
@@ -265,32 +281,36 @@ fn preset_menu(
                 look.weak_bg_fill = DISC;
                 look.bg_stroke = Stroke::new(1.0_f32, OUTLINE);
             }
-            egui::ComboBox::from_id_salt("preset")
+            let menu = egui::ComboBox::from_id_salt("preset")
                 .width(190.0)
                 // Room for the factory presets and a dozen saved ones before it scrolls.
                 .height(480.0)
                 .truncate()
-                .selected_text(egui::RichText::new(label).size(14.0).color(INK))
+                .selected_text(egui::RichText::new(&label).size(14.0).color(Color32::TRANSPARENT))
                 .show_ui(ui, |ui| {
-                    if !state.menu_open {
-                        state.user_presets = shared.user_presets.list();
-                    }
-                    let mut item = |ui: &mut egui::Ui, choice: Choice| {
-                        if ui.selectable_label(choice == selected, choice.name()).clicked() {
-                            picked = Some(choice);
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::Center), |ui| {
+                        if !state.menu_open {
+                            state.user_presets = shared.user_presets.list();
                         }
-                    };
-                    item(ui, Choice::None);
-                    for name in preset::factory_names() {
-                        item(ui, Choice::Factory(name.to_owned()));
-                    }
-                    if !state.user_presets.is_empty() {
-                        ui.separator();
-                    }
-                    for name in &state.user_presets {
-                        item(ui, Choice::User(name.clone()));
-                    }
-                })
+                        let mut item = |ui: &mut egui::Ui, choice: Choice| {
+                            if ui.selectable_label(choice == selected, choice.name()).clicked() {
+                                picked = Some(choice);
+                            }
+                        };
+                        item(ui, Choice::None);
+                        for name in preset::factory_names() {
+                            item(ui, Choice::Factory(name.to_owned()));
+                        }
+                        if !state.user_presets.is_empty() {
+                            ui.separator();
+                        }
+                        for name in &state.user_presets {
+                            item(ui, Choice::User(name.clone()));
+                        }
+                    })
+                });
+            paint_menu_text(ui, menu.response.rect, egui::RichText::new(label).size(14.0).color(INK), true);
+            menu
         })
         .inner;
     let was_open = state.menu_open;
@@ -616,16 +636,20 @@ fn direction_menu(ui: &mut egui::Ui, setter: &ParamSetter, param: &EnumParam<Dir
                 look.weak_bg_fill = DISC;
                 look.bg_stroke = Stroke::new(1.0_f32, OUTLINE);
             }
-            egui::ComboBox::from_id_salt("direction")
+            let menu = egui::ComboBox::from_id_salt("direction")
                 .width(110.0)
-                .selected_text(egui::RichText::new(name(shown)).size(13.0).color(INK))
+                .selected_text(egui::RichText::new(name(shown)).size(13.0).color(Color32::TRANSPARENT))
                 .show_ui(ui, |ui| {
-                    for direction in [Direction::Forward, Direction::Backward, Direction::Levitate] {
-                        if ui.selectable_label(direction == shown, name(direction)).clicked() {
-                            picked = Some(direction);
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::Center), |ui| {
+                        for direction in [Direction::Forward, Direction::Backward, Direction::Levitate] {
+                            if ui.selectable_label(direction == shown, name(direction)).clicked() {
+                                picked = Some(direction);
+                            }
                         }
-                    }
-                })
+                    })
+                });
+            paint_menu_text(ui, menu.response.rect, egui::RichText::new(name(shown)).size(13.0).color(INK), false);
+            menu
         })
         .inner;
     menu.response.clone().on_hover_text(
@@ -1003,6 +1027,9 @@ mod tests {
             fn flatten(shape: egui::Shape, into: &mut Vec<egui::Shape>) {
                 match shape {
                     egui::Shape::Vec(shapes) => shapes.into_iter().for_each(|shape| flatten(shape, into)),
+                    // Text painted fully transparent can't be seen, as the menus' own text isn't.
+                    egui::Shape::Text(text)
+                        if text.galley.job.sections.iter().all(|s| s.format.color == Color32::TRANSPARENT) => {}
                     shape => into.push(shape),
                 }
             }
@@ -1393,6 +1420,49 @@ mod tests {
         pick_direction(&mut editor, "Levitate");
         editor.wait(1.1);
         assert_one_edit(&editor.screen.take_edits(), editor.plugin.params.direction.as_ptr(), 1.0);
+    }
+
+    #[test]
+    fn the_menus_centre_their_text() {
+        for scale in [1.0, 1.5] {
+            let mut editor = Editor::scaled(true, scale);
+            let drawn = editor.settle();
+            let centred = |what: &str, text: Rect, within: Rect| {
+                assert!((text.center().x - within.center().x).abs() < 1.5, "{what} at {text:?} in {within:?}, scale {scale}");
+                assert!((text.center().y - within.center().y).abs() < 3.0, "{what} at {text:?} in {within:?}, scale {scale}");
+            };
+            // A sample is loaded, so the preset shows its `*`.
+            for (menu, name) in [(drawn.preset_menu, "--*"), (drawn.direction, "Forward")] {
+                let texts: Vec<(String, Rect, Color32)> =
+                    editor.screen.text_shapes().into_iter().filter(|(_, rect, _)| menu.contains(rect.center())).collect();
+                assert_eq!(texts.len(), 1, "one text on the button: {texts:?}");
+                assert_eq!(texts[0].0, name);
+                centred(name, texts[0].1, menu);
+            }
+
+            let menu = editor.frame().direction;
+            editor.click_at(menu.center());
+            editor.frame();
+            let items: Vec<(String, Rect)> = editor
+                .screen
+                .text_shapes()
+                .into_iter()
+                .filter(|(text, rect, _)| rect.top() > menu.bottom() - 1.0 && ["Forward", "Backward", "Levitate"].contains(&text.as_str()))
+                .map(|(text, rect, _)| (text, rect))
+                .collect();
+            assert_eq!(items.len(), 3, "{items:?}");
+            for (name, rect) in &items {
+                assert!((rect.center().x - menu.center().x).abs() < 1.5, "{name} at {rect:?} under {menu:?}, scale {scale}");
+            }
+            editor.screen.press_key(egui::Key::Escape);
+            editor.wait(0.2);
+
+            let entries = open_preset_menu(&mut editor);
+            assert!(entries.len() >= 6, "{entries:?}");
+            for (name, rect) in &entries {
+                assert!((rect.center().x - drawn.preset_menu.center().x).abs() < 1.5, "{name} at {rect:?}, scale {scale}");
+            }
+        }
     }
 
     /// The text the Direction menu shows.

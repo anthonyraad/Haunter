@@ -62,7 +62,7 @@ Projects saved before 1.7 had a Reverse toggle instead of Direction. They load w
 
 ## Presets
 
-The preset menu sits left of **Save**, at the right of the title.
+The preset menu sits left of **Save**, at the right of the title. The preset and Direction menus show their text centred, on the button and in the list.
 
 - **--** is the empty preset: no sample, every setting at its default. It is first in the menu, and a new Haunter starts on it. Load a sample from there as usual. Version 1.4 called it Init; projects saved on Init (or on `--` with 1.3) reopen on `--`.
 - **Paper** (20.6 s), **Stone** (8.3 s), **Umber** (10.4 s), **Water** (4.2 s), and **Wind** (5.6 s) are the factory presets, listed alphabetically. Each one's sample is built into the plugin, so they work on any machine. They use the default settings, and the sample shows under the preset's name.
@@ -131,6 +131,7 @@ The unit tests cover:
   - a click anywhere on the empty waveform asks for the file picker once, with a hand pointer, but not while a file is loading or the picker is open;
   - with a sample loaded, a plain click on the waveform asks for the picker, while clicks on the S and E handles or their tabs, and drags, don't, and a drag moves Start;
   - the click that closes the preset menu over the waveform doesn't open the picker;
+  - the preset and Direction menus centre their text on the button and in their lists, at 1x and 1.5x;
   - one click flips Restart, shows it, and sends a begin, set, and end to the host;
   - the Direction menu lists Forward, Backward, and Levitate, shows Forward at first, holds the edit open for a choice and sends it again every frame until the parameter has it (or about a second has passed), like a toggle held down, never sends any other value, shows the choice while the edit is open and until the host has had blocks to apply it, and explains the choices in its tooltip;
   - a choice reaches a host that, like Cubase, only passes an editor edit on to `process` while the edit is still open (an edit opened and closed in one frame never arrived, which was 1.7.0's bug), and choosing what the parameter already has closes the edit after a click's length;

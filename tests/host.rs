@@ -501,6 +501,25 @@ fn turning_dream_eater_up_mid_song_takes_effect_and_off_is_untouched() {
     }
 }
 
+/// The loudest difference Dream Eater at 100% makes to `seconds` of a silent track, which a
+/// noise source would fill with hiss.
+fn change_on_silence(rate: f64, channels: usize, seconds: f64) -> f32 {
+    let silence = vec![vec![0.0f32; (rate * seconds) as usize]; 2];
+    let off = render(&silence, &Settings::at(rate, channels, 0.0), 0.0);
+    let on = render(&silence, &Settings::at(rate, channels, 1.0), 0.0);
+    on.iter().zip(&off).flat_map(|(a, b)| a.iter().zip(b).map(|(a, b)| (a - b).abs())).fold(0.0, f32::max)
+}
+
+#[test]
+fn dream_eater_adds_no_hiss_to_silence_through_the_vst3_wrapper() {
+    for rate in [44_100.0, 48_000.0, 96_000.0] {
+        for channels in [2, 1] {
+            let change = change_on_silence(rate, channels, 4.0);
+            assert_eq!(change, 0.0, "{rate} Hz, {channels} channel(s): a silent track stays as it is at Off");
+        }
+    }
+}
+
 #[test]
 #[ignore]
 fn host_report() {
@@ -526,6 +545,9 @@ fn host_report() {
     for restart in [true, false] {
         let result = change(A_MINOR, Settings { restart, ..Settings::at(48_000.0, 2, 1.0) });
         println!("Restart {restart}: diff {:.3}", result.difference);
+    }
+    for rate in [44_100.0, 48_000.0] {
+        println!("{rate} Hz, silence at 100%: largest change {:e}", change_on_silence(rate, 2, 4.0));
     }
     let result = change(D_MAJOR, Settings::at(48_000.0, 2, 1.0));
     println!(

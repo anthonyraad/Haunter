@@ -1,10 +1,12 @@
 //! Dream Eater: glassy resonances on the track, tuned to its key and played by the sample.
 //!
 //! The track's key is estimated from its audio. Three resonator voices, the root, fifth, and ninth
-//! of that key's major pentatonic, listen to the track and to soft noise that follows its level,
-//! and each hit of the sample opens them, so they swell and ring out in tune. Each voice is a
-//! detuned pair, one per side, for a stereo shimmer. The chord is added after the duck, so it
-//! blooms in the space each hit opens. Nothing here allocates while processing.
+//! of that key's major pentatonic, listen to a delayed copy of the track, taken before the duck,
+//! and each hit of the sample opens them, so they swell and ring out in tune. The delay lands the
+//! track's energy in the gap each duck opens. Each voice is a detuned pair, one per side, for a
+//! stereo shimmer. The chord is added after the duck, so it blooms in the space each hit opens.
+//! Nothing is generated here but the ringing of the track itself: there is no noise source, so
+//! silence in is silence out. Nothing here allocates while processing.
 
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{PI, TAU};
@@ -407,12 +409,15 @@ const TAIL_LONGEST: f64 = 0.9;
 const RESTING_OPEN: f64 = 0.1;
 const SWELL_ATTACK_MS: f32 = 25.0;
 const SWELL_RELEASE_MS: f32 = 140.0;
-/// Besides the track, each side's resonators hear their own soft noise that follows the track's
-/// level, so every note of the chord sounds even where the track has nothing at its pitch. This
-/// is how loud the noise alone rings a resonator, as a share of the track's level.
-const BREATH: f64 = 0.5;
-/// How quickly the noise follows the track's level.
-const BREATH_MS: f32 = 60.0;
+/// The resonators hear the track, before the duck, this long after it played: the follower's
+/// Attack, which is when the duck has come in, plus two of the swell's attack time constants,
+/// by when the voices are about three-quarters open. So the track's energy arrives in the gap
+/// right after each duck, as the hit opens the voices. 51 ms at the default 1 ms Attack.
+const EXCITE_SWELLS: f64 = 2.0;
+/// The longest Attack, and so the longest delay the delay line has to hold.
+const LONGEST_ATTACK_MS: f64 = 100.0;
+/// How quickly the delay follows a change of Attack, so it glides instead of jumping.
+const DELAY_GLIDE_MS: f32 = 50.0;
 /// How long a new key takes to take over the track's input from the old one.
 const CROSSFADE_SECONDS: f64 = 0.4;
 /// The shortest time between retunes, so the bank being retuned has rung out.
@@ -424,7 +429,7 @@ const AIR_GAIN: f64 = 1.41;
 /// How loud the chord is at 100%, relative to the track after the duck. The chord is added after
 /// the duck, so it blooms in the space each hit opens, and the track is turned down as the chord
 /// comes up so the output stays about as loud as Off.
-const WET_LEVEL: f64 = 0.42;
+const WET_LEVEL: f64 = 0.55;
 /// The most the leveller turns the chord up, so it never makes much of a whisper.
 const MAX_GAIN: f64 = 8.0;
 /// How long the leveller listens to judge loudness.
@@ -440,6 +445,11 @@ const SURGE_BLOCK_MS: f64 = 250.0;
 /// The wet is turned down so it never pushes the output past this or the dry track's own peak.
 const CEILING: f64 = 1.0;
 const LIMITER_RELEASE_MS: f32 = 80.0;
+/// The chord rings the track's own notes, so it can line up with the track and make the sum
+/// louder than the two apart, and where the track has little at the chord's pitches the chord
+/// stays quiet. So the output is brought back to the ducked track's loudness, turned down by at
+/// most this much, and up by no more than undoes `dry_gain`, so the track is never louder than Off.
+const MIN_MAKEUP: f64 = 0.7;
 /// Frames between updates of the tuning and the tail.
 const CONTROL_FRAMES: usize = 32;
 
@@ -456,6 +466,50 @@ pub(crate) fn dry_gain(amount: f64) -> f64 {
     (1.0 - wet * wet).sqrt()
 }
 
+/// How long after the track the resonators hear it, in milliseconds, for an Attack of
+/// `attack_ms`.
+pub(crate) fn excite_delay_ms(attack_ms: f64) -> f64 {
+    attack_ms.clamp(0.0, LONGEST_ATTACK_MS) + EXCITE_SWELLS * SWELL_ATTACK_MS as f64
+}
+
+/// The track's mid before the duck, held long enough to be heard again after any delay
+/// `excite_delay_ms` can ask for, and read back between frames.
+#[derive(Debug, Clone, Default)]
+struct DelayLine {
+    buffer: Vec<f64>,
+    write: usize,
+}
+
+impl DelayLine {
+    /// Allocates for `frames` of delay. Not for the audio thread.
+    fn prepare(&mut self, frames: usize) {
+        self.buffer = vec![0.0; frames + 2];
+        self.write = 0;
+    }
+
+    fn reset(&mut self) {
+        self.buffer.fill(0.0);
+        self.write = 0;
+    }
+
+    fn push(&mut self, value: f64) {
+        self.buffer[self.write] = value;
+        self.write = (self.write + 1) % self.buffer.len();
+    }
+
+    /// The value pushed `frames` frames before the last one, linearly interpolated.
+    fn read(&self, frames: f64) -> f64 {
+        let length = self.buffer.len();
+        let frames = frames.clamp(0.0, (length - 2) as f64);
+        let whole = frames.floor();
+        let fraction = frames - whole;
+        let newest = (self.write + length - 1) % length;
+        let at = (newest + length - whole as usize) % length;
+        let before = (at + length - 1) % length;
+        self.buffer[at] + fraction * (self.buffer[before] - self.buffer[at])
+    }
+}
+
 /// A two-pole band-pass resonator with unit gain at its pitch: a topology-preserving state
 /// variable filter, which stays stable however its tuning moves.
 #[derive(Debug, Clone, Copy, Default)]
@@ -466,8 +520,6 @@ struct Resonator {
     a2: f64,
     a3: f64,
     k: f64,
-    /// The gain that makes unit white noise ring it at unit level, whatever its pitch and tail.
-    breath: f64,
 }
 
 impl Resonator {
@@ -480,8 +532,6 @@ impl Resonator {
         self.a2 = g * self.a1;
         self.a3 = g * self.a2;
         self.k = k;
-        // A unit-peak band-pass passes k*pi*f/fs of white noise's power.
-        self.breath = (sample_rate / (k * PI * hz)).sqrt();
     }
 
     fn reset(&mut self) {
@@ -596,22 +646,6 @@ fn pan_gains(pan: f64) -> [f64; 2] {
     [angle.cos(), angle.sin()]
 }
 
-/// White noise with unit power, from a fixed seed.
-#[derive(Debug, Clone, Copy)]
-struct Noise(u32);
-
-impl Noise {
-    fn next(&mut self) -> f64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 17;
-        self.0 ^= self.0 << 5;
-        // Uniform in -1..1 has a third of unit power.
-        (self.0 as f64 / u32::MAX as f64 * 2.0 - 1.0) * 3.0f64.sqrt()
-    }
-}
-
-const NOISE_SEEDS: [u32; 2] = [0x9e37_79b9, 0x7f4a_7c15];
-
 pub struct DreamEater {
     sample_rate: f64,
     detector: KeyDetector,
@@ -635,14 +669,20 @@ pub struct DreamEater {
     /// Each voice partial's level on the left and right.
     gains: [[[f64; 2]; PARTIALS.len()]; VOICES],
     countdown: usize,
-    /// The left and right noise, and the track's power that sets how loud they are.
-    noise: [Noise; 2],
-    breath_power: f64,
-    breath_rate: f64,
+    /// The track's mid before the duck, which the resonators hear `delay` frames late.
+    excitation: DelayLine,
+    /// The delay the Attack asks for, and the one in use, which glides to it.
+    delay_target: f64,
+    delay: f64,
+    delay_glide: f64,
     wet_filters: [WetFilter; 2],
     /// The track's power after the duck, and the chord's before the leveller.
     dry_power: PowerMeter,
     wet_power: PowerMeter,
+    /// The output's power before the makeup, and the makeup that brings it back to the ducked
+    /// track's.
+    out_power: PowerMeter,
+    makeup: f64,
     leveller: f64,
     limiter: f64,
     loudness_rate: f64,
@@ -677,12 +717,15 @@ impl DreamEater {
             shimmer: [0.0; VOICES],
             gains,
             countdown: 0,
-            noise: NOISE_SEEDS.map(Noise),
-            breath_power: 0.0,
-            breath_rate: 0.0,
+            excitation: DelayLine::default(),
+            delay_target: 0.0,
+            delay: 0.0,
+            delay_glide: 0.0,
             wet_filters: Default::default(),
             dry_power: PowerMeter::default(),
             wet_power: PowerMeter::default(),
+            out_power: PowerMeter::default(),
+            makeup: 1.0,
             leveller: 0.0,
             limiter: 1.0,
             loudness_rate: 0.0,
@@ -703,7 +746,11 @@ impl DreamEater {
         self.retune_gap = (RETUNE_GAP_SECONDS * sample_rate) as usize;
         self.swell_attack = 1.0 - one_pole(SWELL_ATTACK_MS, sample_rate);
         self.swell_release = 1.0 - one_pole(SWELL_RELEASE_MS, sample_rate);
-        self.breath_rate = 1.0 - one_pole(BREATH_MS, sample_rate);
+        let longest = excite_delay_ms(LONGEST_ATTACK_MS) * 0.001 * sample_rate;
+        self.excitation.prepare(longest.ceil() as usize);
+        self.delay_glide = 1.0 - one_pole(DELAY_GLIDE_MS, sample_rate);
+        self.set_attack(crate::dsp::Settings::default().attack_ms);
+        self.delay = self.delay_target;
         for filter in &mut self.wet_filters {
             filter.set(sample_rate);
         }
@@ -717,8 +764,21 @@ impl DreamEater {
 
     pub fn reset(&mut self) {
         self.detector.reset();
+        self.excitation.reset();
+        self.delay = self.delay_target;
         self.running = false;
         self.swell = 0.0;
+    }
+
+    /// Follows the ducking's Attack, which sets how late the resonators hear the track.
+    pub fn set_attack(&mut self, attack_ms: f32) {
+        self.delay_target = excite_delay_ms(attack_ms as f64) * 0.001 * self.sample_rate;
+    }
+
+    /// How late the resonators hear the track, in frames, once any change of Attack has settled.
+    #[cfg(test)]
+    pub(crate) fn delay_frames(&self) -> f64 {
+        self.delay_target
     }
 
     pub fn choose(&mut self, choice: KeyChoice) {
@@ -764,13 +824,13 @@ impl DreamEater {
         self.crossfade = 1.0;
         self.since_retune = self.retune_gap;
         self.shimmer = [0.0, 0.37, 0.71];
-        self.noise = NOISE_SEEDS.map(Noise);
-        self.breath_power = 0.0;
         for filter in &mut self.wet_filters {
             filter.reset();
         }
         self.dry_power.reset();
         self.wet_power.reset();
+        self.out_power.reset();
+        self.makeup = 1.0;
         self.leveller = 0.0;
         self.limiter = 1.0;
         self.countdown = 0;
@@ -812,6 +872,8 @@ impl DreamEater {
         let stereo = channels > 1;
         let mid = if stereo { 0.5 * (track[0] + track[1]) } else { track[0] };
         self.detector.push(mid);
+        self.excitation.push(mid as f64);
+        self.delay += self.delay_glide * (self.delay_target - self.delay);
         let envelope = envelope as f64;
         let rate = if envelope > self.swell { self.swell_attack } else { self.swell_release };
         self.swell += rate * (envelope - self.swell);
@@ -830,20 +892,18 @@ impl DreamEater {
         self.countdown -= 1;
         self.crossfade = (self.crossfade + self.crossfade_step).min(1.0);
 
-        let mid = mid as f64;
-        self.breath_power += self.breath_rate * (mid * mid - self.breath_power);
-        let breath = BREATH * self.breath_power.sqrt();
-        let noise = [self.noise[0].next() * breath, self.noise[1].next() * breath];
+        // The track before the duck, late enough to land in the gap the duck opens.
+        let delayed = self.excitation.read(self.delay);
         // Squared, so the voices open mostly on the hit itself.
         let open = RESTING_OPEN + (1.0 - RESTING_OPEN) * self.swell.clamp(0.0, 1.0).powi(2);
+        let input = open * delayed;
         let mut wet = [0.0f64; 2];
         for (index, bank) in self.banks.iter_mut().enumerate() {
-            let feed = open * if index == self.active { self.crossfade } else { 1.0 - self.crossfade };
+            let feed = input * if index == self.active { self.crossfade } else { 1.0 - self.crossfade };
             for (partials, gains) in bank.voices.iter_mut().zip(&self.gains) {
                 for (pair, gain) in partials.iter_mut().zip(gains) {
                     for side in 0..2 {
-                        let resonator = &mut pair[side];
-                        let ring = resonator.process(feed * (mid + noise[side] * resonator.breath));
+                        let ring = pair[side].process(feed);
                         wet[side] += ring * gain[side];
                     }
                 }
@@ -868,11 +928,22 @@ impl DreamEater {
         let wet_power = self.wet_power.update(wet[0] * wet[0] + wet[1] * wet[1], rate, surge_rate, block);
         let target = (WET_LEVEL * amount * (dry_power / wet_power.max(1e-30)).sqrt()).min(MAX_GAIN);
         self.leveller += self.leveller_glide * (target - self.leveller);
-        let dry_gain = heard * dry_gain(amount);
-        let dry = track.map(|side| dry_gain * side);
+        let dry = track.map(|side| heard * dry_gain(amount) * side);
         let wet = wet.map(|side| self.leveller * side);
+        // Brings the sum back to the ducked track's loudness, where the chord lines up with the
+        // track or finds little in it to ring.
+        let sum_power = self.out_power.update(
+            (dry[0] + wet[0]).powi(2) + (dry[1] + wet[1]).powi(2),
+            rate,
+            surge_rate,
+            block,
+        );
+        let most = 1.0 / dry_gain(amount);
+        let makeup = if sum_power > 1e-30 { (dry_power / sum_power).sqrt().clamp(MIN_MAKEUP, most) } else { 1.0 };
+        self.makeup += self.leveller_glide * (makeup - self.makeup);
+        let (dry, wet) = (dry.map(|side| self.makeup * side), wet.map(|side| self.makeup * side));
         // Turns the wet down, never the track, so the output stays under the ceiling or the
-        // track's own peak.
+        // track's own peak. The track itself is never above its level at Off.
         let mut fits = 1.0f64;
         for side in 0..2 {
             let limit = dry[side].abs().max(CEILING);
@@ -888,6 +959,11 @@ impl DreamEater {
     #[cfg(test)]
     pub(crate) fn leveller(&self) -> f64 {
         self.leveller
+    }
+
+    #[cfg(test)]
+    pub(crate) fn makeup(&self) -> f64 {
+        self.makeup
     }
 }
 
@@ -1107,7 +1183,8 @@ mod tests {
             // A hit every half second.
             let envelope = (-((n % 24_000) as f32) / 4_800.0).exp();
             let out = dream.process([v, v], 2, envelope, 1.0, 1.0).unwrap();
-            wet.push(out[0] - v);
+            // The chord alone, without the track under it.
+            wet.push(out[0] - (dream.makeup() * dry_gain(1.0)) as f32 * v);
         }
         assert_eq!(dream.key(), 6);
 
@@ -1126,11 +1203,59 @@ mod tests {
         let steady = jump(per_second..2 * per_second);
         let across = jump(2 * per_second - 4..3 * per_second);
         assert!(across < steady * 1.5, "{across} vs {steady}");
+        // Nor a click: no step between samples bigger than with the hits, for the wet's level.
+        // The track is noise, which has more to ring at some keys than others.
         let step = |range: std::ops::Range<usize>| {
-            wet[range].windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0f32, f32::max)
+            let level = rms(&wet[range.clone()]);
+            wet[range].windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0f32, f32::max) / level
         };
         let (steady_step, switch_step) = (step(RATE as usize..switch), step(switch - 480..switch + RATE as usize));
         assert!(switch_step < steady_step * 1.5, "{switch_step} vs {steady_step}");
+    }
+
+    #[test]
+    fn silence_in_is_silence_out_with_no_hiss() {
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            let mut dream = DreamEater::new(rate);
+            let frames = 4 * rate as usize;
+            for n in 0..frames {
+                // A hit every half second, fully open on each.
+                let envelope = (-((n % (rate as usize / 2)) as f32) / (0.1 * rate as f32)).exp();
+                let out = dream.process([0.0, 0.0], 2, envelope, 1.0 - 0.75 * envelope, 1.0).unwrap();
+                assert_eq!(out, [0.0, 0.0], "at {rate} Hz, frame {n}");
+            }
+            assert!(dream.level() > 0.0, "the voices were open");
+        }
+    }
+
+    #[test]
+    fn the_resonators_hear_the_track_late_by_the_attack_and_swell() {
+        assert_eq!(excite_delay_ms(1.0), 51.0);
+        assert_eq!(excite_delay_ms(100.0), 150.0);
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            for attack in [0.1f32, 1.0, 30.0, 100.0] {
+                let mut dream = DreamEater::new(rate);
+                dream.choose(KeyChoice::Fixed(0));
+                dream.set_attack(attack);
+                dream.reset();
+                let delay = excite_delay_ms(attack as f64) * 0.001 * rate;
+                assert!((dream.delay_frames() - delay).abs() < 1e-9);
+                // One click, with the voices fully open throughout.
+                let mut wet = Vec::new();
+                for n in 0..(delay as usize + rate as usize / 10) {
+                    let v = if n == 100 { 1.0 } else { 0.0 };
+                    let out = dream.process([v, v], 2, 1.0, 1.0, 1.0).unwrap();
+                    // The click itself passes straight through, so it is left out.
+                    wet.push(if n == 100 { 0.0 } else { out[0] as f64 });
+                }
+                let first = wet.iter().position(|v| v.abs() > 1e-12).unwrap();
+                assert!(
+                    (first as f64 - (100.0 + delay)).abs() <= 1.0,
+                    "at {rate} Hz, Attack {attack}: rings from frame {first}, expected {}",
+                    100.0 + delay
+                );
+            }
+        }
     }
 
     #[test]

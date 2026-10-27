@@ -625,6 +625,7 @@ impl Engine {
         self.follower.set(settings.attack_ms, settings.release_ms, self.sample_rate);
         self.raw_follower.set(settings.attack_ms, settings.release_ms, self.sample_rate);
         self.dream.choose(settings.dream_key);
+        self.dream.set_attack(settings.attack_ms);
         if let Some(sample) = self.sample.clone() {
             self.update_region(sample.frames());
             let key = self.analysis_key(&sample);
@@ -1370,8 +1371,15 @@ mod tests {
         let mut engine = kick_engine();
         engine.settings.dream_key = KeyChoice::Fixed(0);
         let output = process_track(&mut engine, &input, playing, full);
-        let dry_gain = crate::dream::dry_gain(1.0) as f32;
-        let wet: Vec<f32> = output.iter().zip(&input).map(|(a, b)| a - dry_gain * b).collect();
+        // The track's share of the output, a little above `dry_gain` where the chord finds little
+        // in noise to ring and the makeup brings the loudness back, found beat by beat. The chord
+        // hears the track tens of milliseconds late, so it has nothing in common with it.
+        let mut wet = Vec::with_capacity(output.len());
+        for (out, track) in output.chunks(24_000).zip(input.chunks(24_000)) {
+            let dot: f32 = out.iter().zip(track).map(|(a, b)| a * b).sum();
+            let share = dot / track.iter().map(|v| v * v).sum::<f32>();
+            wet.extend(out.iter().zip(track).map(|(a, b)| a - share * b));
+        }
         let power = |signal: &[f32], hz: f64| {
             let coefficient = 2.0 * (2.0 * std::f64::consts::PI * hz / RATE).cos();
             let (mut s1, mut s2) = (0.0, 0.0);
@@ -1394,6 +1402,33 @@ mod tests {
             assert!(chord > 20.0 * between, "beat {beat} rings on the chord: {chord} vs {between}");
         }
         assert_eq!(engine.dream_key(), 0);
+    }
+
+    #[test]
+    fn dream_eater_at_full_adds_no_hiss_to_silence() {
+        // A silent track, ducked on every hit, at 100%: nothing comes out but silence.
+        let playing = TransportInfo::playing_at(0.0, 120.0, RATE);
+        let mut engine = kick_engine();
+        let silence = vec![0.0f32; 4 * RATE as usize];
+        let mut levels = Vec::new();
+        let mut output = Vec::new();
+        for (block, chunk) in silence.chunks(2_400).enumerate() {
+            let transport = TransportInfo::playing_at((block * 2_400) as f64 * 2.0 / RATE, 120.0, RATE);
+            let mut left = chunk.to_vec();
+            let mut right = chunk.to_vec();
+            let report = engine.process(&mut [&mut left[..], &mut right[..]], &transport, || ducking(1.0));
+            levels.push(report.dream_level);
+            output.extend(left);
+            output.extend(right);
+        }
+        assert!(levels.iter().any(|&level| level > 0.5), "the hits opened the voices: {levels:?}");
+        assert!(output.iter().all(|&v| v == 0.0), "no hiss: peak {}", output.iter().fold(0.0f32, |m, v| m.max(v.abs())));
+
+        // And once a track stops, the chord rings out to true silence rather than a noise floor.
+        let input = track(96_000);
+        process_track(&mut engine, &input, playing, || ducking(1.0));
+        let tail = process_track(&mut engine, &silence, TransportInfo::playing_at(4.0, 120.0, RATE), || ducking(1.0));
+        assert!(tail[tail.len() - 24_000..].iter().all(|v| v.abs() < 1e-6), "the tail dies away to silence");
     }
 
     #[test]
@@ -1535,6 +1570,7 @@ mod tests {
                     engine.dream_key(),
                     engine.dream.leveller(),
                 );
+                println!("    makeup {:.2}", engine.dream.makeup());
             }
         }
         println!("worst-case peak at 1.0: {:.3}", worst_case().1);

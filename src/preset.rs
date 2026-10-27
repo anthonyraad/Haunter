@@ -18,7 +18,7 @@ const OLD_NO_PRESET: &str = "Init";
 
 /// Factory presets, in menu order, with the sample each one loads. They use default settings.
 const FACTORY: &[(&str, &[u8])] = &[
-    ("Gaze", include_bytes!("../presets/Gaze.wav")),
+    ("Daisy", include_bytes!("../presets/Daisy.wav")),
     ("Paper", include_bytes!("../presets/Paper.wav")),
     ("Press", include_bytes!("../presets/Press.wav")),
     ("Spin", include_bytes!("../presets/Spin.wav")),
@@ -315,17 +315,19 @@ mod tests {
         assert_eq!(check_name("  Big Room  "), Ok("Big Room"));
         for bad in [
             "", "   ", "a/b", "a\\b", "what?", "con", "COM1", "lpt9.txt", "dots.", "--", "Init", "init", "water", "Water",
-            "Paper", "stone", "UMBER", "Wind",
+            "Paper", "stone", "UMBER", "Wind", "daisy",
         ] {
             assert!(check_name(bad).is_err(), "{bad:?} was accepted");
         }
+        // Gaze was a factory preset until 1.7.6, so its name is free again.
+        assert_eq!(check_name("Gaze"), Ok("Gaze"));
         assert!(check_name(&"x".repeat(64)).is_ok());
         assert!(check_name(&"x".repeat(65)).is_err());
     }
 
     #[test]
     fn factory_presets_are_listed_alphabetically() {
-        assert_eq!(factory_names().collect::<Vec<_>>(), ["Gaze", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind"]);
+        assert_eq!(factory_names().collect::<Vec<_>>(), ["Daisy", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind"]);
         assert_eq!(Choice::None.name(), "--");
     }
 
@@ -343,14 +345,20 @@ mod tests {
         assert_eq!(water.sample_rate, 44_100.0);
         assert_eq!(water.channels.len(), 2);
         assert_eq!(water.frames(), 184_275);
+        // Daisy (1.7.6) is a 32-bit float, 44.1 kHz stereo WAV, 18.9 s long.
+        let daisy = Preset::factory("Daisy").unwrap().sample.unwrap();
+        assert_eq!(daisy.sample_rate, 44_100.0);
+        assert_eq!(daisy.channels.len(), 2);
+        assert_eq!(daisy.frames(), 831_600);
         // The 1.7.3 presets are 24-bit, 96 kHz stereo WAVs, kept at their own rate.
-        for (name, frames) in [("Gaze", 788_556), ("Press", 795_840), ("Spin", 1_537_683)] {
+        for (name, frames) in [("Press", 795_840), ("Spin", 1_537_683)] {
             let sample = Preset::factory(name).unwrap().sample.unwrap();
             assert_eq!(sample.sample_rate, 96_000.0, "{name}");
             assert_eq!(sample.channels.len(), 2, "{name}");
             assert_eq!(sample.frames(), frames, "{name}");
         }
         assert!(Preset::factory("Fire").is_err());
+        assert!(Preset::factory("Gaze").is_err(), "Gaze was removed in 1.7.6");
         assert!(Preset::factory("--").is_err(), "-- is no preset at all, not a factory one");
         assert!(Preset::factory("Init").is_err());
     }

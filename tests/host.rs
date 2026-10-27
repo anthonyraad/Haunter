@@ -950,7 +950,7 @@ fn dream_eater_is_audible_on_mono_cello_through_the_vst3_wrapper() {
 fn real_material_report() {
     let rate = 48_000.0;
     let mut tracks: Vec<(String, Vec<Vec<f32>>)> =
-        ["Gaze", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind"].iter().map(|name| (name.to_string(), factory_track(name, rate, 12.0))).collect();
+        ["Daisy", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind"].iter().map(|name| (name.to_string(), factory_track(name, rate, 12.0))).collect();
     for path in extra_tracks() {
         let name = path.file_stem().unwrap().to_string_lossy().into_owned();
         tracks.push((name, real_track(&path, rate, 12.0)));

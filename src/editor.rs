@@ -1894,7 +1894,7 @@ mod tests {
         editor.settle();
         assert_eq!(shown_preset(&mut editor), "--", "a new instance has no preset and no sample");
         let entries: Vec<String> = open_preset_menu(&mut editor).into_iter().map(|(text, _)| text).collect();
-        assert_eq!(entries, ["--", "Gaze", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind"]);
+        assert_eq!(entries, ["--", "Daisy", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind"]);
         close_preset_menu(&mut editor);
         editor.screen.take_edits();
 
@@ -1937,7 +1937,7 @@ mod tests {
     fn every_factory_preset_loads_its_own_sample() {
         let mut editor = Editor::new(false);
         editor.settle();
-        for name in ["Gaze", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind"] {
+        for name in ["Daisy", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind"] {
             pick_preset(&mut editor, name);
             let params = editor.plugin.params.clone();
             assert_eq!(params.preset.get().choice, Choice::Factory(name.into()));
@@ -1960,7 +1960,7 @@ mod tests {
         let entries: Vec<String> = open_preset_menu(&mut editor).into_iter().map(|(text, _)| text).collect();
         assert_eq!(
             entries,
-            ["--", "Gaze", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind", "Snare Gate"],
+            ["--", "Daisy", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind", "Snare Gate"],
             "user presets come after the factory ones"
         );
         close_preset_menu(&mut editor);

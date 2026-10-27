@@ -907,6 +907,29 @@ mod tests {
     }
 
     #[test]
+    fn projects_saved_on_the_removed_gaze_preset_reopen_with_their_sample() {
+        // Gaze was a factory preset until 1.7.6. Its sample is in the project state, so a project
+        // saved on it still plays it and shows "Gaze", unchanged, though the menu no longer lists it.
+        let sample = Preset::factory("Water").unwrap().sample.unwrap();
+        let gaze = EmbeddedSample { name: "Gaze".to_owned(), ..sample };
+        let donor = Haunter::default();
+        install_sample(gaze.clone(), &donor.params, &donor.shared);
+        let mut fields = donor.params.serialize_fields();
+        let selection = format!(r#"{{"choice":{{"kind":"factory","name":"Gaze"}},"values":{{}},"sample":{}}}"#, gaze.fingerprint());
+        fields.insert("preset".to_owned(), selection);
+        let restored = Haunter::default();
+        restored.params.deserialize_fields(&fields);
+        let selection = restored.params.preset.get();
+        assert_eq!(selection.choice, Choice::Factory("Gaze".into()));
+        assert_eq!(selection.choice.name(), "Gaze");
+        assert!(!selection.is_modified(restored.params.as_ref(), restored.params.sample.fingerprint(), false));
+        assert_eq!(restored.params.sample.read(|s| s.cloned()), Some(gaze));
+        assert!(!crate::preset::factory_names().any(|name| name == "Gaze"));
+        // Choosing it again isn't possible from the menu, and reading it fails cleanly.
+        assert!(read_preset(&selection.choice, &restored.shared).is_err());
+    }
+
+    #[test]
     fn defaults() {
         let params = &Haunter::default().params;
         let volume = &params.sample_volume;

@@ -3,15 +3,17 @@ use nih_plug::prelude::*;
 use nih_plug::wrapper::state::{ParamValue, PluginState};
 use nih_plug_egui::EguiState;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub mod audio_file;
+pub mod dream;
 pub mod dsp;
 mod editor;
 pub mod preset;
 pub mod sample;
 
+use dream::KeyChoice;
 use dsp::{Engine, FrameGains, Settings, SyncRate, TransportInfo, HP_OFF_HZ, LP_OFF_HZ};
 use preset::{Choice, Preset, Selection, SelectionSlot, UserPresets};
 use sample::{EmbeddedSample, Overview, PreparedSample};
@@ -58,6 +60,38 @@ impl<'a> PersistentField<'a, Option<EmbeddedSample>> for SampleSlot {
         F: Fn(&Option<EmbeddedSample>) -> R,
     {
         f(&self.sample.read().unwrap())
+    }
+}
+
+/// The persisted key Dream Eater tunes to, readable from the audio thread without a lock.
+pub struct KeyChoiceSlot(AtomicU8);
+
+impl Default for KeyChoiceSlot {
+    fn default() -> Self {
+        KeyChoiceSlot(AtomicU8::new(KeyChoice::Auto.to_bits()))
+    }
+}
+
+impl KeyChoiceSlot {
+    pub fn get(&self) -> KeyChoice {
+        KeyChoice::from_bits(self.0.load(Ordering::Relaxed))
+    }
+
+    pub fn set(&self, choice: KeyChoice) {
+        self.0.store(choice.to_bits(), Ordering::Relaxed);
+    }
+}
+
+impl<'a> PersistentField<'a, KeyChoice> for KeyChoiceSlot {
+    fn set(&self, new_value: KeyChoice) {
+        KeyChoiceSlot::set(self, new_value);
+    }
+
+    fn map<F, R>(&self, f: F) -> R
+    where
+        F: Fn(&KeyChoice) -> R,
+    {
+        f(&self.get())
     }
 }
 
@@ -176,6 +210,7 @@ pub fn apply_preset(choice: Choice, preset: Preset, setter: &ParamSetter, params
     }
     let values = preset.complete_values(params);
     let sample = preset.sample.as_ref().map_or(0, EmbeddedSample::fingerprint);
+    params.dream_key.set(preset.dream_key);
     install(preset.sample, params, shared);
     params.preset.set(Selection { choice, values, sample });
     shared.set_status("");
@@ -184,7 +219,7 @@ pub fn apply_preset(choice: Choice, preset: Preset, setter: &ParamSetter, params
 /// Saves the sample and every parameter as the user preset `name`, and selects it. Returns the
 /// name as saved.
 pub fn save_preset(name: &str, params: &HaunterParams, shared: &Shared) -> Result<String, String> {
-    let preset = Preset::capture(params, params.sample.read(|sample| sample.cloned()));
+    let preset = Preset::capture(params, params.sample.read(|sample| sample.cloned()), params.dream_key.get());
     let name = shared.user_presets.save(name, &preset)?;
     let sample = preset.sample.as_ref().map_or(0, EmbeddedSample::fingerprint);
     params.preset.set(Selection { choice: Choice::User(name.clone()), values: preset.values, sample });
@@ -211,6 +246,10 @@ pub struct HaunterParams {
     /// The selected preset, so a project reopens showing it.
     #[persist = "preset"]
     pub preset: SelectionSlot,
+
+    /// The key Dream Eater tunes to, chosen from the knob's right-click menu.
+    #[persist = "dream-key"]
+    pub dream_key: KeyChoiceSlot,
 
     #[id = "rate"]
     pub rate: EnumParam<SyncRate>,
@@ -344,6 +383,7 @@ impl HaunterParams {
             editor_state: EguiState::from_size(editor::WIDTH, editor::HEIGHT),
             sample: SampleSlot::default(),
             preset: SelectionSlot::default(),
+            dream_key: KeyChoiceSlot::default(),
             rate: EnumParam::new("Rate", SyncRate::Quarter),
             restart: BoolParam::new("Restart", true),
             reverse: BoolParam::new("Reverse", false),
@@ -372,14 +412,16 @@ impl HaunterParams {
             release_ms: self.release.value(),
             high_pass_hz: self.high_pass.value(),
             low_pass_hz: self.low_pass.value(),
+            dream_key: self.dream_key.get(),
         }
     }
 }
 
 /// Brings older states up to date. From 1.0, One-shot mode becomes Restart on and Loop mode
 /// becomes Restart off, and Invert is dropped. Up to 1.1, the Output gain is dropped, because the
-/// output is now always at unity. A state without Dream Eater loads with it Off, since parameters
-/// a state leaves out would otherwise keep whatever value they had.
+/// output is now always at unity. A state without Dream Eater loads with it Off, and one without
+/// a Dream Eater key loads on Auto, since whatever a state leaves out would otherwise keep the
+/// value it had.
 fn migrate_state(state: &mut PluginState) {
     if let Some(mode) = state.params.remove("mode") {
         let looped = matches!(&mode, ParamValue::String(id) if id == "loop") || matches!(mode, ParamValue::I32(1));
@@ -388,6 +430,10 @@ fn migrate_state(state: &mut PluginState) {
     state.params.remove("invert");
     state.params.remove("output");
     state.params.entry("dream-eater".to_owned()).or_insert(ParamValue::F32(0.0));
+    state
+        .fields
+        .entry("dream-key".to_owned())
+        .or_insert_with(|| serde_json::to_string(&KeyChoice::Auto).unwrap());
 }
 
 pub struct Haunter {
@@ -708,6 +754,7 @@ mod tests {
         let fields = plugin.params.serialize_fields();
         assert_eq!(fields.get("sample").map(String::as_str), Some("null"));
         assert!(fields.contains_key("editor-state"));
+        assert_eq!(fields.get("dream-key").map(String::as_str), Some(r#""auto""#));
         assert_eq!(fields.get("preset").map(String::as_str), Some(r#"{"choice":{"kind":"none"},"values":{},"sample":0}"#));
     }
 
@@ -779,6 +826,46 @@ mod tests {
             selection.is_modified(restored.params.as_ref(), restored.params.sample.fingerprint(), false),
             "the project reopens showing the preset as changed, because the sample was replaced"
         );
+    }
+
+    #[test]
+    fn the_dream_eater_key_is_kept_in_the_plugin_state() {
+        let original = Haunter::default();
+        assert_eq!(original.params.dream_key.get(), KeyChoice::Auto, "Auto by default");
+        assert_eq!(original.params.serialize_fields().get("dream-key").map(String::as_str), Some(r#""auto""#));
+        original.params.dream_key.set(KeyChoice::Fixed(9));
+        let state = save_state(&original);
+        assert!(state.contains(r#""dream-key":"\"a\"""#), "{state}");
+        let restored = Haunter::default();
+        load_state(&restored, &state);
+        assert_eq!(restored.params.dream_key.get(), KeyChoice::Fixed(9));
+        assert_eq!(restored.params.settings().dream_key, KeyChoice::Fixed(9), "and the engine gets it");
+
+        // A project from before 1.6 has no key, and opens on Auto even in an instance set to one.
+        let mut fields = Haunter::default().params.serialize_fields();
+        fields.remove("dream-key");
+        let mut old = PluginState { version: "1.5.0".into(), params: BTreeMap::new(), fields };
+        Haunter::filter_state(&mut old);
+        restored.params.deserialize_fields(&old.fields);
+        assert_eq!(restored.params.dream_key.get(), KeyChoice::Auto);
+    }
+
+    #[test]
+    fn a_saved_user_preset_keeps_the_dream_eater_key() {
+        let folder = TempDir::new();
+        let plugin = Haunter::with_preset_dir(folder.path().to_owned());
+        plugin.params.dream_key.set(KeyChoice::Fixed(4));
+        save_preset("Bright", &plugin.params, &plugin.shared).unwrap();
+        let loaded = read_preset(&Choice::User("Bright".into()), &plugin.shared).unwrap();
+        assert_eq!(loaded.dream_key, KeyChoice::Fixed(4));
+        let file = std::fs::read_to_string(folder.path().join("Bright.json")).unwrap();
+        assert!(file.contains(r#""dream_key": "e""#), "{file}");
+
+        // Presets saved before 1.6 have no key and listen for it.
+        let old = file.replace(r#""dream_key": "e""#, r#""ignored": 0"#);
+        std::fs::write(folder.path().join("Old.json"), old).unwrap();
+        assert_eq!(read_preset(&Choice::User("Old".into()), &plugin.shared).unwrap().dream_key, KeyChoice::Auto);
+        assert_eq!(read_preset(&Choice::Factory("Water".into()), &plugin.shared).unwrap().dream_key, KeyChoice::Auto);
     }
 
     #[test]

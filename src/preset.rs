@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use crate::audio_file;
+use crate::dream::KeyChoice;
 use crate::sample::EmbeddedSample;
 
 /// What the preset menu shows when no preset is selected: no sample and default settings.
@@ -62,6 +63,8 @@ impl Choice {
 pub struct Preset {
     pub values: Values,
     pub sample: Option<EmbeddedSample>,
+    /// The key Dream Eater tunes to. Auto for the factory presets.
+    pub dream_key: KeyChoice,
 }
 
 impl Preset {
@@ -73,17 +76,17 @@ impl Preset {
         let audio = audio_file::decode(wav).map_err(|err| err.to_string())?;
         let sample = EmbeddedSample::from_decoded((*name).to_owned(), audio)
             .ok_or_else(|| format!("The {name} preset has no audio"))?;
-        Ok(Preset { values: Values::new(), sample: Some(sample) })
+        Ok(Preset { values: Values::new(), sample: Some(sample), dream_key: KeyChoice::Auto })
     }
 
     /// Every parameter's current value.
-    pub fn capture(params: &impl Params, sample: Option<EmbeddedSample>) -> Preset {
+    pub fn capture(params: &impl Params, sample: Option<EmbeddedSample>, dream_key: KeyChoice) -> Preset {
         let values = params
             .param_map()
             .into_iter()
             .map(|(id, ptr, _)| (id, unsafe { ptr.unmodulated_plain_value() }))
             .collect();
-        Preset { values, sample }
+        Preset { values, sample, dream_key }
     }
 
     /// The plain value this preset gives `ptr`.
@@ -164,6 +167,9 @@ struct PresetFile {
     plugin_version: String,
     params: Values,
     sample: Option<EmbeddedSample>,
+    /// Missing from presets saved before 1.6, which load on Auto.
+    #[serde(default)]
+    dream_key: KeyChoice,
 }
 
 /// The folder of user presets, one `<name>.json` per preset.
@@ -224,6 +230,7 @@ impl UserPresets {
             plugin_version: env!("CARGO_PKG_VERSION").to_owned(),
             params: preset.values.clone(),
             sample: preset.sample.clone(),
+            dream_key: preset.dream_key,
         };
         let json = serde_json::to_vec_pretty(&file).map_err(|err| format!("Could not save the preset: {err}"))?;
         let failed = |err: std::io::Error| format!("Could not save the preset: {err}");
@@ -247,7 +254,7 @@ impl UserPresets {
             return Err(format!("The preset {name} needs a newer version of Haunter"));
         }
         let values = file.params.into_iter().filter(|(_, value)| value.is_finite()).collect();
-        Ok(Preset { values, sample: file.sample })
+        Ok(Preset { values, sample: file.sample, dream_key: file.dream_key })
     }
 }
 

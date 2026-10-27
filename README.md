@@ -19,7 +19,18 @@ With **Restart** on (the default), Haunter plays the selected region once from S
 
 The HP and LP filters work on the sample itself as it plays. An envelope follower runs on the filtered sample, and its level sets how far the track is turned down. Depth is measured against the unfiltered sample's peak over the region: with the filters off, the track ducks by exactly Depth at the sample's loudest point. Filtering part of the sample away makes the duck shallower, and changes what you hear through Blend.
 
-**Dream Eater** puts a resonant comb filter on the track, and the same envelope that drives the ducking (after Reverse, HP, and LP) plays it. Between hits the comb rests at a 9 ms delay, with its lowest resonance near 111 Hz, and light feedback. On each hit the delay shortens by up to three octaves and the feedback rises, so the resonance sweeps up with the sample and falls back as it decays. Turning the knob up raises the comb's level in the mix, its feedback, and how far it sweeps, all together. At 100% the comb is 85% of the mix and its feedback reaches 0.87 on the hit. At fully counter-clockwise it reads Off and the comb is bypassed completely, so the track is untouched. The feedback never reaches 1, the comb's input is scaled down as the feedback rises, and its loop is damped above 7 kHz. That keeps the level close to the dry track at any setting. The comb runs before the ducking, and the blended sample doesn't go through it.
+**Dream Eater** adds a soft, bell-like chord that rings in the track's key, and the same envelope that drives the ducking (after Reverse, HP, and LP) plays it. There is no pitch sweep: each hit swells the chord in, and it rings out after the hit.
+
+- **The key.** Haunter listens to the track all the time, even while Dream Eater is Off. It builds a pitch-class profile from the strongest partials over the last few seconds and matches it against major and minor key profiles. A minor key counts as its relative major, since both share the same pentatonic scale. A key is only taken once it has been clearly ahead of every other key for 1.5 s. Noise, drums, and silence leave the last key in place. Until a key has been heard, Dream Eater plays in C.
+- **The chord.** Three resonators play the key's major pentatonic: the root (somewhere from A3 to G#4), the fifth, and the ninth above it. Each also has a quieter partial an octave up that rings half as long. Together they span roughly 220 Hz to 1.9 kHz. The root sits in the middle, the fifth leans left and the ninth right, with their octaves on the opposite sides. They are all fed from the mid of the track, so the chord stays whole in mono. Each voice drifts by a few cents, slowly, for a gentle shimmer.
+- **The swell.** Each hit opens the chord's input from 25% to full, with a 25 ms rise and a 140 ms fall. Turning the knob up makes the tail longer, from 0.3 s to 1.2 s, and the chord louder.
+- **The tone.** The chord goes through a 24 dB/oct high-pass at 180 Hz and a gentle 3 dB lift above 1.5 kHz, so it never gets muddy or shrill.
+- **A key change.** When the key changes, the new chord takes over the input over 0.4 s while the old chord rings out, so nothing clicks. The chord retunes at most once every 2 s.
+- **Loudness.** At 100% the track is turned down by 0.4 dB, and the chord fills the loudness that frees, judged over about a second and a half of what you hear after the duck, so the output stays about as loud as Off. The chord is also turned down whenever it would push the output past the louder of the track's own peak and 0 dBFS.
+
+Fully counter-clockwise reads Off, and the track is untouched, bit for bit. Dream Eater runs before the ducking, and the blended sample doesn't go through it.
+
+**Choosing the key yourself.** Right-click the Dream Eater knob for a menu with **Auto** (the default) and the twelve keys, each shown as a major key and its relative minor (C major / A minor, and so on). Nothing on the panel shows the choice. It is saved in the project and in user presets. Factory presets and `--` set it back to Auto, and projects and presets from before 1.6 load on Auto. Right-clicking doesn't turn the knob, and changing the key doesn't add a `*` to the preset name.
 
 The output is always at unity gain. There is no output level control.
 
@@ -42,9 +53,9 @@ The output is always at unity gain. There is no output level control.
 | LP | Low-pass on the sample, 50 Hz to 20 kHz (Off). Affects both the ducking and the blended sample. |
 | Sample Vol | The sample's level, −48 to +12 dB. The default is 0.0 dB. |
 | Blend | How much of the sample is added to the output. The default is 0%, so you only hear the duck. |
-| Dream Eater | Off (the default) to 100%, in 1% steps. How hard the sample plays a comb filter on the track. The dark knob shows the sample's live sweep as a blue fill inside its white arc. |
+| Dream Eater | Off (the default) to 100%, in 1% steps. How loud and how long the chord rings in the track's key. The dark knob shows the sample's live swell as a blue fill inside its white arc. Right-click it to choose the key. |
 
-Start and End are automatable parameters too. They show times in milliseconds, measured within the loaded sample. Double-click a knob to reset it. Hold Shift while dragging for fine adjustment.
+Start and End are automatable parameters too. They show times in milliseconds, measured within the loaded sample. Drag a knob with the left mouse button to turn it. Double-click a knob to reset it. Hold Shift while dragging for fine adjustment.
 
 Projects saved with version 1.0 load with One-shot mode as Restart on and Loop mode as Restart off. Invert no longer exists, so it is dropped when an old project loads. Projects saved with 1.1 or earlier load with Dream Eater Off. Their Output setting is ignored, so a project that used Output to change the level plays at unity gain.
 
@@ -88,11 +99,24 @@ The unit tests cover:
 - Grid timing for straight, dotted, and triplet rates, including transport start, cycle jumps, and block-size independence.
 - Restart on versus off, Reverse, the Start and End region, and Depth and Mix.
 - HP and LP measurably changing both the blended sample and the ducking.
-- Dream Eater: Off is a bit-exact bypass, even right after it was on. Turning it up changes the track more. The comb sweeps on the sample's hits and lets go between them. At full, with full-scale noise and a full-scale tone on the comb's resonance, the output stays finite, below +6 dB, and dies away in silence. `cargo test --release dream_eater_report -- --ignored --nocapture` prints how much each setting changes the test track, its loudness, peak, and top end against Off.
+- Dream Eater:
+  - Off is a bit-exact bypass, even right after it was on, and the key is still followed while it is Off.
+  - Turning it up changes the track more.
+  - The chord swells on the sample's hits and rings out between them, on the key's root, fifth, and ninth and not between them, with no pitch sweep.
+  - At full, with full-scale noise and then a full-scale tone on the root, the output stays finite, peaks at 1.02 or below, has no DC, and dies away in silence.
+  - Quiet tracks stay quiet, and mono tracks stay mono.
+- Key detection:
+  - The FFT puts a tone in its bin.
+  - Synthetic A minor and D major chord sequences are heard as the C and D pentatonics, at 44.1, 48, and 96 kHz.
+  - Noise and silence have no key, and a key that was heard is held through them.
+  - A key change waits until the new key has been clear for long enough, and a new key waits for the old chord to ring out.
+  - Retuning from C to F# crossfades without a step in level or a click.
+  - Roots sit between A3 and G#4, and the key choices round-trip through their saved IDs.
+- `cargo test --release dream_eater_report -- --ignored --nocapture` prints how much each setting changes three materials against Off: the test track, noise, and A minor chords with hiss. For each it shows the change, loudness, peak, top end, the detected key, and how far the wet lines up with the track.
 - WAV and AIFF decoding and resampling.
 - MP3 decoding of `tests\fixtures\tone-1khz.mp3`, 0.25 s of a 1 kHz tone encoded by LAME: the rate, both channels at their levels, the pitch, and the exact length with the encoder delay trimmed. MP3s are recognised by their contents, a cut-off one decodes what is there, and an MP3 loaded from disk is embedded in the state and restored bit for bit after the file is deleted.
-- Saving and restoring the state with the embedded sample and the selected preset, default values, loading 1.0 and 1.1 states, and projects saved on Water or with no preset (`--` in 1.3, Init in 1.4) reopening on Water and `--`, unchanged.
-- Presets: the factory presets are in alphabetical order and each decodes its built-in sample. Saving a user preset to a temporary folder and reading it back returns the same sample, bit for bit, and every parameter, including values away from the defaults. Saving under an existing name replaces it. Bad and reserved names are refused, and missing or damaged files report an error.
+- Saving and restoring the state with the embedded sample, the selected preset, and the Dream Eater key, default values, loading 1.0 and 1.1 states, states from before 1.6 loading on Auto, and projects saved on Water or with no preset (`--` in 1.3, Init in 1.4) reopening on Water and `--`, unchanged.
+- Presets: the factory presets are in alphabetical order and each decodes its built-in sample. Saving a user preset to a temporary folder and reading it back returns the same sample, bit for bit, every parameter, including values away from the defaults, and the Dream Eater key. Presets from before 1.6 load on Auto. Saving under an existing name replaces it. Bad and reserved names are refused, and missing or damaged files report an error.
 - Headless editor checks that feed raw pointer and key events through the real editor, the way egui-baseview does, at 1x and 1.5x scale. The fake host never applies edits, like nih-plug's VST3 wrapper while the host is processing. They check that:
   - everything fits the window, with the preset menu and then Save at the right of the title, and no Load button;
   - with no sample, nothing sits between the title and the waveform, which reads "Drop a sample here", and the sample's name appears under the title once one is loaded;
@@ -102,10 +126,11 @@ The unit tests cover:
   - one click flips Restart and Reverse, lights them, and sends a begin, set, and end to the host;
   - with Restart off, Rate keeps its face, reads a grey ∞ (and egui's font has that glyph), and ignores drags, double-clicks, and the scroll wheel, and with Restart on again it reads 1/4 and turns;
   - every knob turns when dragged, and Dream Eater sits in Output's old place with its dark face, reads Off, and turns;
+  - right-clicking Dream Eater opens a menu with Auto and the twelve keys, and choosing one sets the key without sending any edit or turning the knob. The panel's text is the same before and after, and a right-drag turns nothing;
   - a new instance shows `--`, and the menu lists `--`, Paper, Stone, Umber, Water, Wind, then saved presets;
   - choosing Water from the menu loads its built-in sample, sends every parameter at its default, and the audio thread plays it, `--` clears it, and loading a sample then shows `--*`;
   - choosing each factory preset loads its own built-in sample;
-  - choosing a saved preset sends its values and loads its sample, and a preset saved after the menu was last opened is shown in it;
+  - choosing a saved preset sends its values, loads its sample, and sets its Dream Eater key, factory presets and `--` set the key back to Auto, and a preset saved after the menu was last opened is shown in it;
   - the name gets a `*` after the sample, a setting, Start, Restart, or Reverse changes, and loses it after choosing the preset again or saving through the prompt (Enter, OK, and Escape), and factory names are refused there.
 
 `cargo run --release --features standalone --example standalone -- --backend dummy` opens the editor without a host. Set `HAUNTER_PREVIEW_SAMPLE` to a WAV, AIFF, or MP3 path to load it at startup.

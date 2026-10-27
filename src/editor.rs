@@ -7,6 +7,7 @@ use nih_plug_egui::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::dream::KeyChoice;
 use crate::preset::{self, Choice};
 use crate::{apply_preset, load_file, read_preset, save_preset, HaunterParams, Shared};
 
@@ -140,7 +141,7 @@ fn draw(
             let ([restart, reverse], restart_on) = toggles_and_meter(ui, setter, params, shared, state);
             ui.add_space(8.0);
             // Without Restart the region just loops, so the grid spacing does nothing.
-            let upper_knobs = knob_row(ui, setter, &[
+            let (upper_knobs, _) = knob_row(ui, setter, &[
                 ("Rate", &params.rate, restart_on, Face::Plain),
                 ("Depth", &params.depth, true, Face::Plain),
                 ("Attack", &params.attack, true, Face::Plain),
@@ -148,13 +149,14 @@ fn draw(
                 ("Mix", &params.mix, true, Face::Plain),
             ]);
             let dream_level = shared.dream_level.load(Ordering::Relaxed);
-            let lower_knobs = knob_row(ui, setter, &[
+            let (lower_knobs, lower) = knob_row(ui, setter, &[
                 ("HP", &params.high_pass, true, Face::Plain),
                 ("LP", &params.low_pass, true, Face::Plain),
                 ("Sample Vol", &params.sample_volume, true, Face::Plain),
                 ("Blend", &params.blend, true, Face::Plain),
                 ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level }),
             ]);
+            key_menu(&lower[4], params);
             Drawn { used: ui.min_rect(), preset_menu, save, waveform, browse, restart, reverse, upper_knobs, lower_knobs }
         })
         .inner
@@ -623,31 +625,41 @@ enum Face {
 }
 
 trait KnobParam {
-    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str, turnable: bool, face: Face);
+    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str, turnable: bool, face: Face) -> egui::Response;
 }
 
 impl<P: Param> KnobParam for P {
-    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str, turnable: bool, face: Face) {
-        draw_knob(ui, setter, self, name, turnable, face);
+    fn draw(&self, ui: &mut egui::Ui, setter: &ParamSetter, name: &str, turnable: bool, face: Face) -> egui::Response {
+        draw_knob(ui, setter, self, name, turnable, face)
     }
 }
 
 /// A knob that isn't `turnable` looks the same but takes no input, and reads a grey infinity.
-fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name: &str, turnable: bool, face: Face) {
+/// Only the left button turns it.
+fn draw_knob<P: Param>(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    param: &P,
+    name: &str,
+    turnable: bool,
+    face: Face,
+) -> egui::Response {
     let width = ui.available_width().max(88.0);
     let sense = if turnable { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 112.0), sense);
     let normalized = param.modulated_normalized_value();
     let memory = ui.id().with(name);
 
-    if response.drag_started() {
+    if response.drag_started_by(egui::PointerButton::Primary) {
         setter.begin_set_parameter(param);
         ui.memory_mut(|mem| {
             mem.data.insert_temp(memory.with("start"), normalized);
             mem.data.insert_temp(memory.with("drag"), 0.0f32);
+            mem.data.insert_temp(memory.with("turning"), true);
         });
     }
-    if response.dragged() {
+    let turning = ui.memory(|mem| mem.data.get_temp::<bool>(memory.with("turning")).unwrap_or(false));
+    if turning && response.dragged() {
         let (start, mut dragged) = ui.memory(|mem| {
             (
                 mem.data.get_temp::<f32>(memory.with("start")).unwrap_or(normalized),
@@ -666,8 +678,9 @@ fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name:
         setter.set_parameter(param, param.default_plain_value());
         setter.end_set_parameter(param);
     }
-    if response.drag_stopped() {
+    if turning && response.drag_stopped() {
         setter.end_set_parameter(param);
+        ui.memory_mut(|mem| mem.data.remove::<bool>(memory.with("turning")));
     }
 
     let dial = 74.0_f32.min(rect.width() - 8.0);
@@ -709,6 +722,21 @@ fn draw_knob<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, param: &P, name:
         egui::FontId::proportional(11.0),
         SUBTLE,
     );
+    response
+}
+
+/// Right-clicking Dream Eater chooses the key its resonances are tuned to. Nothing on the panel
+/// shows the choice.
+fn key_menu(knob: &egui::Response, params: &HaunterParams) {
+    knob.context_menu(|ui| {
+        let current = params.dream_key.get();
+        for choice in KeyChoice::all() {
+            if ui.selectable_label(choice == current, choice.label()).clicked() {
+                params.dream_key.set(choice);
+                ui.close_menu();
+            }
+        }
+    });
 }
 
 /// An infinity sign centred on `center`, from the font if it has one and drawn otherwise.
@@ -729,11 +757,16 @@ fn draw_infinity(painter: &egui::Painter, center: Pos2, color: Color32) {
 }
 
 /// Draws a row of knobs, each with whether it can be turned and how it looks. Returns the row's
-/// area.
-fn knob_row(ui: &mut egui::Ui, setter: &ParamSetter, knobs: &[(&str, &dyn KnobParam, bool, Face)]) -> Rect {
+/// area and each knob's response.
+fn knob_row(
+    ui: &mut egui::Ui,
+    setter: &ParamSetter,
+    knobs: &[(&str, &dyn KnobParam, bool, Face)],
+) -> (Rect, Vec<egui::Response>) {
     let width = ui.available_width();
     let height = 118.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let mut responses = Vec::with_capacity(knobs.len());
     for (index, (name, param, turnable, face)) in knobs.iter().enumerate() {
         let center_x = rect.left() + width * (index as f32 + 0.5) / KNOB_COLUMNS;
         let slot = Rect::from_center_size(Pos2::new(center_x, rect.center().y), egui::vec2(120.0, height));
@@ -741,9 +774,9 @@ fn knob_row(ui: &mut egui::Ui, setter: &ParamSetter, knobs: &[(&str, &dyn KnobPa
             .id_salt(*name)
             .max_rect(slot)
             .layout(egui::Layout::top_down(egui::Align::Center));
-        ui.allocate_new_ui(builder, |ui| param.draw(ui, setter, name, *turnable, *face));
+        responses.push(ui.allocate_new_ui(builder, |ui| param.draw(ui, setter, name, *turnable, *face)).inner);
     }
-    rect
+    (rect, responses)
 }
 
 #[cfg(test)]
@@ -837,9 +870,16 @@ mod tests {
 
         /// baseview's `ButtonPressed` or `ButtonReleased` for the left button.
         fn left_button(&mut self, pressed: bool) {
+            self.button(egui::PointerButton::Primary, pressed);
+        }
+
+        fn right_button(&mut self, pressed: bool) {
+            self.button(egui::PointerButton::Secondary, pressed);
+        }
+
+        fn button(&mut self, button: egui::PointerButton, pressed: bool) {
             if let Some(pos) = self.cursor {
                 let modifiers = self.input.modifiers;
-                let button = egui::PointerButton::Primary;
                 self.input.events.push(egui::Event::PointerButton { pos, button, pressed, modifiers });
             }
         }
@@ -1348,7 +1388,7 @@ mod tests {
             let row = |screen: &mut Screen| {
                 screen.frame(|context, setter| {
                     egui::CentralPanel::default()
-                        .show(context, |ui| knob_row(ui, setter, &[("Rate", &plugin.params.rate, turnable, Face::Plain)]))
+                        .show(context, |ui| knob_row(ui, setter, &[("Rate", &plugin.params.rate, turnable, Face::Plain)]).0)
                         .inner
                 })
             };
@@ -1415,6 +1455,56 @@ mod tests {
         let dream = editor.plugin.params.dream_eater.as_ptr();
         let edits = editor.screen.take_edits();
         assert!(edits.iter().any(|edit| matches!(edit, Edit::Set(p, value) if *p == dream && *value > 0.0)), "{edits:?}");
+    }
+
+    #[test]
+    fn right_clicking_dream_eater_picks_its_key_without_turning_it_or_showing_it() {
+        let mut editor = Editor::new(true);
+        let row = editor.settle().lower_knobs;
+        let dream_eater = knob_centres(row).last().unwrap();
+        // Everything but the gain reduction readout, which falls while the test runs.
+        let panel_texts = |screen: &Screen| {
+            let mut texts: Vec<String> = screen.texts().into_iter().filter(|text| !text.starts_with(" -")).collect();
+            texts.sort();
+            texts
+        };
+        let panel = panel_texts(&editor.screen);
+        let labels: Vec<String> = KeyChoice::all().map(|choice| choice.label()).collect();
+        assert_eq!(labels.len(), 13);
+        assert!(labels.iter().all(|label| !panel.contains(label)), "nothing on the panel names a key");
+        editor.screen.take_edits();
+
+        editor.move_to(dream_eater);
+        editor.screen.right_button(true);
+        editor.frame();
+        editor.screen.right_button(false);
+        editor.settle();
+        let shown = editor.screen.texts();
+        assert!(labels.iter().all(|label| shown.contains(label)), "Auto and the twelve keys: {shown:?}");
+        assert_eq!(editor.plugin.params.dream_key.get(), KeyChoice::Auto);
+
+        let d_major = editor.screen.find_text(&KeyChoice::Fixed(2).label()).unwrap();
+        editor.click_at(d_major.center());
+        editor.settle();
+        assert_eq!(editor.plugin.params.dream_key.get(), KeyChoice::Fixed(2));
+        assert_eq!(editor.screen.take_edits(), [], "the key is not a parameter, and the knob did not move");
+        assert_eq!(editor.plugin.params.dream_eater.value(), 0.0);
+        assert_eq!(panel_texts(&editor.screen), panel, "the menu closes and the panel looks the same");
+
+        // A right-drag does not turn it either.
+        editor.move_to(dream_eater);
+        editor.screen.right_button(true);
+        editor.frame();
+        for step in 1..=4 {
+            editor.screen.cursor_moved(dream_eater - egui::vec2(0.0, 10.0 * step as f32));
+            editor.frame();
+        }
+        editor.screen.right_button(false);
+        editor.frame();
+        editor.screen.press_key(egui::Key::Escape);
+        editor.settle();
+        assert_eq!(editor.screen.take_edits(), []);
+        assert_eq!(editor.plugin.params.dream_key.get(), KeyChoice::Fixed(2));
     }
 
     /// The text in the preset menu's button.
@@ -1537,7 +1627,8 @@ mod tests {
     fn choosing_a_user_preset_sends_its_settings_and_loads_its_sample() {
         let mut editor = Editor::new(false);
         editor.settle();
-        let mut preset = crate::preset::Preset { values: Default::default(), sample: Some(another_sample()) };
+        let mut preset =
+            crate::preset::Preset { sample: Some(another_sample()), dream_key: KeyChoice::Fixed(7), ..Default::default() };
         for (id, value) in [("rate", 4.0), ("restart", 0.0), ("reverse", 1.0), ("start", 0.125), ("depth", 0.4), ("release", 321.5)] {
             preset.values.insert(id.to_owned(), value);
         }
@@ -1562,6 +1653,13 @@ mod tests {
         assert_eq!(shown_preset(&mut editor), "Snare Gate", "not changed while the host applies the settings");
         editor.plugin.shared.processed_blocks.fetch_add(HOST_GRACE_BLOCKS, Ordering::Relaxed);
         assert_eq!(shown_preset(&mut editor), "Snare Gate*", "the test host never applies them, so they differ");
+        assert_eq!(params.dream_key.get(), KeyChoice::Fixed(7), "the preset's Dream Eater key comes with it");
+
+        pick_preset(&mut editor, "Water");
+        assert_eq!(params.dream_key.get(), KeyChoice::Auto, "factory presets listen for the key");
+        params.dream_key.set(KeyChoice::Fixed(3));
+        pick_preset(&mut editor, "--");
+        assert_eq!(params.dream_key.get(), KeyChoice::Auto);
     }
 
     #[test]

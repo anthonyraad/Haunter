@@ -571,24 +571,39 @@ fn toggle(ui: &mut egui::Ui, setter: &ParamSetter, param: &BoolParam, shared: &S
     (response.rect, toggling.map_or(param.value(), |edit| edit.target))
 }
 
+/// Editor frames (baseview ticks every 15 ms) a Direction edit stays open at least, about as long
+/// as a click on a toggle holds its edit open.
+const MIN_HOLD_FRAMES: u32 = 8;
+/// Editor frames after which a Direction edit is closed even if the host never applied it, about
+/// a second.
+const MAX_HOLD_FRAMES: u32 = 66;
+
 /// A Direction edit the host has been sent but has not applied to the parameter yet.
 #[derive(Clone, Copy)]
 struct Choosing {
     target: Direction,
-    /// `Shared::processed_blocks` when the edit was sent.
-    sent_at: u64,
+    /// The edit is still open and is sent again every frame.
+    open: bool,
+    /// Frames the edit has been open.
+    frames: u32,
+    /// `Shared::processed_blocks` when the edit was closed.
+    closed_at: u64,
 }
 
 /// The Direction menu, looking like the preset menu. Returns where it was drawn.
 ///
-/// A choice is sent as one whole edit, and the menu shows it until the host applies it, the way a
-/// toggle does.
+/// Choosing from a menu is a single click, but while the host is processing, nih-plug's VST3
+/// wrapper leaves the parameter alone and waits for the host to send the edit back, and an edit
+/// opened and closed in the same frame never comes back from Cubase. So, like a toggle held down
+/// or a knob drag, the edit opens on the choice and is sent again every frame until the
+/// parameter has the new value (or about a second has passed), and only then closed. The menu
+/// shows the choice until the host applies it, or has had a few blocks after the edit closed to.
 fn direction_menu(ui: &mut egui::Ui, setter: &ParamSetter, param: &EnumParam<Direction>, shared: &Shared) -> Rect {
     let memory = ui.make_persistent_id("direction");
     let blocks = shared.processed_blocks.load(Ordering::Relaxed);
-    let choosing = ui
-        .memory(|mem| mem.data.get_temp::<Choosing>(memory))
-        .filter(|edit| param.value() != edit.target && blocks < edit.sent_at + HOST_GRACE_BLOCKS);
+    let choosing = ui.memory(|mem| mem.data.get_temp::<Choosing>(memory)).filter(|edit| {
+        edit.open || (param.value() != edit.target && blocks < edit.closed_at + HOST_GRACE_BLOCKS)
+    });
     let shown = choosing.map_or(param.value(), |edit| edit.target);
     let name = |direction: Direction| Direction::variants()[direction.to_index()];
 
@@ -617,15 +632,34 @@ fn direction_menu(ui: &mut egui::Ui, setter: &ParamSetter, param: &EnumParam<Dir
         "Forward plays the region from S to E.\nBackward plays it from E to S, turning round at once when chosen.\nLevitate bounces between S and E.",
     );
 
-    let choosing = match picked {
-        Some(target) => {
+    let choosing = match (picked, choosing) {
+        // A new choice while an edit is open carries on with the same edit.
+        (Some(target), Some(edit)) if edit.open => {
+            setter.set_parameter(param, target);
+            Some(Choosing { target, frames: 1, ..edit })
+        }
+        (Some(target), _) => {
             setter.begin_set_parameter(param);
             setter.set_parameter(param, target);
-            setter.end_set_parameter(param);
-            Some(Choosing { target, sent_at: blocks })
+            Some(Choosing { target, open: true, frames: 1, closed_at: blocks })
         }
-        None => choosing,
+        (None, Some(mut edit)) if edit.open => {
+            setter.set_parameter(param, edit.target);
+            edit.frames += 1;
+            let applied = param.value() == edit.target;
+            if (applied && edit.frames >= MIN_HOLD_FRAMES) || edit.frames >= MAX_HOLD_FRAMES {
+                setter.end_set_parameter(param);
+                edit.open = false;
+                edit.closed_at = blocks;
+            }
+            Some(edit)
+        }
+        (None, other) => other,
     };
+    if choosing.is_some_and(|edit| edit.open) {
+        // Keeps frames coming while the edit is open, whatever egui would otherwise repaint.
+        ui.ctx().request_repaint();
+    }
     ui.memory_mut(|mem| match choosing {
         Some(edit) => mem.data.insert_temp(memory, edit),
         None => mem.data.remove::<Choosing>(memory),
@@ -1357,6 +1391,7 @@ mod tests {
         assert_one_edit(&editor.screen.take_edits(), editor.plugin.params.restart.as_ptr(), 0.0);
         assert!(!editor.screen.lit(drawn.restart));
         pick_direction(&mut editor, "Levitate");
+        editor.wait(1.1);
         assert_one_edit(&editor.screen.take_edits(), editor.plugin.params.direction.as_ptr(), 1.0);
     }
 
@@ -1409,9 +1444,15 @@ mod tests {
         );
 
         pick_direction(&mut editor, "Backward");
-        assert_eq!(editor.screen.take_edits(), [Edit::Begin(direction), Edit::Set(direction, 0.5), Edit::End(direction)]);
+        let edits = editor.screen.take_edits();
+        assert_eq!(edits[0], Edit::Begin(direction), "{edits:?}");
+        assert!(edits[1..].iter().all(|edit| *edit == Edit::Set(direction, 0.5)), "held open and sent every frame: {edits:?}");
+        assert_eq!(shown_direction(&mut editor), "Backward", "the menu shows the choice while the edit is open");
+        editor.wait(1.1);
+        let edits = editor.screen.take_edits();
+        assert_eq!(edits.last(), Some(&Edit::End(direction)), "closed after about a second without an answer");
         editor.wait(1.0);
-        assert!(editor.screen.take_edits().is_empty(), "one edit per choice");
+        assert!(editor.screen.take_edits().is_empty(), "and then left alone");
         assert_eq!(editor.plugin.params.direction.value(), Direction::Forward, "the host has not sent the edit back yet");
         assert_eq!(shown_direction(&mut editor), "Backward", "but the menu shows the choice");
 
@@ -1419,8 +1460,84 @@ mod tests {
         assert_eq!(shown_direction(&mut editor), "Forward", "the host dropped the edit, so the menu shows the real value");
 
         pick_direction(&mut editor, "Levitate");
+        editor.wait(1.1);
         assert_one_edit(&editor.screen.take_edits(), direction, 1.0);
         assert_eq!(shown_direction(&mut editor), "Levitate");
+    }
+
+    /// Cubase's side of the editor's edits, as far as the audio goes: between editor frames it
+    /// calls `process`, and a value the editor set reaches `process` only while the edit is still
+    /// open. An edit opened and closed within one frame never arrives, which is why a single
+    /// begin, set, and end did nothing in Cubase.
+    #[derive(Default)]
+    struct CubaseLike {
+        /// The value of the edit that is open, if one is.
+        open: Option<Option<f32>>,
+        /// The values `process` received.
+        received: Vec<f32>,
+    }
+
+    impl CubaseLike {
+        fn hear(&mut self, edits: &[Edit], param: ParamPtr) {
+            for edit in edits {
+                match *edit {
+                    Edit::Begin(p) if p == param => {
+                        assert!(self.open.is_none(), "an edit opened twice");
+                        self.open = Some(None);
+                    }
+                    Edit::Set(p, value) if p == param => {
+                        let open = self.open.as_mut().expect("a value sent outside an edit");
+                        *open = Some(value);
+                    }
+                    Edit::End(p) if p == param => self.open = None,
+                    _ => {}
+                }
+            }
+        }
+
+        fn process(&mut self) {
+            if let Some(Some(value)) = self.open {
+                self.received.push(value);
+            }
+        }
+    }
+
+    #[test]
+    fn a_direction_reaches_a_host_that_only_takes_edits_held_across_process_calls() {
+        let mut editor = Editor::new(true);
+        editor.settle();
+        editor.screen.take_edits();
+        let direction = editor.plugin.params.direction.as_ptr();
+        let mut host = CubaseLike::default();
+
+        pick_direction(&mut editor, "Backward");
+        let mut frames = 0;
+        loop {
+            host.hear(&editor.screen.take_edits(), direction);
+            if host.open.is_none() {
+                break;
+            }
+            host.process();
+            editor.plugin.shared.processed_blocks.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(shown_direction(&mut editor), "Backward", "frame {frames}");
+            frames += 1;
+            assert!(frames < 200, "the edit is closed in the end");
+        }
+        assert!(host.received.len() >= MIN_HOLD_FRAMES as usize - 2, "process heard Backward {} times", host.received.len());
+        assert!(host.received.iter().all(|&value| value == 0.5), "only ever Backward: {:?}", host.received);
+
+        // A choice the parameter already has closes as soon as the edit has been held for a click.
+        pick_direction(&mut editor, "Forward");
+        let mut frames = 0;
+        loop {
+            host.hear(&editor.screen.take_edits(), direction);
+            if host.open.is_none() {
+                break;
+            }
+            editor.frame();
+            frames += 1;
+        }
+        assert!(frames <= MIN_HOLD_FRAMES as usize, "closed after {frames} more frames");
     }
 
     #[test]

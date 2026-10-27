@@ -144,6 +144,86 @@ fn project_with(sample: &str) -> Vec<u8> {
     serde_json::to_vec(&state).unwrap()
 }
 
+/// A project with `params` saved in it as well as Water.
+fn project_with_params(params: &[(&str, nih_plug::wrapper::state::ParamValue)]) -> Vec<u8> {
+    let mut state: PluginState = serde_json::from_slice(&project_with("Water")).unwrap();
+    for (id, value) in params {
+        state.params.insert((*id).to_owned(), value.clone());
+    }
+    serde_json::to_vec(&state).unwrap()
+}
+
+impl Host {
+    fn normalized(&self, name: &str) -> f64 {
+        unsafe { IEditController::get_param_normalized(&*self.wrapper, self.ids[name]) }
+    }
+
+    fn shown(&self, name: &str, normalized: f64) -> String {
+        let mut text = [0i16; 128];
+        unsafe {
+            assert_eq!(IEditController::get_param_string_by_value(&*self.wrapper, self.ids[name], normalized, text.as_mut_ptr()), kResultOk);
+        }
+        String::from_utf16_lossy(&text.iter().take_while(|&&c| c != 0).map(|&c| c as u16).collect::<Vec<_>>())
+    }
+}
+
+#[test]
+fn direction_round_trips_through_the_vst3_wrapper() {
+    let mut host = Host::new(48_000.0, 2, &project_with("Water"));
+    let id = host.ids["Direction"];
+    unsafe {
+        let mut info: ParameterInfo = std::mem::zeroed();
+        let index = (0..IEditController::get_parameter_count(&*host.wrapper))
+            .find(|&index| {
+                IEditController::get_parameter_info(&*host.wrapper, index, &mut info);
+                info.id == id
+            })
+            .unwrap();
+        assert_eq!(IEditController::get_parameter_info(&*host.wrapper, index, &mut info), kResultOk);
+        assert_eq!(info.step_count, 2, "three choices");
+        assert_eq!(info.default_normalized_value, 0.0, "Forward by default");
+    }
+    assert_eq!(host.normalized("Direction"), 0.0);
+    let mut audio = vec![vec![0.0f32; 512]; 2];
+    // What the host sends back, including the rounding a host might add to the editor's value.
+    for (sent, expected, name) in [
+        (0.5, 0.5, "Backward"),
+        (1.0, 1.0, "Levitate"),
+        (0.0, 0.0, "Forward"),
+        (0.500_000_1, 0.5, "Backward"),
+        (0.499_999_9, 0.5, "Backward"),
+        (0.999_999, 1.0, "Levitate"),
+    ] {
+        host.set("Direction", sent);
+        host.process_in(&mut audio, true, 512);
+        let now = host.normalized("Direction");
+        assert!((now - expected).abs() < 1e-6, "sent {sent}, the parameter reads {now}");
+        assert_eq!(host.shown("Direction", now), name);
+        // It stays put over the next blocks: nothing sets it back.
+        host.process_in(&mut audio, true, 512);
+        host.process_in(&mut audio, true, 512);
+        assert!((host.normalized("Direction") - expected).abs() < 1e-6, "{name} held");
+    }
+}
+
+#[test]
+fn projects_load_their_direction_through_the_vst3_wrapper() {
+    use nih_plug::wrapper::state::ParamValue;
+    for (params, expected) in [
+        (vec![("reverse", ParamValue::Bool(true))], 0.5),
+        (vec![("reverse", ParamValue::Bool(false))], 0.0),
+        (vec![("direction", ParamValue::String("levitate".into()))], 1.0),
+        (vec![("direction", ParamValue::String("backward".into()))], 0.5),
+        (vec![], 0.0),
+    ] {
+        let mut host = Host::new(48_000.0, 2, &project_with_params(&params));
+        assert_eq!(host.normalized("Direction"), expected, "{params:?}");
+        let mut audio = vec![vec![0.0f32; 512]; 2];
+        host.process_in(&mut audio, true, 512);
+        assert_eq!(host.normalized("Direction"), expected, "{params:?} after a block");
+    }
+}
+
 /// Plucked chords, given as MIDI notes, two seconds each and round and round, in stereo.
 fn chords(progression: &[&[u8]], rate: f64, seconds: f64) -> Vec<Vec<f32>> {
     let frames = (rate * seconds) as usize;

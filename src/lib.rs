@@ -967,6 +967,27 @@ mod tests {
     }
 
     #[test]
+    fn direction_normalized_values_round_trip() {
+        let plugin = Haunter::default();
+        let param = &plugin.params.direction;
+        let ptr = param.as_ptr();
+        assert_eq!(unsafe { ptr.step_count() }, Some(2));
+        for (index, direction) in [Direction::Forward, Direction::Backward, Direction::Levitate].into_iter().enumerate() {
+            let normalized = unsafe { ptr.preview_normalized(index as f32) };
+            assert_eq!(normalized, [0.0, 0.5, 1.0][index], "{direction:?}");
+            assert_eq!(param.preview_normalized(direction), normalized, "the editor sends what the wrapper expects");
+            assert_eq!(param.preview_plain(normalized), direction);
+            assert_eq!(unsafe { ptr.preview_plain(normalized) }, index as f32);
+            // A host that hands the value back slightly off still lands on the same choice.
+            for nudged in [normalized - 0.01, normalized + 0.01] {
+                if (0.0..=1.0).contains(&nudged) {
+                    assert_eq!(param.preview_plain(nudged), direction, "{nudged}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn reverse_from_before_1_7_loads_as_a_direction() {
         for (reverse, direction) in [
             (Some(ParamValue::Bool(true)), "backward"),

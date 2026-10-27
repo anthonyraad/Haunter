@@ -510,6 +510,12 @@ const C_CHORD: [f64; 3] = [60.0, 67.0, 74.0];
 const D_CHORD: [f64; 3] = [62.0, 69.0, 76.0];
 /// Notes outside C major, which the test songs never play.
 const OUTSIDE_C_MAJOR: [f64; 6] = [61.0, 63.0, 66.0, 68.0, 70.0, 73.0];
+/// The ninth's top partial in C, two octaves over D5: D7, 2.35 kHz.
+const SPARKLE_IN_C: f64 = 98.0;
+/// In D, two octaves over E5: E7, 2.64 kHz.
+const SPARKLE_IN_D: f64 = 100.0;
+/// Every note from C8, 4.2 kHz, to A#8, 7.5 kHz, where nothing should ring.
+const ABOVE_THE_SPARKLE: [f64; 11] = [108.0, 109.0, 110.0, 111.0, 112.0, 113.0, 114.0, 115.0, 116.0, 117.0, 118.0];
 
 #[test]
 fn dream_eater_is_clearly_audible_through_the_vst3_wrapper() {
@@ -528,6 +534,16 @@ fn dream_eater_is_clearly_audible_through_the_vst3_wrapper() {
             if channels == 2 {
                 let spread = correlation(&result.sides[0], &result.sides[1]);
                 assert!(spread < 0.8, "{label}: the chord shimmers across the stereo field: {spread:.2}");
+                let sum: Vec<f32> = result.sides[0].iter().zip(&result.sides[1]).map(|(l, r)| l + r).collect();
+                let mono = 20.0 * (rms(&sum) / (rms(&result.sides[0]).powi(2) + rms(&result.sides[1]).powi(2)).sqrt()).log10();
+                assert!(mono > -1.0, "{label}: summed to mono, the change keeps its level: {mono:+.2} dB");
+                // The ninth's sparkle two octaves up, D7 at 2.35 kHz in C, comes up, and nothing
+                // rings above it: the chord gets brighter, never shrill.
+                let sparkle = added_power(&result.on, &result.off, &[SPARKLE_IN_C], rate);
+                let above = added_power(&result.on, &result.off, &ABOVE_THE_SPARKLE, rate);
+                let gain = band_gain_db(&result.on, &result.off, &[SPARKLE_IN_C], rate);
+                assert!(gain > 10.0, "{label}: the sparkle comes up {gain:.1} dB");
+                assert!(sparkle > 10.0 * above.max(0.0), "{label}: at the sparkle, not above 4.2 kHz: {sparkle:e} vs {above:e}");
             }
         }
     }
@@ -540,6 +556,10 @@ fn dream_eater_rings_the_detected_key_through_the_vst3_wrapper() {
     // The C chord Dream Eater starts on, before it has heard the key.
     let c = added_power(&result.on, &result.off, &C_CHORD, 48_000.0);
     assert!(d > 20.0 * c.max(0.0), "D major rings D, A, E: {d:e}, not C, G, D: {c:e}");
+    // And its sparkle moves with the key, to E7 at 2.64 kHz, with nothing above 4.2 kHz.
+    let sparkle = added_power(&result.on, &result.off, &[SPARKLE_IN_D], 48_000.0);
+    let above = added_power(&result.on, &result.off, &ABOVE_THE_SPARKLE, 48_000.0);
+    assert!(sparkle > 10.0 * above.max(0.0), "the sparkle at E7: {sparkle:e}, not above 4.2 kHz: {above:e}");
 }
 
 #[test]
@@ -562,6 +582,21 @@ fn dream_eater_swells_on_each_hit_with_restart_on_and_off() {
         }
         let (loudest, quietest) = (shape.iter().cloned().fold(0.0, f64::max), shape.iter().cloned().fold(f64::MAX, f64::min));
         assert!(loudest > 2.0 * quietest, "the chord swells and fades with each hit: {shape:?}");
+        // In 5 ms steps, the change blooms over tens of milliseconds and peaks after the duck
+        // (1.7.4 rose in 25 ms, hidden inside it), and well before the next hit.
+        let step = 240;
+        let mut fine = vec![0.0; beat / step];
+        for start in (0..left.len() - beat).step_by(beat) {
+            for (window, level) in fine.iter_mut().enumerate() {
+                *level += rms(&left[start + window * step..start + (window + 1) * step]);
+            }
+        }
+        let peak = (0..fine.len()).max_by(|&a, &b| fine[a].total_cmp(&fine[b])).unwrap();
+        let low = fine[..=peak].iter().cloned().fold(f64::MAX, f64::min);
+        let reaches = |share: f64| (0..=peak).find(|&w| fine[w] >= low + share * (fine[peak] - low)).unwrap();
+        let (peak_ms, rise_ms) = (peak * 5, (reaches(0.9) - reaches(0.1)) * 5);
+        assert!((100..=300).contains(&peak_ms), "the chord peaks after the duck: at {peak_ms} ms");
+        assert!(rise_ms >= 40, "and blooms in, 10-90% over {rise_ms} ms");
     }
 }
 
@@ -756,7 +791,12 @@ struct RealChange {
     key: u8,
     chord_db: f64,
     others_db: f64,
+    /// How much the ninth's sparkle two octaves up comes up, in dB.
+    sparkle_db: f64,
     spread: f64,
+    /// The power of the change summed to mono, relative to its two sides' together: 0 dB when
+    /// they have nothing in common, below when they cancel.
+    mono_db: f64,
 }
 
 fn real_change(track: &[Vec<f32>], settings: Settings) -> RealChange {
@@ -765,6 +805,12 @@ fn real_change(track: &[Vec<f32>], settings: Settings) -> RealChange {
     let on = render(track, &settings, 6.0);
     let sides: Vec<Vec<f32>> = on.iter().zip(&off).map(|(a, b)| a.iter().zip(b).map(|(a, b)| a - b).collect()).collect();
     let spread = if sides.len() > 1 { correlation(&sides[0], &sides[1]) } else { 1.0 };
+    let mono_db = if sides.len() > 1 {
+        let sum: Vec<f32> = sides[0].iter().zip(&sides[1]).map(|(l, r)| l + r).collect();
+        20.0 * (rms(&sum) / (rms(&sides[0]).powi(2) + rms(&sides[1]).powi(2)).sqrt()).log10()
+    } else {
+        0.0
+    };
     let spectral = off.iter().zip(&on).map(|(off, on)| 10f64.powf(spectral_change_db(on, off) / 10.0)).sum::<f64>() / off.len() as f64;
     let (off, on) = (off.concat(), on.concat());
     let (key, chord_db) = (0..12u8)
@@ -781,7 +827,9 @@ fn real_change(track: &[Vec<f32>], settings: Settings) -> RealChange {
         key,
         chord_db,
         others_db: band_gain_db(&on, &off, &others, rate),
+        sparkle_db: band_gain_db(&on, &off, &[chord[2] + 24.0], rate),
         spread,
+        mono_db,
     }
 }
 
@@ -789,7 +837,7 @@ impl std::fmt::Display for RealChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "difference {:+.1} dB, spectrum {:+.1} dB, loudness {:+.2} dB, peak {:.3}, chord of {} {:+.1} dB, other notes {:+.1} dB, L/R {:.2}",
+            "difference {:+.1} dB, spectrum {:+.1} dB, loudness {:+.2} dB, peak {:.3}, chord of {} {:+.1} dB, other notes {:+.1} dB, sparkle {:+.1} dB, L/R {:.2}, mono sum {:+.1} dB",
             self.difference_db,
             self.spectral_db,
             self.loudness_db,
@@ -797,7 +845,9 @@ impl std::fmt::Display for RealChange {
             haunter::dream::KEY_NAMES[self.key as usize],
             self.chord_db,
             self.others_db,
-            self.spread
+            self.sparkle_db,
+            self.spread,
+            self.mono_db
         )
     }
 }
@@ -882,6 +932,7 @@ fn dream_eater_is_clearly_audible_on_real_tracks_through_the_vst3_wrapper() {
             assert!(result.loudness_db.abs() < 1.25, "{label}: about as loud as Off");
             assert!(result.peak <= 1.0, "{label}");
             assert!(result.spread < 0.5, "{label}: the chord is wide");
+            assert!(result.mono_db > -1.0, "{label}: and loses nothing summed to mono");
         }
     }
 }
@@ -899,7 +950,7 @@ fn dream_eater_is_audible_on_mono_cello_through_the_vst3_wrapper() {
 fn real_material_report() {
     let rate = 48_000.0;
     let mut tracks: Vec<(String, Vec<Vec<f32>>)> =
-        ["Water", "Paper", "Stone", "Umber", "Wind"].iter().map(|name| (name.to_string(), factory_track(name, rate, 12.0))).collect();
+        ["Gaze", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind"].iter().map(|name| (name.to_string(), factory_track(name, rate, 12.0))).collect();
     for path in extra_tracks() {
         let name = path.file_stem().unwrap().to_string_lossy().into_owned();
         tracks.push((name, real_track(&path, rate, 12.0)));

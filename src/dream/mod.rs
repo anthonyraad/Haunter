@@ -9,7 +9,7 @@
 //! silence in is silence out. Nothing here allocates while processing.
 
 use serde::{Deserialize, Serialize};
-use std::f64::consts::{PI, TAU};
+use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
 use crate::dsp::{one_pole, Svf};
 
@@ -391,28 +391,43 @@ impl KeyDetector {
 /// Semitones above the root of each voice: root, fifth, and ninth.
 const VOICING: [f64; VOICES] = [0.0, 7.0, 14.0];
 const VOICES: usize = 3;
-/// Each voice rings at its pitch and, more quietly and briefly, an octave up, for a glassy edge.
-/// (frequency ratio, level, share of the tail)
-const PARTIALS: [(f64, f64, f64); 2] = [(1.0, 1.0, 1.0), (2.0, 0.3, 0.5)];
+/// Each voice rings at its pitch, an octave up more quietly and briefly, for a glassy edge, and
+/// the ninth also two octaves up, quieter and briefer still, for sparkle at about 2 to 3.7 kHz,
+/// where the ear picks it up without the chord getting louder. (frequency ratio, share of the tail)
+const PARTIALS: [(f64, f64); 3] = [(1.0, 1.0), (2.0, 0.5), (4.0, 0.4)];
+/// Each voice's level for each partial. Only the ninth has the top partial: on the root and the
+/// fifth it would sit under 1.7 kHz, where it would add body rather than sparkle. The top partial
+/// is lifted by the wet's air shelf, so it ends up about 2 to 4 dB under the ninth on white noise,
+/// the brightest material (12 to 13.5 dB under the whole wet), and further under it on real tracks,
+/// which have less up there. The octaves are at half level, up from 0.3 in 1.7.4.
+const LEVELS: [[f64; 3]; VOICES] = [[1.0, 0.5, 0.0], [1.0, 0.5, 0.0], [1.0, 0.5, 0.25]];
 /// Pan of each voice's partials, -1 left to 1 right. The root sits in the middle and the fifth
-/// and ninth lean apart, with their octaves on the other side.
-const PAN: [[f64; 2]; VOICES] = [[0.0, 0.0], [-0.6, 0.4], [0.6, -0.4]];
-/// Every partial is a pair of resonators, one per side, detuned against each other by up to this
-/// many cents at a slow rate of its voice's own, so the chord shimmers across the stereo field.
-const SHIMMER_CENTS: f64 = 5.0;
-const SHIMMER_HZ: [f64; VOICES] = [0.13, 0.19, 0.23];
+/// and ninth lean apart, with their octaves on the other side and the ninth's sparkle in the
+/// middle, so the chord is wide but neither side is brighter than the other.
+const PAN: [[f64; 3]; VOICES] = [[0.0, 0.0, 0.0], [-0.75, 0.5, 0.0], [0.75, -0.5, 0.0]];
+/// Every partial is a pair of resonators, one per side, the left detuned up and the right down
+/// by up to this many cents, at a slow rate of its voice's own, so the chord drifts around the
+/// stereo field. The rates are slow enough that the pitch moves no faster than about 8 cents a
+/// second, so the drift reads as width rather than chorus.
+const SHIMMER_CENTS: f64 = 9.0;
+const SHIMMER_HZ: [f64; VOICES] = [0.08, 0.11, 0.14];
 /// How long the voices ring, to -60 dB, at the bottom and top of the knob.
 const TAIL_SHORTEST: f64 = 0.3;
 const TAIL_LONGEST: f64 = 0.9;
 /// How far the track reaches the voices between hits, as a share of a full hit.
 const RESTING_OPEN: f64 = 0.1;
-const SWELL_ATTACK_MS: f32 = 25.0;
-const SWELL_RELEASE_MS: f32 = 140.0;
+/// The swell holds each hit, letting go over this...
+const HIT_RELEASE_MS: f32 = 140.0;
+/// ...and blooms towards it through two smoothing stages of this time constant each: a soft
+/// S-shaped rise, from 10% to 90% in about 65 ms, that peaks about 120 ms after the hit, just
+/// after the duck, and falls back over about 200 ms.
+const BLOOM_MS: f32 = 30.0;
 /// The resonators hear the track, before the duck, this long after it played: the follower's
-/// Attack, which is when the duck has come in, plus two of the swell's attack time constants,
-/// by when the voices are about three-quarters open. So the track's energy arrives in the gap
-/// right after each duck, as the hit opens the voices. 51 ms at the default 1 ms Attack.
-const EXCITE_SWELLS: f64 = 2.0;
+/// Attack, which is when the duck has come in, plus four of the bloom's time constants, about
+/// when the bloom peaks. So the track's energy arrives right after each duck, as the voices are
+/// fully open. 121 ms at the default 1 ms Attack (1.7.4: 51 ms). Three time constants rang the
+/// voices about 0.5 dB less on legato cello, where the limiter has less room as the duck lets go.
+const EXCITE_BLOOMS: f64 = 4.0;
 /// The longest Attack, and so the longest delay the delay line has to hold.
 const LONGEST_ATTACK_MS: f64 = 100.0;
 /// How quickly the delay follows a change of Attack, so it glides instead of jumping.
@@ -498,7 +513,7 @@ pub(crate) fn dry_gain(amount: f64) -> f64 {
 /// How long after the track the resonators hear it, in milliseconds, for an Attack of
 /// `attack_ms`.
 pub(crate) fn excite_delay_ms(attack_ms: f64) -> f64 {
-    attack_ms.clamp(0.0, LONGEST_ATTACK_MS) + EXCITE_SWELLS * SWELL_ATTACK_MS as f64
+    attack_ms.clamp(0.0, LONGEST_ATTACK_MS) + EXCITE_BLOOMS * BLOOM_MS as f64
 }
 
 /// The track's mid before the duck, held long enough to be heard again after any delay
@@ -543,6 +558,7 @@ impl DelayLine {
 /// variable filter, which stays stable however its tuning moves.
 #[derive(Debug, Clone, Copy, Default)]
 struct Resonator {
+    g: f64,
     ic1: f64,
     ic2: f64,
     a1: f64,
@@ -557,10 +573,18 @@ impl Resonator {
         let g = (PI * hz / sample_rate).tan();
         // Poles decaying at k*pi*f per second put -60 dB at 6.9 / (k*pi*f) seconds.
         let k = (2.2 / (hz * tail)).min(1.0);
+        self.g = g;
         self.a1 = 1.0 / (1.0 + g * (g + k));
         self.a2 = g * self.a1;
         self.a3 = g * self.a2;
         self.k = k;
+    }
+
+    /// How far it shifts the phase of a steady tone at `hz`, in radians: none at its own pitch,
+    /// a lead when the tone is below it, and a lag above, up to a quarter cycle either way.
+    fn phase_at(&self, hz: f64, sample_rate: f64) -> f64 {
+        let x = (PI * hz.min(sample_rate * 0.45) / sample_rate).tan() / self.g.max(1e-12);
+        FRAC_PI_2 - (self.k * x).atan2(1.0 - x * x)
     }
 
     fn reset(&mut self) {
@@ -578,6 +602,12 @@ impl Resonator {
     }
 }
 
+/// Which side of each partial hears the track late. It alternates, so neither side leads the
+/// whole chord.
+fn late_side(voice: usize, partial: usize) -> usize {
+    (voice + partial) % 2
+}
+
 /// One chord of voices tuned to one key: each partial of each voice, on the left and the right.
 #[derive(Debug, Clone, Default)]
 struct Bank {
@@ -591,20 +621,23 @@ impl Bank {
     /// `cents` is each voice's detune, which the left takes up and the right down.
     fn tune(&mut self, tail: f64, cents: &[f64; VOICES], sample_rate: f64) {
         let root = root_hz(self.key);
-        for (voice, offsets) in self.offsets.iter_mut().enumerate() {
-            for (offset, (ratio, _, _)) in offsets.iter_mut().zip(PARTIALS) {
-                let hz = root * ratio * (VOICING[voice] / 12.0).exp2();
-                let cycles = (hz * STEREO_OFFSET_MS * 0.001).floor() + 0.25;
-                *offset = cycles / hz * sample_rate;
-            }
-        }
         for (voice, partials) in self.voices.iter_mut().enumerate() {
-            for (pair, (ratio, _, share)) in partials.iter_mut().zip(PARTIALS) {
+            for (partial, (pair, (ratio, share))) in partials.iter_mut().zip(PARTIALS).enumerate() {
                 for (side, resonator) in pair.iter_mut().enumerate() {
                     let detune = if side == 0 { cents[voice] } else { -cents[voice] };
                     let hz = root * ratio * ((VOICING[voice] * 100.0 + detune) / 1200.0).exp2();
                     resonator.tune(hz, tail * share, sample_rate);
                 }
+                // Detuned apart by more than their few hertz of bandwidth, the two sides shift a
+                // note on their pitch by up to a quarter cycle each, in opposite directions, which
+                // could take them from a quarter cycle apart to half a cycle, cancelling in mono.
+                // So the late side's offset takes up the difference, and on the note they stay a
+                // quarter cycle apart however far the drift has taken them.
+                let hz = root * ratio * (VOICING[voice] / 12.0).exp2();
+                let late = late_side(voice, partial);
+                let shift = pair[late].phase_at(hz, sample_rate) - pair[1 - late].phase_at(hz, sample_rate);
+                let cycles = (hz * STEREO_OFFSET_MS * 0.001).floor() + 0.25 + shift / TAU;
+                self.offsets[voice][partial] = cycles / hz * sample_rate;
             }
         }
     }
@@ -698,10 +731,13 @@ pub struct DreamEater {
     retune_gap: usize,
     /// Whether the voices ran last frame. They start from silence each time Dream Eater comes on.
     running: bool,
-    /// The sample's envelope, smoothed so the voices swell instead of jumping.
+    /// The sample's envelope held over each hit, and bloomed through two stages towards it, so
+    /// the voices swell instead of jumping.
+    hit: f64,
+    bloom: f64,
     swell: f64,
-    swell_attack: f64,
-    swell_release: f64,
+    hit_release: f64,
+    bloom_rate: f64,
     /// Each voice's detune LFO phase, in cycles.
     shimmer: [f64; VOICES],
     /// Each voice partial's level on the left and right.
@@ -759,7 +795,7 @@ impl DreamEater {
         let mut gains = [[[0.0; 2]; PARTIALS.len()]; VOICES];
         for (voice, partials) in gains.iter_mut().enumerate() {
             for (partial, gain) in partials.iter_mut().enumerate() {
-                *gain = pan_gains(PAN[voice][partial]).map(|side| side * PARTIALS[partial].1);
+                *gain = pan_gains(PAN[voice][partial]).map(|side| side * LEVELS[voice][partial]);
             }
         }
         let mut dream = DreamEater {
@@ -773,9 +809,11 @@ impl DreamEater {
             since_retune: 0,
             retune_gap: 0,
             running: false,
+            hit: 0.0,
+            bloom: 0.0,
             swell: 0.0,
-            swell_attack: 0.0,
-            swell_release: 0.0,
+            hit_release: 0.0,
+            bloom_rate: 0.0,
             shimmer: [0.0; VOICES],
             gains,
             countdown: 0,
@@ -811,8 +849,8 @@ impl DreamEater {
         self.detector.prepare(sample_rate);
         self.crossfade_step = 1.0 / (CROSSFADE_SECONDS * sample_rate);
         self.retune_gap = (RETUNE_GAP_SECONDS * sample_rate) as usize;
-        self.swell_attack = 1.0 - one_pole(SWELL_ATTACK_MS, sample_rate);
-        self.swell_release = 1.0 - one_pole(SWELL_RELEASE_MS, sample_rate);
+        self.hit_release = 1.0 - one_pole(HIT_RELEASE_MS, sample_rate);
+        self.bloom_rate = 1.0 - one_pole(BLOOM_MS, sample_rate);
         let longest = (excite_delay_ms(LONGEST_ATTACK_MS) + STEREO_ROOM_MS) * 0.001 * sample_rate;
         self.excitation.prepare(longest.ceil() as usize);
         self.delay_glide = 1.0 - one_pole(DELAY_GLIDE_MS, sample_rate);
@@ -836,6 +874,8 @@ impl DreamEater {
         self.excitation.reset();
         self.delay = self.delay_target;
         self.running = false;
+        self.hit = 0.0;
+        self.bloom = 0.0;
         self.swell = 0.0;
     }
 
@@ -945,8 +985,9 @@ impl DreamEater {
         self.excitation.push(mid as f64);
         self.delay += self.delay_glide * (self.delay_target - self.delay);
         let envelope = envelope as f64;
-        let rate = if envelope > self.swell { self.swell_attack } else { self.swell_release };
-        self.swell += rate * (envelope - self.swell);
+        self.hit = if envelope > self.hit { envelope } else { self.hit + self.hit_release * (envelope - self.hit) };
+        self.bloom += self.bloom_rate * (self.hit - self.bloom);
+        self.swell += self.bloom_rate * (self.bloom - self.swell);
         if amount.is_nan() || amount <= 0.0 {
             self.running = false;
             return None;
@@ -971,8 +1012,10 @@ impl DreamEater {
             let share = open * if index == self.active { self.crossfade } else { 1.0 - self.crossfade };
             for (voice, (partials, gains)) in bank.voices.iter_mut().zip(&self.gains).enumerate() {
                 for (partial, (pair, gain)) in partials.iter_mut().zip(gains).enumerate() {
-                    // The late side alternates, so neither side leads the whole chord.
-                    let late_side = (voice + partial) % 2;
+                    if *gain == [0.0; 2] {
+                        continue;
+                    }
+                    let late_side = late_side(voice, partial);
                     let late = self.excitation.read(self.delay + bank.offsets[voice][partial]);
                     for side in 0..2 {
                         let hears = if side == late_side { late } else { delayed };
@@ -1243,9 +1286,173 @@ mod tests {
         assert!((root_hz(8) - 415.305).abs() < 1e-3);
         for key in 0..12 {
             let root = root_hz(key);
-            let top = root * (VOICING[2] / 12.0).exp2() * PARTIALS[1].0;
-            assert!(root >= 200.0 && top < 2_000.0, "key {key}: {root} to {top}");
+            let octave = root * (VOICING[2] / 12.0).exp2() * PARTIALS[1].0;
+            assert!(root >= 200.0 && octave < 2_000.0, "key {key}: {root} to {octave}");
         }
+    }
+
+    /// Where the ninth's top partial rings in `key`, before any detune.
+    fn sparkle_hz(key: u8) -> f64 {
+        root_hz(key) * (VOICING[2] / 12.0).exp2() * PARTIALS[2].0
+    }
+
+    #[test]
+    fn only_the_ninth_sparkles_two_octaves_up_at_2_to_4_khz() {
+        assert_eq!(PARTIALS[2].0, 4.0);
+        assert_eq!(LEVELS.map(|levels| levels[2] > 0.0), [false, false, true]);
+        for key in 0..12 {
+            let top = sparkle_hz(key);
+            assert!((1_950.0..3_800.0).contains(&top), "key {key}: {top} Hz");
+            // From C# up to G#, in the 2.4 to 4 kHz the ear is keenest on; A to C sit just under.
+            if (1..=8).contains(&key) {
+                assert!(top >= 2_400.0, "key {key}: {top} Hz");
+            }
+        }
+        assert!((sparkle_hz(9) - 1_975.5).abs() < 0.1 && (sparkle_hz(8) - 3_729.3).abs() < 0.1);
+    }
+
+    /// The wet alone, left and right, with the voices held fully open on `seconds` of white noise
+    /// at a third of full scale, the brightest material there is, from 1 s on.
+    fn wet_on_noise(key: u8, seconds: f64) -> [Vec<f32>; 2] {
+        wet_on(key, &noise((seconds * RATE) as usize, 11).iter().map(|v| v * 0.3).collect::<Vec<_>>())
+    }
+
+    /// The wet alone, left and right, with the voices held fully open on `input`, from 1 s on.
+    fn wet_on(key: u8, input: &[f32]) -> [Vec<f32>; 2] {
+        let mut dream = DreamEater::new(RATE);
+        dream.choose(KeyChoice::Fixed(key));
+        let mut wet = [Vec::new(), Vec::new()];
+        for (n, &v) in input.iter().enumerate() {
+            let out = dream.process([v, v], 2, 1.0, 1.0, 1.0).unwrap();
+            if n >= RATE as usize {
+                for side in 0..2 {
+                    wet[side].push(out[side] - (dream.makeup() * dry_gain(1.0)) as f32 * v);
+                }
+            }
+        }
+        wet
+    }
+
+    /// The power of `signal` between `low` and `high` Hz, as a share of its whole power.
+    fn band_share(signal: &[f32], low: f64, high: f64) -> f64 {
+        // Every fourth DFT bin, so four times each.
+        let bin = RATE / signal.len() as f64;
+        let mut hz = (low / bin).ceil() * bin;
+        let mut power = 0.0;
+        while hz < high {
+            power += 8.0 * power_at(signal, hz);
+            hz += 4.0 * bin;
+        }
+        power / (rms(signal) as f64).powi(2).max(1e-30)
+    }
+
+    #[test]
+    fn the_sparkle_is_heard_but_never_shrill() {
+        for key in [9, 0, 8] {
+            let wet = wet_on_noise(key, 3.0);
+            let top = sparkle_hz(key);
+            let ninth = top / 4.0;
+            // Both sides together, as the ninth leans right and its octave left.
+            let powers = wet.each_ref().map(|side| (rms(side) as f64).powi(2));
+            let share = |low: f64, high: f64| {
+                let both = band_share(&wet[0], low, high) * powers[0] + band_share(&wet[1], low, high) * powers[1];
+                10.0 * (both / (powers[0] + powers[1])).max(1e-30).log10()
+            };
+            let sparkle = share(top * 0.97, top * 1.03);
+            let at_ninth = share(ninth * 0.97, ninth * 1.03);
+            let above = share(4_200.0, 12_000.0);
+            println!("key {key}: sparkle {sparkle:.1} dB, ninth {at_ninth:.1} dB, above 4.2 kHz {above:.1} dB");
+            let label = format!("key {key}: sparkle {sparkle:.1} dB, ninth {at_ninth:.1} dB, above 4.2 kHz {above:.1} dB of the wet");
+            // On white noise, the brightest there is, the sparkle stays well under the ninth it
+            // shines above and under a sixth of the chord's power, and nothing rings above it.
+            assert!(sparkle > -17.0 && sparkle < -9.0, "{label}");
+            assert!(sparkle < at_ninth - 1.0, "{label}");
+            assert!(above < -22.0 && above < sparkle - 10.0, "{label}");
+        }
+    }
+
+    #[test]
+    fn summed_to_mono_the_chord_loses_nothing() {
+        for key in [0, 5, 8] {
+            let [left, right] = wet_on_noise(key, 5.0);
+            let mono: Vec<f32> = left.iter().zip(&right).map(|(l, r)| l + r).collect();
+            let sides = |range: std::ops::Range<usize>| {
+                (rms(&left[range.clone()]) as f64).powi(2) + (rms(&right[range]) as f64).powi(2)
+            };
+            // Summed, uncorrelated sides keep both their powers; cancelling sides would lose some.
+            let whole = 10.0 * ((rms(&mono) as f64).powi(2) / sides(0..mono.len())).log10();
+            assert!(whole > -0.5, "key {key}: the mono sum is {whole:+.2} dB against the two sides' power");
+            // Nor does it dip for a moment as the sides drift against each other.
+            let worst = (0..mono.len() / 4_800)
+                .map(|w| {
+                    let range = w * 4_800..(w + 1) * 4_800;
+                    10.0 * ((rms(&mono[range.clone()]) as f64).powi(2) / sides(range)).log10()
+                })
+                .fold(f64::MAX, f64::min);
+            assert!(worst > -3.0, "key {key}: the mono sum dips to {worst:+.2} dB over 100 ms");
+            // Yet the sides are wide: little in common.
+            let dot: f64 = left.iter().zip(&right).map(|(&l, &r)| l as f64 * r as f64).sum();
+            let correlation = dot / (rms(&left) as f64 * rms(&right) as f64 * left.len() as f64);
+            assert!(correlation.abs() < 0.3, "key {key}: L/R correlation {correlation:.2}");
+        }
+    }
+
+    #[test]
+    fn summed_to_mono_a_held_chord_on_its_own_pitches_never_cancels() {
+        // The worst case for the drift: steady tones right on the chord's pitches, where the few
+        // hertz wide resonators ring hardest and their phase moves most as they drift apart. Long
+        // enough for every voice's drift to go through a whole cycle and more.
+        for key in [0, 8] {
+            let notes: Vec<f64> = VOICING.iter().map(|semitones| root_hz(key) * (semitones / 12.0).exp2()).collect();
+            let input: Vec<f32> = (0..(15.0 * RATE) as usize)
+                .map(|n| notes.iter().map(|hz| 0.1 * (TAU * hz * n as f64 / RATE).sin()).sum::<f64>() as f32)
+                .collect();
+            let [left, right] = wet_on(key, &input);
+            let mono: Vec<f32> = left.iter().zip(&right).map(|(l, r)| l + r).collect();
+            let db = |range: std::ops::Range<usize>| {
+                let sides = (rms(&left[range.clone()]) as f64).powi(2) + (rms(&right[range.clone()]) as f64).powi(2);
+                10.0 * ((rms(&mono[range]) as f64).powi(2) / sides).log10()
+            };
+            let whole = db(0..mono.len());
+            let worst = (0..mono.len() / 24_000).map(|w| db(w * 24_000..(w + 1) * 24_000)).fold(f64::MAX, f64::min);
+            println!("key {key}: mono sum {whole:+.2} dB, worst half second {worst:+.2} dB");
+            assert!(whole > -0.5, "key {key}: the mono sum is {whole:+.2} dB against the two sides' power");
+            assert!(worst > -1.5, "key {key}: the mono sum dips to {worst:+.2} dB over half a second");
+        }
+    }
+
+    #[test]
+    fn each_hit_blooms_softly_and_peaks_just_after_the_duck() {
+        let mut dream = DreamEater::new(RATE);
+        let beat = RATE as usize / 2;
+        // A kick-like envelope every half second, as the follower gives it with the default
+        // 1 ms Attack: in at once, and gone over a couple of hundred milliseconds.
+        let envelope = |n: usize| {
+            let t = (n % beat) as f64 / RATE;
+            (if t < 0.001 { t / 0.001 } else { (-(t - 0.001) / 0.13).exp() }) as f32
+        };
+        let mut levels = Vec::new();
+        for n in 0..6 * beat {
+            dream.process([0.0, 0.0], 2, envelope(n), 1.0 - 0.75 * envelope(n), 1.0);
+            levels.push(dream.level() as f64);
+        }
+        let last = &levels[5 * beat..];
+        let ms = |frames: usize| frames as f64 * 1_000.0 / RATE;
+        let peak = (0..beat).max_by(|&a, &b| last[a].total_cmp(&last[b])).unwrap();
+        let low = last[..peak].iter().cloned().fold(f64::MAX, f64::min);
+        let crossing = |share: f64| (0..peak).find(|&n| last[n] >= low + share * (last[peak] - low)).unwrap();
+        let rise = ms(crossing(0.9) - crossing(0.1));
+        let label = format!("rises 10-90% in {rise:.0} ms, peaks {:.2} at {:.0} ms from {low:.2}", last[peak], ms(peak));
+        assert!((60.0..=120.0).contains(&rise), "a soft bloom, not a snap: {label}");
+        // The duck is deepest on the hit and half way back by about 90 ms.
+        assert!((90.0..=160.0).contains(&ms(peak)), "peaks just after the duck: {label}");
+        assert!(last[peak] > 0.7 && low < 0.25, "each hit still opens the voices well past the floor: {label}");
+        // The track reaches the voices as they are most of the way open.
+        let delay = (excite_delay_ms(1.0) * 0.001 * RATE) as usize;
+        assert!(last[delay] > 0.8 * last[peak], "{label}; at the delay: {:.2}", last[delay]);
+        // And it falls back over a couple of hundred milliseconds, before the next hit.
+        let half = (peak..beat).find(|&n| last[n] <= low + 0.5 * (last[peak] - low)).unwrap();
+        assert!((120.0..=260.0).contains(&ms(half - peak)), "{label}; half way down {:.0} ms after", ms(half - peak));
     }
 
     /// Goertzel power of `signal` at `hz`.
@@ -1295,7 +1502,10 @@ mod tests {
             windows[range].windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0f32, f32::max)
         };
         let per_second = windows.len() / 6;
-        let steady = jump(per_second..2 * per_second);
+        // Steady is the hits on C before the switch and on F# once the crossfade is over: the
+        // 5 ms RMS of a few resonators on noise wanders by itself, more so with the sparkle, and
+        // one second of it is too little to judge by.
+        let steady = jump(per_second..2 * per_second).max(jump(3 * per_second..6 * per_second));
         let across = jump(2 * per_second - 4..3 * per_second);
         assert!(across < steady * 1.5, "{across} vs {steady}");
         // Nor a click: no step between samples bigger than with the hits, for the wet's level.
@@ -1325,8 +1535,8 @@ mod tests {
 
     #[test]
     fn the_resonators_hear_the_track_late_by_the_attack_and_swell() {
-        assert_eq!(excite_delay_ms(1.0), 51.0);
-        assert_eq!(excite_delay_ms(100.0), 150.0);
+        assert_eq!(excite_delay_ms(1.0), 121.0);
+        assert_eq!(excite_delay_ms(100.0), 220.0);
         for rate in [44_100.0, 48_000.0, 96_000.0] {
             for attack in [0.1f32, 1.0, 30.0, 100.0] {
                 let mut dream = DreamEater::new(rate);

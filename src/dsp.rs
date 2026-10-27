@@ -1571,11 +1571,14 @@ mod tests {
             }
             rms(&during) / rms(&steady)
         };
-        let on_the_hit = moved(2_400, 9_600);
+        // Since 1.7.5 the chord blooms in after the duck and peaks 150 to 200 ms after the hit.
+        let on_the_hit = moved(4_800, 12_000);
         let between_hits = moved(21_600, 24_000);
         assert!(on_the_hit > 0.15, "the kick swells the resonance: {on_the_hit}");
         assert!(between_hits < on_the_hit * 0.7, "and it rings out after: {between_hits} vs {on_the_hit}");
-        assert!(levels[1] > 0.3 && levels[9] < 0.1, "the editor sees the swell: {levels:?}");
+        // The swell blooms over about a hundred milliseconds and lets go over a few hundred, so
+        // by the end of the beat it has fallen to under a fifth of its peak.
+        assert!(levels[1] > 0.3 && levels[9] < levels[2] * 0.2, "the editor sees the swell: {levels:?}");
     }
 
     #[test]
@@ -1744,6 +1747,126 @@ mod tests {
     }
 
     const A_MINOR: &[&[u8]] = &[&[45, 57, 60, 64], &[41, 57, 60, 65], &[48, 55, 60, 64], &[43, 55, 59, 62]];
+
+    /// One beat of `engine`'s sample ducking a sustained noise track on every beat at 120 bpm with
+    /// Dream Eater at 100%, in 5 ms steps averaged over beats 4 to 11, once the leveller has
+    /// settled: the duck's gain, how far the voices are open, and the chord's RMS on its own.
+    struct Bloom {
+        duck: Vec<f64>,
+        open: Vec<f64>,
+        chord: Vec<f64>,
+        /// Diagnostics: the raw wet's RMS, the leveller, and the limiter.
+        raw: Vec<f64>,
+        leveller: Vec<f64>,
+        limiter: Vec<f64>,
+    }
+
+    const BLOOM_STEP: usize = 240;
+
+    fn bloom(engine: impl Fn() -> Engine) -> Bloom {
+        const BEAT: usize = 24_000;
+        let beats = 12;
+        let input: Vec<f32> = noise(beats * BEAT).iter().map(|v| v * 0.3).collect();
+        let (mut ducker, mut eater) = (engine(), engine());
+        let steps = BEAT / BLOOM_STEP;
+        let mut shape = Bloom {
+            duck: vec![0.0; steps],
+            open: vec![0.0; steps],
+            chord: vec![0.0; steps],
+            raw: vec![0.0; steps],
+            leveller: vec![0.0; steps],
+            limiter: vec![0.0; steps],
+        };
+        for beat in 0..beats {
+            let range = beat * BEAT..(beat + 1) * BEAT;
+            let (mut out, mut gain, mut levels, mut probes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for start in range.clone().step_by(BLOOM_STEP) {
+                let transport = TransportInfo::playing_at(start as f64 * 2.0 / RATE, 120.0, RATE);
+                gain.extend(run(&mut ducker, BLOOM_STEP, transport, ducking(0.0)).0);
+                let mut left = input[start..start + BLOOM_STEP].to_vec();
+                let mut right = left.clone();
+                eater.settings.dream_key = KeyChoice::Fixed(0);
+                let report = eater.process(&mut [&mut left[..], &mut right[..]], &transport, || ducking(1.0));
+                levels.push(report.dream_level as f64);
+                probes.push(std::mem::take(&mut eater.dream.probe));
+                out.extend(left);
+            }
+            if beat < 4 {
+                continue;
+            }
+            let ducked: Vec<f32> = input[range].iter().zip(&gain).map(|(v, g)| v * g).collect();
+            for step in 0..steps {
+                let window = step * BLOOM_STEP..(step + 1) * BLOOM_STEP;
+                // The chord alone: the output less the ducked track, at the share of it that is
+                // there in this step, which the makeup moves.
+                let (out, ducked) = (&out[window.clone()], &ducked[window.clone()]);
+                let share = out.iter().zip(ducked).map(|(a, b)| a * b).sum::<f32>() / ducked.iter().map(|v| v * v).sum::<f32>();
+                let chord: Vec<f32> = out.iter().zip(ducked).map(|(a, b)| a - share * b).collect();
+                shape.duck[step] += gain[window].iter().map(|&g| g as f64).sum::<f64>() / BLOOM_STEP as f64 / 8.0;
+                shape.open[step] += levels[step] / 8.0;
+                let p = &probes[step];
+                shape.raw[step] += (p.raw_wet_power / p.frames).sqrt() / 8.0;
+                shape.leveller[step] += p.leveller / p.frames / 8.0;
+                shape.limiter[step] += p.limiter / p.frames / 8.0;
+                shape.chord[step] += rms(&chord) as f64 / 8.0;
+            }
+        }
+        shape
+    }
+
+    impl Bloom {
+        fn ms(step: usize) -> f64 {
+            (step * BLOOM_STEP) as f64 * 1_000.0 / RATE
+        }
+
+        /// When the duck is deepest, and when it has come 90% of the way back.
+        fn duck_ms(&self) -> (f64, f64) {
+            let bottom = (0..self.duck.len()).min_by(|&a, &b| self.duck[a].total_cmp(&self.duck[b])).unwrap();
+            let depth = 1.0 - self.duck[bottom];
+            let back = (bottom..self.duck.len()).find(|&s| 1.0 - self.duck[s] <= 0.1 * depth).unwrap_or(self.duck.len());
+            (Self::ms(bottom), Self::ms(back))
+        }
+
+        /// When the chord peaks, and how long it takes to rise from 10% to 90% of the way from
+        /// its level between hits to that peak.
+        fn chord_ms(&self) -> (f64, f64) {
+            let peak = (0..self.chord.len()).max_by(|&a, &b| self.chord[a].total_cmp(&self.chord[b])).unwrap();
+            let low = self.chord[..=peak].iter().cloned().fold(f64::MAX, f64::min);
+            let at = |share: f64| {
+                let level = low + share * (self.chord[peak] - low);
+                (0..=peak).rev().find(|&s| self.chord[s] <= level).map_or(0, |s| s + 1)
+            };
+            (Self::ms(peak), Self::ms(at(0.9)) - Self::ms(at(0.1)))
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dream_eater_bloom_report() {
+        let water = crate::preset::Preset::factory("Water").unwrap().sample.unwrap();
+        let water = || {
+            let mut engine = Engine::new(RATE);
+            engine.set_sample(Some(Arc::new(PreparedSample::new(&water, RATE))));
+            engine.finish_analysis();
+            engine
+        };
+        for (name, shape) in [("kick", bloom(kick_engine)), ("Water", bloom(water))] {
+            println!("{name}:");
+            for step in (0..60).step_by(2) {
+                println!(
+                    "{:4.0} ms: duck {:.2}  open {:.2}  chord {:.4}  raw {:.5}  leveller {:.1}  limiter {:.2}",
+                    Bloom::ms(step),
+                    shape.duck[step],
+                    shape.open[step],
+                    shape.chord[step],
+                    shape.raw[step],
+                    shape.leveller[step],
+                    shape.limiter[step]
+                );
+            }
+            println!("duck deepest, 90% back at {:?} ms; chord peak at, 10-90% rise {:?} ms", shape.duck_ms(), shape.chord_ms());
+        }
+    }
 
     /// Inside Dream Eater on real recordings, with Water ducking: the factory samples, and any
     /// files in `HAUNTER_REAL_TRACKS`, separated by semicolons.

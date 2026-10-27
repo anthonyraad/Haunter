@@ -653,7 +653,7 @@ fn direction_menu(ui: &mut egui::Ui, setter: &ParamSetter, param: &EnumParam<Dir
         })
         .inner;
     menu.response.clone().on_hover_text(
-        "Forward plays the region from S to E.\nBackward plays it from E to S, turning round at once when chosen.\nLevitate bounces between S and E.",
+        "Forward plays the region from S to E.\nBackward plays it from E to S, turning round at once when chosen.\nLevitate bounces between S and E; with Restart on, it plays\nforward from S and backward from E on alternate steps.",
     );
 
     let choosing = match (picked, choosing) {

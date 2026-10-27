@@ -148,16 +148,23 @@ impl GridClock {
     /// span `[beat - step/2, beat + step/2)`, so every grid line lands on exactly one frame even
     /// when the host's block positions jitter slightly.
     pub fn tick(&mut self, beat: f64, beats_per_frame: f64, interval: f64) -> bool {
+        self.tick_line(beat, beats_per_frame, interval).is_some()
+    }
+
+    /// Like [`GridClock::tick`], but returns which grid line fired, counted in `interval`s from
+    /// the song's start (line 0 at beat 0, negative before it), so it depends only on the song
+    /// position and not on where playback started.
+    pub fn tick_line(&mut self, beat: f64, beats_per_frame: f64, interval: f64) -> Option<i64> {
         let half = 0.5 * beats_per_frame;
         let line = ((beat - half) / interval).ceil();
         if line * interval < beat + half {
             let line = line as i64;
             if self.last_line != Some(line) {
                 self.last_line = Some(line);
-                return true;
+                return Some(line);
             }
         }
-        false
+        None
     }
 }
 
@@ -452,6 +459,9 @@ struct AnalysisKey {
     end: usize,
     direction: Direction,
     fades_out: bool,
+    /// Levitate with Restart on: one pass forward, then a separate pass back from End, which
+    /// fades out like this.
+    alternates: Option<bool>,
     declick: usize,
     attack_ms: f32,
     release_ms: f32,
@@ -497,15 +507,24 @@ impl PeakAnalysis {
             let key = run.key;
             let region = (key.start, key.end);
             while budget > 0 && run.voice.remaining(region) > 0 {
-                let gain = run.voice.declick_gain(region, key.fades_out, key.declick);
+                let fades_out = match (key.alternates, run.turned) {
+                    (Some(back_fades_out), true) => back_fades_out,
+                    _ => key.fades_out,
+                };
+                let gain = run.voice.declick_gain(region, fades_out, key.declick);
                 let level = run.follower.process((sample.key[run.voice.frame()] * gain) as f64);
                 run.peak = run.peak.max(level);
                 run.voice.advance();
                 budget -= 1;
                 // Levitate's peak is over the way there and back.
                 if key.direction.bounces() && !run.turned && run.voice.remaining(region) == 0 {
-                    run.voice.turn();
-                    run.voice.fade_in_from = None;
+                    if key.alternates.is_some() {
+                        // With Restart on, the way back is its own pass, from End.
+                        run.voice = Voice::trigger(region, sample.frames(), true);
+                    } else {
+                        run.voice.turn();
+                        run.voice.fade_in_from = None;
+                    }
                     run.turned = true;
                 }
             }
@@ -646,11 +665,29 @@ impl Engine {
         self.region = Self::region_frames(self.settings.start, self.settings.end, frames);
     }
 
+    /// Whether Levitate turns round at the handles: with Restart off, while the transport plays.
+    /// With Restart on it alternates instead, one pass per Rate step (see [`Engine::plays_backwards`]).
+    fn bounces(&self, playing: bool) -> bool {
+        self.settings.direction.bounces() && playing && !self.settings.restart
+    }
+
+    /// Whether a pass triggered on grid line `line` plays backwards. With Restart on, Levitate
+    /// alternates by the line's parity, counted from the song's start: even lines (the song's
+    /// first step is line 0) play forward from Start, odd ones backward from End. So the same
+    /// step always goes the same way, across loops and wherever playback starts.
+    fn plays_backwards(&self, line: Option<i64>) -> bool {
+        match (self.settings.direction, line) {
+            (Direction::Levitate, Some(line)) if self.settings.restart => line.rem_euclid(2) == 1,
+            (direction, _) => direction.starts_backwards(),
+        }
+    }
+
     /// Whether a pass fades out at its last frame: always when looping, otherwise only when it
-    /// stops mid-sample. Levitate turns round at the handles instead while the transport plays,
-    /// which needs no fade: the frames either side of a turn are neighbours in the sample.
+    /// stops mid-sample. Levitate without Restart turns round at the handles instead while the
+    /// transport plays, which needs no fade: the frames either side of a turn are neighbours in
+    /// the sample.
     fn fades_out(&self, reverse: bool, frames: usize, playing: bool) -> bool {
-        if self.settings.direction.bounces() && playing {
+        if self.bounces(playing) {
             return false;
         }
         let (start, end) = self.region;
@@ -665,6 +702,7 @@ impl Engine {
             end: self.region.1,
             direction,
             fades_out: self.fades_out(direction.starts_backwards(), sample.frames(), true),
+            alternates: (direction.bounces() && self.settings.restart).then(|| self.fades_out(true, sample.frames(), true)),
             declick: self.declick,
             attack_ms: self.settings.attack_ms,
             release_ms: self.settings.release_ms,
@@ -720,12 +758,16 @@ impl Engine {
 
         let mut min_track_gain = 1.0f32;
         for frame in 0..frames {
-            let trigger = match grid {
-                Some((beat, step)) => self.clock.tick(beat + frame as f64 * step, step, interval),
-                None => std::mem::take(&mut start_loop),
+            // The grid line that fired, if one did. Levitate with Restart on goes by its parity.
+            let (trigger, line) = match grid {
+                Some((beat, step)) => match self.clock.tick_line(beat + frame as f64 * step, step, interval) {
+                    Some(line) => (true, Some(line)),
+                    None => (false, None),
+                },
+                None => (std::mem::take(&mut start_loop), None),
             };
             let gains = gains();
-            let (track_gain, add_left, add_right, envelope) = self.frame(trigger, transport.playing, &gains);
+            let (track_gain, add_left, add_right, envelope) = self.frame(trigger, line, transport.playing, &gains);
             min_track_gain = min_track_gain.min(track_gain);
             let mut track = [0.0f32; 2];
             for (index, channel) in channels.iter().take(2).enumerate() {
@@ -758,14 +800,14 @@ impl Engine {
     }
 
     /// Returns (track gain, sample left, sample right, normalised envelope) for one frame.
-    fn frame(&mut self, trigger: bool, playing: bool, gains: &FrameGains) -> (f32, f32, f32, f32) {
+    fn frame(&mut self, trigger: bool, line: Option<i64>, playing: bool, gains: &FrameGains) -> (f32, f32, f32, f32) {
         let Some(sample) = self.sample.clone() else {
             return (1.0, 0.0, 0.0, 0.0);
         };
         let frames = sample.frames();
         let region = self.region;
         let direction = self.settings.direction;
-        let reverse = direction.starts_backwards();
+        let reverse = self.plays_backwards(line);
 
         if trigger {
             if let Some(voice) = self.voice.take() {
@@ -793,7 +835,7 @@ impl Engine {
                 raw_key += sample.key[at] * gain;
                 voice.advance();
             }
-            if voice.remaining(region) == 0 && direction.bounces() && playing {
+            if voice.remaining(region) == 0 && self.bounces(playing) {
                 voice.turn();
                 // No fade-in on the way back past where it started.
                 voice.fade_in_from = None;
@@ -1329,20 +1371,137 @@ mod tests {
         }
     }
 
-    #[test]
-    fn levitate_with_restart_starts_each_step_from_s_going_forward() {
+    /// Plays `blocks` blocks of `block` frames from `start_beat` at 120 bpm, the transport moving
+    /// on with each, with `gains`. Returns the left output and the playhead after each block.
+    fn play_along(engine: &mut Engine, start_beat: f64, block: usize, blocks: usize, gains: FrameGains) -> (Vec<f32>, Vec<Option<f32>>) {
+        let step = 120.0 / 60.0 / RATE;
+        let (mut out, mut heads) = (Vec::new(), Vec::new());
+        for index in 0..blocks {
+            let transport = TransportInfo::playing_at(start_beat + (index * block) as f64 * step, 120.0, RATE);
+            let mut left = vec![if gains.mix > 0.0 { 1.0 } else { 0.0 }; block];
+            let mut right = left.clone();
+            let report = engine.process(&mut [&mut left[..], &mut right[..]], &transport, || gains);
+            out.extend(left);
+            heads.push(report.playhead);
+        }
+        (out, heads)
+    }
+
+    fn levitate_with_restart(end: f32) -> Engine {
         let mut engine = Engine::new(RATE);
         engine.settings.direction = Direction::Levitate;
-        engine.settings.end = 0.25;
+        assert!(engine.settings.restart);
+        engine.settings.end = end;
         engine.set_sample(Some(prepared(vec![ramp(48_000)])));
-        // A quarter note at 120 bpm is 24,000 frames: up to E in 12,000, back down by 24,000.
-        let left = play(&mut engine, 30_000, TransportInfo::playing_at(0.0, 120.0, RATE));
-        assert!(left[6_000] > left[3_000], "forward from S");
-        assert_eq!(left[11_999], 12_000.0 / 48_000.0);
-        assert!(left[18_000] < left[15_000], "back from E");
-        assert!(left[23_999] < 2.0 / 48_000.0, "back at S as the next step comes");
-        assert!(left[25_000] < 0.03 && left[27_000] > left[25_000], "the step restarts it from S, going forward");
-        assert!(biggest_step(&left) < 2e-4);
+        engine
+    }
+
+    #[test]
+    fn levitate_with_restart_alternates_forward_and_backward_each_step() {
+        // A quarter note at 120 bpm is 24,000 frames; the region is the first 12,000.
+        let mut engine = levitate_with_restart(0.25);
+        let (left, heads) = play_along(&mut engine, 0.0, 500, 192, sample_only());
+        let declick = (DECLICK_SECONDS * RATE) as usize;
+        for step in 0..4 {
+            let at = step * 24_000;
+            if step % 2 == 0 {
+                // Forward from S, from the song's first step, fading out at E (mid-sample).
+                for n in 0..12_000 - declick {
+                    assert_eq!(left[at + n], (n + 1) as f32 / 48_000.0, "step {step} frame {n}");
+                }
+            } else {
+                // Backward from E, fading in there because it is mid-sample, down to S.
+                assert!(left[at] < 12_000.0 / 48_000.0 / declick as f32 + 1e-6, "step {step} fades in");
+                for n in declick..12_000 {
+                    assert_eq!(left[at + n], (12_000 - n) as f32 / 48_000.0, "step {step} frame {n}");
+                }
+            }
+            // One pass per step: no bounce at the far handle, silence until the next step.
+            assert!(left[at + 12_000..at + 24_000].iter().all(|&v| v == 0.0), "step {step} stops at the far handle");
+            // The playhead follows: rising on forward steps, falling on backward ones.
+            let first = at / 500 + 2;
+            let moves: Vec<bool> = (first..first + 20).map(|b| heads[b + 1].unwrap() > heads[b].unwrap()).collect();
+            assert!(moves.iter().all(|&up| up == (step % 2 == 0)), "step {step}: {:?}", &heads[first..first + 21]);
+        }
+    }
+
+    #[test]
+    fn levitate_with_restart_goes_by_the_song_position_wherever_playback_starts() {
+        let mut whole = levitate_with_restart(0.25);
+        let reference = play_along(&mut whole, 0.0, 500, 192, sample_only()).0;
+        // Starting on the second, third, or fourth quarter note plays exactly what a run from the
+        // song's start plays there: backward, forward, backward.
+        for start in 1..4 {
+            let mut engine = levitate_with_restart(0.25);
+            let left = play_along(&mut engine, start as f64, 500, 48, sample_only()).0;
+            let expected = &reference[start * 24_000..start * 24_000 + 24_000];
+            let worst = left.iter().zip(expected).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            assert!(worst < 1e-6, "from beat {start}: off by {worst}");
+            let backwards = left[3_000] > left[6_000];
+            assert_eq!(backwards, start % 2 == 1, "from beat {start}");
+        }
+        // Stopping and starting again on the same step goes the same way.
+        let mut engine = levitate_with_restart(0.25);
+        play_along(&mut engine, 1.0, 500, 10, sample_only());
+        play(&mut engine, 500, TransportInfo::stopped());
+        let again = play_along(&mut engine, 1.0, 500, 10, sample_only()).0;
+        assert!(again[3_000] > again[4_000], "backward again on the second quarter note");
+    }
+
+    #[test]
+    fn levitate_with_restart_retriggers_without_clicks() {
+        // Steps shorter than the region, so every step cuts a pass off mid-way and turns round,
+        // on a loud 3 kHz tone, with the region at the file's ends and in the middle of it.
+        let tone = loud_sine(48_000, 3_000.0);
+        let natural = biggest_step(&tone);
+        for (start, end) in [(0.0, 1.0), (0.1, 0.9), (0.237, 0.611)] {
+            let mut worst = [0.0f32; 3];
+            for (index, direction) in [Direction::Forward, Direction::Backward, Direction::Levitate].into_iter().enumerate() {
+                let mut engine = Engine::new(RATE);
+                engine.settings.direction = direction;
+                engine.settings.rate = SyncRate::Sixteenth;
+                engine.settings.start = start;
+                engine.settings.end = end;
+                engine.set_sample(Some(prepared(vec![tone.clone()])));
+                let left = play_along(&mut engine, 0.0, 512, 100, sample_only()).0;
+                worst[index] = biggest_step(&left[60..]);
+            }
+            let [forward, backward, levitate] = worst;
+            assert!(levitate <= natural * 1.15, "{start}-{end}: {levitate} against the tone's own {natural}");
+            assert!(levitate <= forward.max(backward) * 1.001, "{start}-{end}: no worse than Forward or Backward: {worst:?}");
+        }
+    }
+
+    #[test]
+    fn levitate_with_restart_ducks_with_the_way_it_plays() {
+        // A 400 ms kick: played forward its hit is at the start of the step, backward at the end
+        // of the pass, and the duck (which also drives Dream Eater's swell) follows.
+        let mut engine = Engine::new(RATE);
+        engine.settings.direction = Direction::Levitate;
+        engine.set_sample(Some(prepared(vec![kick(400.0)])));
+        engine.finish_analysis();
+        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
+        let (gain, _) = play_along(&mut engine, 0.0, 500, 144, gains);
+        let deepest = |range: std::ops::Range<usize>| {
+            range.clone().min_by(|&a, &b| gain[a].total_cmp(&gain[b])).unwrap() - range.start
+        };
+        let forward = deepest(0..24_000);
+        let backward = deepest(24_000..48_000);
+        assert!(forward < 2_400, "forward ducks at the hit, {forward} frames in");
+        assert!((16_800..19_300).contains(&backward), "backward ducks as the pass reaches the hit, {backward} frames in");
+        assert!(gain[48_000 + forward] < 0.2, "and forward again on the third step");
+    }
+
+    #[test]
+    fn levitate_judges_its_peak_both_ways_with_restart() {
+        let mut engine = levitate_with_restart(0.25);
+        let key = engine.analysis_key(engine.sample().unwrap());
+        assert!(key.fades_out, "each pass fades out at a handle mid-sample, like Forward");
+        assert_eq!(key.alternates, Some(false), "and the way back stops at the file's start, needing no fade");
+        engine.finish_analysis();
+        assert!(engine.analysis.peak().is_some_and(|peak| peak > 0.0));
+        engine.settings.restart = false;
+        assert_eq!(engine.analysis_key(engine.sample().unwrap()).alternates, None, "without Restart it bounces");
     }
 
     #[test]

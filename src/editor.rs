@@ -1790,7 +1790,8 @@ mod tests {
         let panel = panel_texts(&editor.screen);
         let labels: Vec<String> = KeyChoice::all().map(|choice| choice.label()).collect();
         assert_eq!(labels.len(), 13);
-        assert!(labels.iter().all(|label| !panel.contains(label)), "nothing on the panel names a key");
+        let named: Vec<&String> = panel.iter().filter(|text| labels.contains(text)).collect();
+        assert_eq!(named, ["E"], "nothing on the panel names a key; the E is the End handle's tab");
         editor.screen.take_edits();
 
         editor.move_to(dream_eater);
@@ -1799,7 +1800,11 @@ mod tests {
         editor.screen.right_button(false);
         editor.settle();
         let shown = editor.screen.texts();
-        assert!(labels.iter().all(|label| shown.contains(label)), "Auto and the twelve keys: {shown:?}");
+        let count = |texts: &[String], label: &String| texts.iter().filter(|text| *text == label).count();
+        assert!(
+            labels.iter().all(|label| count(&shown, label) == count(&panel, label) + 1),
+            "Auto and the twelve keys, once each: {shown:?}"
+        );
         assert_eq!(editor.plugin.params.dream_key.get(), KeyChoice::Auto);
 
         let d_major = editor.screen.find_text(&KeyChoice::Fixed(2).label()).unwrap();

@@ -31,7 +31,7 @@ The HP and LP filters work on the sample itself as it plays. An envelope followe
 
 Fully counter-clockwise reads Off, and the track is untouched, bit for bit. Dream Eater listens to the track before the ducking, and the blended sample doesn't go through it.
 
-**Choosing the key yourself.** Right-click the Dream Eater knob for a menu with **Auto** (the default) and the twelve keys, each shown as a major key and its relative minor (C major / A minor, and so on). Nothing on the panel shows the choice. It is saved in the project and in user presets. Factory presets and `--` set it back to Auto, and projects and presets from before 1.6 load on Auto. Right-clicking doesn't turn the knob, and changing the key doesn't add a `*` to the preset name.
+**Choosing the key yourself.** Right-click the Dream Eater knob for a menu with **Auto** (the default) and the twelve keys, each shown by its root alone: C, C#, D, D#, E, F, F#, G, G#, A, A#, B. A key also covers its relative minor (C covers A minor), since the chord is the pentatonic both share. Nothing on the panel shows the choice. It is saved in the project and in user presets. Factory presets and `--` set it back to Auto, and projects and presets from before 1.6 load on Auto. Right-clicking doesn't turn the knob, and changing the key doesn't add a `*` to the preset name.
 
 The output is always at unity gain. There is no output level control.
 

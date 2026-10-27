@@ -14,7 +14,7 @@ use std::f64::consts::{PI, TAU};
 use crate::dsp::{one_pole, Svf};
 
 /// Pitch class names, C first.
-pub const KEY_NAMES: [&str; 12] = ["C", "C#/Db", "D", "D#/Eb", "E", "F", "F#/Gb", "G", "G#/Ab", "A", "A#/Bb", "B"];
+pub const KEY_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 /// How keys are stored in the plugin state.
 const KEY_IDS: [&str; 12] = ["c", "c#", "d", "d#", "e", "f", "f#", "g", "g#", "a", "a#", "b"];
 /// Where Dream Eater tunes while no key has been heard with confidence.
@@ -38,13 +38,12 @@ impl KeyChoice {
         std::iter::once(KeyChoice::Auto).chain((0..12).map(KeyChoice::Fixed))
     }
 
+    /// What the key menu shows: Auto, or just the root, as in C or F#. The relative minor isn't
+    /// named, since the chord is the pentatonic both share.
     pub fn label(self) -> String {
         match self {
             KeyChoice::Auto => "Auto".to_owned(),
-            KeyChoice::Fixed(key) => {
-                let key = key as usize % 12;
-                format!("{} major / {} minor", KEY_NAMES[key], KEY_NAMES[(key + 9) % 12])
-            }
+            KeyChoice::Fixed(key) => KEY_NAMES[key as usize % 12].to_owned(),
         }
     }
 
@@ -1231,9 +1230,10 @@ mod tests {
         assert_eq!(serde_json::to_string(&KeyChoice::Auto).unwrap(), r#""auto""#);
         assert_eq!(serde_json::to_string(&KeyChoice::Fixed(1)).unwrap(), r#""c#""#);
         assert!(serde_json::from_str::<KeyChoice>(r#""h""#).is_err());
-        assert_eq!(KeyChoice::Fixed(0).label(), "C major / A minor");
-        assert_eq!(KeyChoice::Fixed(3).label(), "D#/Eb major / C minor");
-        assert_eq!(KeyChoice::Fixed(1).label(), "C#/Db major / A#/Bb minor");
+        assert_eq!(
+            KeyChoice::all().map(KeyChoice::label).collect::<Vec<_>>(),
+            ["Auto", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        );
     }
 
     #[test]

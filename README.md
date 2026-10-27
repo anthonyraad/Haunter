@@ -39,7 +39,7 @@ The output is always at unity gain. There is no output level control.
 
 | Control | What it does |
 | --- | --- |
-| Preset menu | **--** (no sample, default settings), the factory presets **Paper**, **Stone**, **Umber**, **Water**, and **Wind**, then your saved presets. A `*` after the name means something has changed since the preset was loaded or saved. |
+| Preset menu | **--** (no sample, default settings), the factory presets **Gaze**, **Paper**, **Press**, **Spin**, **Stone**, **Umber**, **Water**, and **Wind**, then your saved presets. A `*` after the name means something has changed since the preset was loaded or saved. |
 | Save | Asks for a name in place of the preset controls. Type it and press Enter or OK. Escape or Cancel closes the prompt without saving. |
 | Waveform | Shows the loaded sample, with its name and length under the title. Drag the **S** and **E** handles to set the region. The orange line is the playhead. To load a sample, drop a WAV, AIFF, or MP3 file anywhere on the window, or click the waveform area to pick one. While it is empty, it reads "Drop a sample here" and a click anywhere in it opens the file picker. Once a sample is loaded, a click that isn't on a handle and isn't a drag opens it. The pointer turns into a hand where a click opens the picker, and into a sideways arrow over a handle. |
 | Restart | On by default. On: the region plays once from Start on every Rate step. Off: the region loops continuously while the transport plays. Rate then reads ∞ and ignores dragging and double-clicks. |
@@ -65,7 +65,7 @@ Projects saved before 1.7 had a Reverse toggle instead of Direction. They load w
 The preset menu sits left of **Save**, at the right of the title. The preset and Direction menus show their text centred, on the button and in the list.
 
 - **--** is the empty preset: no sample, every setting at its default. It is first in the menu, and a new Haunter starts on it. Load a sample from there as usual. Version 1.4 called it Init; projects saved on Init (or on `--` with 1.3) reopen on `--`.
-- **Paper** (20.6 s), **Stone** (8.3 s), **Umber** (10.4 s), **Water** (4.2 s), and **Wind** (5.6 s) are the factory presets, listed alphabetically. Each one's sample is built into the plugin, so they work on any machine. They use the default settings, and the sample shows under the preset's name.
+- **Gaze** (8.2 s), **Paper** (20.6 s), **Press** (8.3 s), **Spin** (16.0 s), **Stone** (8.3 s), **Umber** (10.4 s), **Water** (4.2 s), and **Wind** (5.6 s) are the factory presets, listed alphabetically. Each one's sample is built into the plugin, so they work on any machine. They use the default settings, and the sample shows under the preset's name.
 - **Save** stores the loaded sample's audio and every setting (Start, End, Restart, Direction, and all the knobs) as a preset with the name you type. Saved presets are listed after the factory ones and are there in every project. Saving under an existing name replaces that preset. Names can't contain `< > : " / \ | ? *` and can't be `--`, `Init`, or a factory preset's name. A preset you saved before 1.4 under a name that is now a factory preset's still shows among your presets. When the selected preset is one of yours, the prompt starts with its name, so pressing Enter updates it.
 - Choosing a preset sends each setting to Cubase the same way turning a knob does, and loads its sample. Choosing the selected preset again puts it back the way it was saved.
 - The name gets a `*`, as in `Water*` or `--*`, when any setting, Start or End, Restart or Direction, or the sample differs from the preset. Choosing the preset again or saving clears it.
@@ -138,7 +138,7 @@ The unit tests cover:
   - with Restart off, Rate keeps its face, reads a grey ∞ (and egui's font has that glyph), and ignores drags, double-clicks, and the scroll wheel, and with Restart on again it reads 1/4 and turns;
   - every knob turns when dragged, and Dream Eater sits in Output's old place with its dark face, reads Off, and turns;
   - right-clicking Dream Eater opens a menu with Auto and the twelve keys, and choosing one sets the key without sending any edit or turning the knob. The panel's text is the same before and after, and a right-drag turns nothing;
-  - a new instance shows `--`, and the menu lists `--`, Paper, Stone, Umber, Water, Wind, then saved presets;
+  - a new instance shows `--`, and the menu lists `--`, Gaze, Paper, Press, Spin, Stone, Umber, Water, Wind, then saved presets;
   - choosing Water from the menu loads its built-in sample, sends every parameter at its default, and the audio thread plays it, `--` clears it, and loading a sample then shows `--*`;
   - choosing each factory preset loads its own built-in sample;
   - choosing a saved preset sends its values, loads its sample, and sets its Dream Eater key, factory presets and `--` set the key back to Auto, and a preset saved after the menu was last opened is shown in it;

@@ -122,7 +122,7 @@ impl Shared {
     }
 }
 
-/// Decodes and installs a WAV or AIFF on a background thread.
+/// Decodes and installs a WAV, AIFF, or MP3 on a background thread.
 pub fn load_file(path: PathBuf, params: Arc<HaunterParams>, shared: Arc<Shared>) {
     if shared.loading.swap(true, Ordering::AcqRel) {
         return;
@@ -668,6 +668,33 @@ mod tests {
     }
 
     #[test]
+    fn a_loaded_mp3_is_embedded_in_the_state_like_a_wav() {
+        let folder = TempDir::new();
+        std::fs::create_dir_all(folder.path()).unwrap();
+        let path = folder.path().join("ghost tone.mp3");
+        std::fs::write(&path, include_bytes!("../tests/fixtures/tone-1khz.mp3")).unwrap();
+
+        let mut original = Haunter::default();
+        load_file(path.clone(), original.params.clone(), original.shared.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while original.shared.loading.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(*original.shared.status.lock().unwrap(), "", "loaded without an error");
+        let loaded = original.params.sample.read(|s| s.cloned()).expect("the MP3 is the sample");
+        assert_eq!(loaded.name, "ghost tone.mp3");
+        assert_eq!((loaded.sample_rate, loaded.channels.len(), loaded.frames()), (44_100.0, 2, 11_025));
+
+        let state = save_state(&original);
+        std::fs::remove_file(&path).unwrap();
+        let mut restored = Haunter::default();
+        load_state(&restored, &state);
+        assert_eq!(restored.params.sample.read(|s| s.cloned()), Some(loaded), "decoded audio comes back bit for bit");
+        assert_eq!(render(&mut original, 48_000.0), render(&mut restored, 48_000.0));
+        assert!(restored.engine.sample().is_some_and(|sample| sample.frames() == 12_000), "resampled to the host rate");
+    }
+
+    #[test]
     fn parameter_ids_are_stable() {
         let plugin = Haunter::default();
         let ids: Vec<String> = plugin.params.param_map().into_iter().map(|(id, _, _)| id).collect();
@@ -777,7 +804,7 @@ mod tests {
         restored.params.deserialize_fields(&fields);
         let selection = restored.params.preset.get();
         assert_eq!(selection.choice, Choice::None);
-        assert_eq!(selection.choice.name(), "Init", "what 1.3 showed as --");
+        assert_eq!(selection.choice.name(), "--", "what 1.4 showed as Init, and 1.3 as --");
         assert!(!selection.is_modified(restored.params.as_ref(), restored.params.sample.fingerprint(), false));
     }
 

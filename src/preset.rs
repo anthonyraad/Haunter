@@ -11,9 +11,9 @@ use crate::audio_file;
 use crate::sample::EmbeddedSample;
 
 /// What the preset menu shows when no preset is selected: no sample and default settings.
-pub const NO_PRESET: &str = "Init";
-/// What 1.3 called [`NO_PRESET`]. Still refused as a user preset name.
-const OLD_NO_PRESET: &str = "--";
+pub const NO_PRESET: &str = "--";
+/// What 1.4 called [`NO_PRESET`]. Still refused as a user preset name.
+const OLD_NO_PRESET: &str = "Init";
 
 /// Factory presets, in menu order, with the sample each one loads. They use default settings.
 const FACTORY: &[(&str, &[u8])] = &[
@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn factory_presets_are_listed_alphabetically() {
         assert_eq!(factory_names().collect::<Vec<_>>(), ["Paper", "Stone", "Umber", "Water", "Wind"]);
-        assert_eq!(Choice::None.name(), "Init");
+        assert_eq!(Choice::None.name(), "--");
     }
 
     #[test]
@@ -322,7 +322,8 @@ mod tests {
         assert_eq!(water.channels.len(), 2);
         assert_eq!(water.frames(), 184_275);
         assert!(Preset::factory("Fire").is_err());
-        assert!(Preset::factory("Init").is_err(), "Init is no preset at all, not a factory one");
+        assert!(Preset::factory("--").is_err(), "-- is no preset at all, not a factory one");
+        assert!(Preset::factory("Init").is_err());
     }
 
     #[test]

@@ -35,7 +35,9 @@ const ROTARY_END: f32 = std::f32::consts::PI * 2.8;
 const KNOB_COLUMNS: f32 = 5.0;
 /// The meter's full scale, in dB of reduction.
 const METER_RANGE_DB: f32 = 36.0;
-const AUDIO_EXTENSIONS: [&str; 5] = ["wav", "wave", "aif", "aiff", "aifc"];
+const AUDIO_EXTENSIONS: [&str; 6] = ["wav", "wave", "aif", "aiff", "aifc", "mp3"];
+/// How far either side of a Start or End handle a press grabs it instead of loading a file.
+const HANDLE_REACH: f32 = 12.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Handle {
@@ -73,7 +75,9 @@ pub fn create(params: Arc<HaunterParams>, shared: Arc<Shared>, state: Arc<EguiSt
             configure(context);
         },
         move |context, setter, state| {
-            draw(context, setter, &params, &shared, state);
+            if draw(context, setter, &params, &shared, state).browse {
+                open_file_dialog(params.clone(), shared.clone(), state.dialog_open.clone());
+            }
             context.request_repaint();
         },
     )
@@ -91,6 +95,9 @@ struct Drawn {
     /// The preset menu and the Save button, or nothing while the Save prompt is open.
     preset_menu: Rect,
     save: Rect,
+    waveform: Rect,
+    /// The waveform was clicked to choose a file.
+    browse: bool,
     restart: Rect,
     reverse: Rect,
     /// The first row of knobs, which starts with Rate.
@@ -121,12 +128,14 @@ fn draw(
         load_file(path, params.clone(), shared.clone());
     }
     let hovering_files = context.input(|input| !input.raw.hovered_files.is_empty());
+    let busy = shared.loading.load(Ordering::Acquire) || state.dialog_open.load(Ordering::Acquire);
 
     egui::CentralPanel::default()
         .show(context, |ui| {
-            let [preset_menu, save] = header(ui, setter, params, shared, state);
+            let [preset_menu, save] = header(ui, setter, params, shared, state, busy);
             ui.add_space(8.0);
-            waveform(ui, setter, params, shared, state, hovering_files);
+            let can_browse = !busy && !hovering_files;
+            let (waveform, browse) = waveform(ui, setter, params, shared, state, hovering_files, can_browse);
             ui.add_space(10.0);
             let ([restart, reverse], restart_on) = toggles_and_meter(ui, setter, params, shared, state);
             ui.add_space(8.0);
@@ -146,7 +155,7 @@ fn draw(
                 ("Blend", &params.blend, true, Face::Plain),
                 ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level }),
             ]);
-            Drawn { used: ui.min_rect(), preset_menu, save, restart, reverse, upper_knobs, lower_knobs }
+            Drawn { used: ui.min_rect(), preset_menu, save, waveform, browse, restart, reverse, upper_knobs, lower_knobs }
         })
         .inner
 }
@@ -157,14 +166,16 @@ fn is_audio_file(path: &std::path::Path) -> bool {
         .is_some_and(|ext| AUDIO_EXTENSIONS.iter().any(|known| ext.eq_ignore_ascii_case(known)))
 }
 
-/// The title, then the preset menu, Save, and Load, or the Save prompt in their place. Returns
-/// where the preset menu and Save were drawn.
+/// The title, then the preset menu and Save, or the Save prompt in their place. Under them, the
+/// loaded sample or what went wrong, when there is either. Returns where the preset menu and Save
+/// were drawn.
 fn header(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
     params: &Arc<HaunterParams>,
     shared: &Arc<Shared>,
     state: &mut EditorState,
+    busy: bool,
 ) -> [Rect; 2] {
     let mut drawn = [Rect::NOTHING; 2];
     ui.horizontal(|ui| {
@@ -173,10 +184,6 @@ fn header(
             if state.naming.is_some() {
                 naming_prompt(ui, params, shared, state);
                 return;
-            }
-            let busy = shared.loading.load(Ordering::Acquire) || state.dialog_open.load(Ordering::Acquire);
-            if ui.add_enabled(!busy, header_button("Load", 86.0)).clicked() {
-                open_file_dialog(params.clone(), shared.clone(), state.dialog_open.clone());
             }
             let save = ui
                 .add_enabled(!busy, header_button("Save", 64.0))
@@ -193,20 +200,20 @@ fn header(
             drawn = [preset_menu(ui, setter, params, shared, state, !busy), save.rect];
         });
     });
-    let (line, color) = if let Some(error) = &state.save_error {
-        (error.clone(), ERROR)
+    let line = if let Some(error) = &state.save_error {
+        Some((error.clone(), ERROR))
     } else {
         let status = shared.status.lock().unwrap().clone();
-        let line = if !status.is_empty() {
-            status
-        } else if let Some(overview) = shared.overview.lock().unwrap().as_ref() {
-            format!("{} · {:.0} ms", overview.name, overview.seconds * 1000.0)
+        if !status.is_empty() {
+            Some((status, SUBTLE))
         } else {
-            "Load a kick or any one-shot. Its volume shape ducks this track on the tempo grid.".to_owned()
-        };
-        (line, SUBTLE)
+            let overview = shared.overview.lock().unwrap();
+            overview.as_ref().map(|overview| (format!("{} · {:.0} ms", overview.name, overview.seconds * 1000.0), SUBTLE))
+        }
     };
-    ui.label(egui::RichText::new(line).color(color));
+    if let Some((line, color)) = line {
+        ui.label(egui::RichText::new(line).color(color));
+    }
     drawn
 }
 
@@ -226,7 +233,7 @@ fn preset_label(params: &HaunterParams, shared: &Shared, state: &EditorState) ->
     format!("{}{}", selection.choice.name(), if modified { "*" } else { "" })
 }
 
-/// The preset menu: Init, the factory presets, then the user's. Returns where it was drawn.
+/// The preset menu: `--`, the factory presets, then the user's. Returns where it was drawn.
 fn preset_menu(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
@@ -345,7 +352,7 @@ fn open_file_dialog(params: Arc<HaunterParams>, shared: Arc<Shared>, dialog_open
     std::thread::spawn(move || {
         let picked = rfd::FileDialog::new()
             .set_title("Load a sample into Haunter")
-            .add_filter("WAV or AIFF", &AUDIO_EXTENSIONS)
+            .add_filter("WAV, AIFF, or MP3", &AUDIO_EXTENSIONS)
             .pick_file();
         dialog_open.store(false, Ordering::Release);
         if let Some(path) = picked {
@@ -354,6 +361,9 @@ fn open_file_dialog(params: Arc<HaunterParams>, shared: Arc<Shared>, dialog_open
     });
 }
 
+/// The sample with its Start and End handles. A click that isn't on a handle, or anywhere while
+/// there is no sample, asks for a file when `can_browse`. Returns where it was drawn and whether
+/// it was clicked to choose a file.
 fn waveform(
     ui: &mut egui::Ui,
     setter: &ParamSetter,
@@ -361,11 +371,14 @@ fn waveform(
     shared: &Shared,
     state: &mut EditorState,
     hovering_files: bool,
-) {
+    can_browse: bool,
+) -> (Rect, bool) {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 180.0), egui::Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     painter.rect(rect, CornerRadius::same(6), DISC, Stroke::new(1.0_f32, OUTLINE), StrokeKind::Inside);
+    // The click that closes the preset menu shouldn't also open the file browser.
+    let can_browse = can_browse && !state.menu_open;
 
     let overview = shared.overview.lock().unwrap().clone();
     let inner = rect.shrink2(egui::vec2(10.0, 14.0));
@@ -373,20 +386,19 @@ fn waveform(
     let fraction_of = |x: f32| ((x - inner.left()) / inner.width()).clamp(0.0, 1.0);
 
     let Some(overview) = overview else {
-        painter.text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "Drop a WAV or AIFF here, or click Load",
-            egui::FontId::proportional(15.0),
-            SUBTLE,
-        );
+        painter.text(rect.center(), egui::Align2::CENTER_CENTER, "Drop a sample here", egui::FontId::proportional(15.0), SUBTLE);
+        if can_browse && response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
         drop_overlay(&painter, rect, hovering_files);
-        return;
+        return (rect, can_browse && response.clicked());
     };
 
     let start = params.start.modulated_plain_value();
     let end = params.end.modulated_plain_value();
     let (low, high) = (start.min(end), start.max(end));
+    let on_handle = |x: f32| (x - x_of(start)).abs() < HANDLE_REACH || (x - x_of(end)).abs() < HANDLE_REACH;
+    let browse = can_browse && response.clicked() && response.interact_pointer_pos().is_some_and(|pointer| !on_handle(pointer.x));
 
     // Handle dragging: grab whichever handle is nearer the pointer.
     if response.drag_started() {
@@ -414,9 +426,10 @@ fn waveform(
         }
     }
     if let Some(pointer) = response.hover_pos() {
-        let near = (pointer.x - x_of(start)).abs() < 12.0 || (pointer.x - x_of(end)).abs() < 12.0;
-        if near || state.dragging.is_some() {
+        if on_handle(pointer.x) || state.dragging.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        } else if can_browse {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
     }
 
@@ -466,6 +479,7 @@ fn waveform(
     }
 
     drop_overlay(&painter, rect, hovering_files);
+    (rect, browse)
 }
 
 fn handle_param(params: &HaunterParams, handle: Handle) -> &FloatParam {
@@ -789,6 +803,8 @@ mod tests {
         time: f64,
         /// Everything painted in the last frame.
         shapes: Vec<egui::Shape>,
+        /// The mouse cursor the last frame asked for.
+        cursor_icon: egui::CursorIcon,
     }
 
     impl Screen {
@@ -802,7 +818,15 @@ mod tests {
                 ..Default::default()
             };
             input.viewports.insert(egui::ViewportId::ROOT, viewport);
-            Screen { host: Host::default(), context, input, cursor: None, time: 0.0, shapes: Vec::new() }
+            Screen {
+                host: Host::default(),
+                context,
+                input,
+                cursor: None,
+                time: 0.0,
+                shapes: Vec::new(),
+                cursor_icon: egui::CursorIcon::Default,
+            }
         }
 
         /// baseview's `CursorMoved`.
@@ -829,6 +853,7 @@ mod tests {
             let setter = ParamSetter::new(&self.host);
             let result = ui(&self.context, &setter);
             let output = self.context.end_pass();
+            self.cursor_icon = output.platform_output.cursor_icon;
             fn flatten(shape: egui::Shape, into: &mut Vec<egui::Shape>) {
                 match shape {
                     egui::Shape::Vec(shapes) => shapes.into_iter().for_each(|shape| flatten(shape, into)),
@@ -910,6 +935,8 @@ mod tests {
         screen: Screen,
         state: EditorState,
         presets: TempDir,
+        /// How many frames asked for the file browser.
+        browsed: usize,
     }
 
     impl Editor {
@@ -928,12 +955,14 @@ mod tests {
                 plugin.shared.playhead.store(0.3, Ordering::Relaxed);
                 plugin.shared.gain_reduction_db.store(9.0, Ordering::Relaxed);
             }
-            Editor { plugin, screen: Screen::new(pixels_per_point), state: EditorState::default(), presets }
+            Editor { plugin, screen: Screen::new(pixels_per_point), state: EditorState::default(), presets, browsed: 0 }
         }
 
         fn frame(&mut self) -> Drawn {
             let Editor { plugin, screen, state, .. } = self;
-            screen.frame(|context, setter| draw(context, setter, &plugin.params, &plugin.shared, state))
+            let drawn = screen.frame(|context, setter| draw(context, setter, &plugin.params, &plugin.shared, state));
+            self.browsed += drawn.browse as usize;
+            drawn
         }
 
         /// The first pass measures text, the second lays out with those sizes.
@@ -1008,14 +1037,119 @@ mod tests {
             assert!(used.max.x <= WIDTH as f32, "too wide: {used:?}");
             assert!(used.max.y <= HEIGHT as f32, "too tall: {used:?}");
             assert!(used.max.y > HEIGHT as f32 * 0.8, "unexpectedly short layout: {used:?}");
+            assert!(editor.screen.find_text("Load").is_none(), "there is no Load button");
             if !naming {
-                let load = editor.screen.find_text("Load").expect("Load is drawn");
                 let title = editor.screen.find_text("Haunter").expect("the title is drawn");
                 assert!(title.right() < drawn.preset_menu.left(), "the title, then the preset menu");
                 assert!(drawn.preset_menu.right() <= drawn.save.left(), "the menu is left of Save");
-                assert!(drawn.save.right() <= load.left(), "Save is left of Load");
+                assert!(drawn.save.right() > WIDTH as f32 - 20.0, "Save is at the right edge: {:?}", drawn.save);
+                assert!(drawn.save.center().y < title.bottom() && drawn.save.bottom() > title.center().y, "on the title's line");
             }
         }
+    }
+
+    #[test]
+    fn without_a_sample_nothing_sits_between_the_title_and_the_waveform() {
+        let mut editor = Editor::new(false);
+        let drawn = editor.settle();
+        let title = editor.screen.find_text("Haunter").unwrap();
+        let header_bottom = title.bottom().max(drawn.save.bottom()).max(drawn.preset_menu.bottom());
+        assert!(drawn.waveform.top() - header_bottom < 14.0, "no gap: {header_bottom} then {:?}", drawn.waveform);
+        let between: Vec<String> = editor
+            .screen
+            .text_shapes()
+            .into_iter()
+            .filter(|(_, rect, _)| rect.center().y > header_bottom && rect.center().y < drawn.waveform.top())
+            .map(|(text, _, _)| text)
+            .collect();
+        assert!(between.is_empty(), "{between:?}");
+        assert!(!editor.screen.texts().iter().any(|text| text.contains("one-shot")), "the old hint is gone");
+
+        let painted: Vec<String> = editor
+            .screen
+            .text_shapes()
+            .into_iter()
+            .filter(|(_, rect, _)| drawn.waveform.contains(rect.center()))
+            .map(|(text, _, _)| text)
+            .collect();
+        assert_eq!(painted, ["Drop a sample here"]);
+
+        crate::install_sample(another_sample(), &editor.plugin.params, &editor.plugin.shared);
+        let loaded = editor.settle();
+        assert!(editor.screen.texts().iter().any(|text| text.starts_with("snare.wav · 50 ms")), "the sample is named under the title");
+        assert!(loaded.waveform.top() > drawn.waveform.top());
+        assert!(editor.screen.find_text("Drop a sample here").is_none());
+    }
+
+    #[test]
+    fn a_click_anywhere_on_the_empty_waveform_opens_the_file_browser() {
+        let mut editor = Editor::new(false);
+        let waveform = editor.settle().waveform;
+        for spot in [waveform.center(), waveform.left_top() + egui::vec2(4.0, 4.0), waveform.right_bottom() - egui::vec2(4.0, 4.0)] {
+            editor.move_to(spot);
+            assert_eq!(editor.screen.cursor_icon, egui::CursorIcon::PointingHand, "a hand over {spot:?}");
+            let before = editor.browsed;
+            editor.click_at(spot);
+            assert_eq!(editor.browsed, before + 1, "one click at {spot:?} asks once");
+        }
+        let header = editor.frame().save;
+        editor.click_at(Pos2::new(WIDTH as f32 * 0.4, header.center().y));
+        let below = Pos2::new(waveform.center().x, waveform.bottom() + 6.0);
+        editor.click_at(below);
+        assert_eq!(editor.browsed, 3, "only the waveform opens it");
+        assert_ne!(editor.screen.cursor_icon, egui::CursorIcon::PointingHand);
+        assert!(editor.screen.take_edits().is_empty());
+
+        editor.plugin.shared.loading.store(true, Ordering::Release);
+        editor.click_at(waveform.center());
+        editor.plugin.shared.loading.store(false, Ordering::Release);
+        editor.state.dialog_open.store(true, Ordering::Release);
+        editor.click_at(waveform.center());
+        assert_eq!(editor.browsed, 3, "not while a file is loading or the browser is already open");
+    }
+
+    #[test]
+    fn a_plain_click_on_a_loaded_waveform_opens_the_browser_but_handles_and_drags_do_not() {
+        let mut editor = Editor::new(true);
+        let waveform = editor.settle().waveform;
+        let (start_x, end_x) = (waveform.left() + 10.0, waveform.right() - 10.0);
+        let start = editor.plugin.params.start.as_ptr();
+
+        editor.move_to(waveform.center());
+        assert_eq!(editor.screen.cursor_icon, egui::CursorIcon::PointingHand);
+        editor.screen.take_edits();
+        editor.click_at(waveform.center());
+        assert_eq!(editor.browsed, 1);
+        assert!(editor.screen.take_edits().is_empty(), "a click moves no handle");
+
+        for x in [start_x, start_x + 6.0, end_x - 6.0, end_x] {
+            let spot = Pos2::new(x, waveform.center().y);
+            editor.move_to(spot);
+            assert_eq!(editor.screen.cursor_icon, egui::CursorIcon::ResizeHorizontal, "over a handle at {x}");
+            editor.click_at(spot);
+        }
+        editor.click_at(Pos2::new(start_x, waveform.top() + 10.0));
+        assert_eq!(editor.browsed, 1, "clicks on the handles and their tabs don't open it");
+
+        editor.move_to(Pos2::new(start_x + 30.0, waveform.center().y));
+        editor.drag(egui::vec2(80.0, 0.0));
+        assert_eq!(editor.browsed, 1, "neither does dragging");
+        let edits = editor.screen.take_edits();
+        assert_eq!(edits.first(), Some(&Edit::Begin(start)), "the drag moved Start: {edits:?}");
+        assert!(edits.iter().any(|edit| matches!(edit, Edit::Set(p, value) if *p == start && *value > 0.0)), "{edits:?}");
+    }
+
+    #[test]
+    fn closing_the_preset_menu_on_the_waveform_does_not_open_the_browser() {
+        let mut editor = Editor::new(false);
+        let waveform = editor.settle().waveform;
+        open_preset_menu(&mut editor);
+        editor.click_at(Pos2::new(waveform.left() + 60.0, waveform.center().y));
+        editor.frame();
+        assert!(!editor.state.menu_open, "the click closed the menu");
+        assert_eq!(editor.browsed, 0);
+        editor.click_at(Pos2::new(waveform.left() + 60.0, waveform.center().y));
+        assert_eq!(editor.browsed, 1, "the next click does");
     }
 
     #[test]
@@ -1344,9 +1478,9 @@ mod tests {
     fn choosing_water_loads_its_embedded_sample_with_default_settings() {
         let mut editor = Editor::new(false);
         editor.settle();
-        assert_eq!(shown_preset(&mut editor), "Init", "a new instance has no preset and no sample");
+        assert_eq!(shown_preset(&mut editor), "--", "a new instance has no preset and no sample");
         let entries: Vec<String> = open_preset_menu(&mut editor).into_iter().map(|(text, _)| text).collect();
-        assert_eq!(entries, ["Init", "Paper", "Stone", "Umber", "Water", "Wind"]);
+        assert_eq!(entries, ["--", "Paper", "Stone", "Umber", "Water", "Wind"]);
         close_preset_menu(&mut editor);
         editor.screen.take_edits();
 
@@ -1374,15 +1508,15 @@ mod tests {
         let playing = editor.plugin.engine.sample().expect("the audio thread plays it");
         assert_eq!(playing.frames(), (184_275.0 * 48_000.0 / 44_100.0f64).round() as usize, "resampled to the host rate");
 
-        pick_preset(&mut editor, "Init");
-        assert!(params.sample.read(|s| s.is_none()), "Init means no sample");
+        pick_preset(&mut editor, "--");
+        assert!(params.sample.read(|s| s.is_none()), "-- means no sample");
         assert_eq!(params.preset.get().choice, Choice::None);
-        assert_eq!(shown_preset(&mut editor), "Init");
+        assert_eq!(shown_preset(&mut editor), "--");
         editor.plugin.adopt_pending_sample();
         assert!(editor.plugin.engine.sample().is_none());
 
         crate::install_sample(another_sample(), &params, &editor.plugin.shared);
-        assert_eq!(shown_preset(&mut editor), "Init*", "a loaded sample changes Init");
+        assert_eq!(shown_preset(&mut editor), "--*", "a loaded sample changes --");
     }
 
     #[test]
@@ -1411,7 +1545,7 @@ mod tests {
         let entries: Vec<String> = open_preset_menu(&mut editor).into_iter().map(|(text, _)| text).collect();
         assert_eq!(
             entries,
-            ["Init", "Paper", "Stone", "Umber", "Water", "Wind", "Snare Gate"],
+            ["--", "Paper", "Stone", "Umber", "Water", "Wind", "Snare Gate"],
             "user presets come after the factory ones"
         );
         close_preset_menu(&mut editor);

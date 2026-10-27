@@ -227,10 +227,16 @@ impl Host {
     /// Processes `audio` in place, in blocks of changing size, through separate input and
     /// output buffers unless `in_place`.
     fn process(&mut self, audio: &mut [Vec<f32>], in_place: bool) {
+        self.process_in(audio, in_place, 0);
+    }
+
+    /// As `process`, in blocks of `block` frames, or of changing size if it is 0.
+    fn process_in(&mut self, audio: &mut [Vec<f32>], in_place: bool, block_size: usize) {
         let frames = audio[0].len();
         let (mut done, mut block) = (0, 0);
         while done < frames {
-            let count = BLOCKS[block % BLOCKS.len()].min(frames - done);
+            let size = if block_size > 0 { block_size } else { BLOCKS[block % BLOCKS.len()] };
+            let count = size.min(frames - done);
             self.process_block(audio, done, count, in_place);
             done += count;
             block += 1;
@@ -357,11 +363,13 @@ struct Settings {
     dream_eater: f64,
     restart: bool,
     in_place: bool,
+    /// Frames per block, or 0 for blocks of changing size.
+    block: usize,
 }
 
 impl Settings {
     fn at(rate: f64, channels: usize, dream_eater: f64) -> Self {
-        Settings { rate, channels, dream_eater, restart: true, in_place: false }
+        Settings { rate, channels, dream_eater, restart: true, in_place: false, block: 0 }
     }
 }
 
@@ -376,7 +384,7 @@ fn render(music: &[Vec<f32>], settings: &Settings, skip: f64) -> Vec<Vec<f32>> {
     } else {
         music.to_vec()
     };
-    host.process(&mut audio, settings.in_place);
+    host.process_in(&mut audio, settings.in_place, settings.block);
     let from = (skip * settings.rate) as usize;
     audio.into_iter().map(|side| side[from..].to_vec()).collect()
 }
@@ -497,7 +505,8 @@ fn turning_dream_eater_up_mid_song_takes_effect_and_off_is_untouched() {
         let difference: Vec<f32> = second.iter().zip(&off[side][split..]).map(|(a, b)| a - b).collect();
         let from = rate as usize;
         let change = rms(&difference[from..]) / rms(&off[side][split + from..]);
-        assert!(change > 0.3, "side {side}: {change:.3}");
+        // About -11 dB under the track by waveform, while the chord rings in the gaps the duck opens.
+        assert!(change > 0.25, "side {side}: {change:.3}");
     }
 }
 
@@ -555,4 +564,269 @@ fn host_report() {
         added_power(&result.on, &result.off, &D_CHORD, 48_000.0),
         added_power(&result.on, &result.off, &C_CHORD, 48_000.0)
     );
+}
+
+/// A real recording as a stereo track at `rate`: decoded, resampled, looped to `seconds`, and
+/// peak-normalised to -6 dBFS, as a track would arrive from a mixer channel.
+fn real_track(path: &std::path::Path, rate: f64, seconds: f64) -> Vec<Vec<f32>> {
+    let audio = haunter::audio_file::decode_file(path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+    let mut sides: Vec<Vec<f32>> = (0..2)
+        .map(|side| {
+            let channel = &audio.channels[side.min(audio.channels.len() - 1)];
+            haunter::sample::resample(channel, audio.sample_rate, rate)
+        })
+        .collect();
+    let frames = (rate * seconds) as usize;
+    for side in &mut sides {
+        let source = side.clone();
+        *side = (0..frames).map(|n| source[n % source.len()]).collect();
+    }
+    let peak = sides.iter().flatten().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
+    for side in &mut sides {
+        side.iter_mut().for_each(|v| *v *= 0.5 / peak);
+    }
+    sides
+}
+
+/// A factory sample in `presets\`, as a track.
+fn factory_track(name: &str, rate: f64, seconds: f64) -> Vec<Vec<f32>> {
+    real_track(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("presets").join(format!("{name}.wav")), rate, seconds)
+}
+
+/// In-place radix-2 FFT.
+fn fft(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut length = 2;
+    while length <= n {
+        let step = -TAU / length as f64;
+        for start in (0..n).step_by(length) {
+            for k in 0..length / 2 {
+                let (wr, wi) = ((step * k as f64).cos(), (step * k as f64).sin());
+                let (a, b) = (start + k, start + k + length / 2);
+                let tr = re[b] * wr - im[b] * wi;
+                let ti = re[b] * wi + im[b] * wr;
+                re[b] = re[a] - tr;
+                im[b] = im[a] - ti;
+                re[a] += tr;
+                im[a] += ti;
+            }
+        }
+        length <<= 1;
+    }
+}
+
+/// Magnitude spectra of `signal` over Hann windows of 4096 frames, hopping by half a window.
+fn spectra(signal: &[f32]) -> Vec<Vec<f64>> {
+    const SIZE: usize = 4_096;
+    (0..signal.len().saturating_sub(SIZE))
+        .step_by(SIZE / 2)
+        .map(|start| {
+            let mut re: Vec<f64> = (0..SIZE)
+                .map(|n| signal[start + n] as f64 * (0.5 - 0.5 * (TAU * n as f64 / SIZE as f64).cos()))
+                .collect();
+            let mut im = vec![0.0; SIZE];
+            fft(&mut re, &mut im);
+            (0..SIZE / 2).map(|k| re[k].hypot(im[k])).collect()
+        })
+        .collect()
+}
+
+/// How much the magnitude spectrum changes, in dB relative to Off's, frame by frame: what the
+/// ear hears change, unlike a sample-by-sample difference, which also counts a phase shift.
+fn spectral_change_db(on: &[f32], off: &[f32]) -> f64 {
+    let (on, off) = (spectra(on), spectra(off));
+    let (mut change, mut total) = (0.0, 0.0);
+    for (a, b) in on.iter().zip(&off) {
+        for (a, b) in a.iter().zip(b) {
+            change += (a - b).powi(2);
+            total += b * b;
+        }
+    }
+    10.0 * (change / total.max(1e-30)).log10()
+}
+
+/// The MIDI notes Dream Eater's chord rings in `key`: root, fifth, and ninth.
+fn chord_notes(key: u8) -> [f64; 3] {
+    let root = 57.0 + ((key as usize + 3) % 12) as f64;
+    [root, root + 7.0, root + 14.0]
+}
+
+/// What Dream Eater at `settings.dream_eater` does to a real `track`, over its last 6 seconds.
+struct RealChange {
+    /// RMS of the difference from Off, in dB relative to Off.
+    difference_db: f64,
+    spectral_db: f64,
+    loudness_db: f64,
+    peak: f32,
+    /// The key whose chord comes up most, and by how many dB; and how much the other notes from
+    /// A3 to G#5 move.
+    key: u8,
+    chord_db: f64,
+    others_db: f64,
+    spread: f64,
+}
+
+fn real_change(track: &[Vec<f32>], settings: Settings) -> RealChange {
+    let rate = settings.rate;
+    let off = render(track, &Settings { dream_eater: 0.0, ..settings }, 6.0);
+    let on = render(track, &settings, 6.0);
+    let sides: Vec<Vec<f32>> = on.iter().zip(&off).map(|(a, b)| a.iter().zip(b).map(|(a, b)| a - b).collect()).collect();
+    let spread = if sides.len() > 1 { correlation(&sides[0], &sides[1]) } else { 1.0 };
+    let spectral = off.iter().zip(&on).map(|(off, on)| 10f64.powf(spectral_change_db(on, off) / 10.0)).sum::<f64>() / off.len() as f64;
+    let (off, on) = (off.concat(), on.concat());
+    let (key, chord_db) = (0..12u8)
+        .map(|key| (key, band_gain_db(&on, &off, &chord_notes(key), rate)))
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap();
+    let chord = chord_notes(key);
+    let others: Vec<f64> = (57..81).map(|n| n as f64).filter(|n| !chord.iter().any(|c| (c - n).rem_euclid(12.0) == 0.0)).collect();
+    RealChange {
+        difference_db: 20.0 * (rms(&sides.concat()) / rms(&off)).log10(),
+        spectral_db: 10.0 * spectral.log10(),
+        loudness_db: 20.0 * (rms(&on) / rms(&off)).log10(),
+        peak: on.iter().fold(0.0f32, |m, v| m.max(v.abs())),
+        key,
+        chord_db,
+        others_db: band_gain_db(&on, &off, &others, rate),
+        spread,
+    }
+}
+
+impl std::fmt::Display for RealChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "difference {:+.1} dB, spectrum {:+.1} dB, loudness {:+.2} dB, peak {:.3}, chord of {} {:+.1} dB, other notes {:+.1} dB, L/R {:.2}",
+            self.difference_db,
+            self.spectral_db,
+            self.loudness_db,
+            self.peak,
+            haunter::dream::KEY_NAMES[self.key as usize],
+            self.chord_db,
+            self.others_db,
+            self.spread
+        )
+    }
+}
+
+/// Real recordings to report on besides the factory samples, from `HAUNTER_REAL_TRACKS`,
+/// separated by semicolons.
+fn extra_tracks() -> Vec<std::path::PathBuf> {
+    std::env::var("HAUNTER_REAL_TRACKS")
+        .map(|list| list.split(';').filter(|p| !p.trim().is_empty()).map(|p| p.trim().into()).collect())
+        .unwrap_or_default()
+}
+
+/// A legato cello line, as MIDI notes `note_seconds` each, gliding between them: a bowed,
+/// sawtooth-like tone with a body resonance, 5 Hz vibrato, a slow first attack, and a little bow
+/// noise, the noise only in this test signal. Few transients, so only the duck can play the chord.
+fn cello(notes: &[f64], rate: f64, seconds: f64, note_seconds: f64) -> Vec<Vec<f32>> {
+    let frames = (rate * seconds) as usize;
+    let glide = 1.0 - (-1.0 / (0.02 * rate)).exp();
+    let (mut pitch, mut phase, mut seed) = (notes[0], 0.0f64, 0x1234_5678u32);
+    let mut out = vec![Vec::with_capacity(frames), Vec::with_capacity(frames)];
+    let lag = (0.0007 * rate) as usize;
+    let mut tone = Vec::with_capacity(frames);
+    for n in 0..frames {
+        let t = n as f64 / rate;
+        let note = notes[((t / note_seconds) as usize) % notes.len()];
+        pitch += glide * (note - pitch);
+        let vibrato = 0.15 * (TAU * 5.2 * t).sin() * ((t % note_seconds) / 0.3).min(1.0);
+        let hz = midi_hz(pitch + vibrato);
+        phase += TAU * hz / rate;
+        let mut value = 0.0;
+        for h in 1..40 {
+            let f = hz * h as f64;
+            if f > rate / 2.2 {
+                break;
+            }
+            let body = 1.0 + 0.6 * (-((f - 600.0) / 300.0).powi(2)).exp();
+            value += body / (h as f64 * (1.0 + (f / 3_000.0).powi(2))) * (h as f64 * (phase + 0.3)).sin();
+        }
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        value += 0.01 * ((seed >> 8) as f64 / (1u32 << 23) as f64 - 1.0);
+        tone.push(value * (0.5 + 0.5 * (t / 0.25).min(1.0)));
+    }
+    let peak = tone.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    for n in 0..frames {
+        out[0].push((0.5 * tone[n] / peak) as f32);
+        out[1].push((0.475 * tone[n.saturating_sub(lag)] / peak) as f32);
+    }
+    out
+}
+
+/// D minor and C minor cello lines: D3 F3 A3 G3 E3 D3 A2 C3, and the low strings in C minor.
+const CELLO_D_MINOR: [f64; 8] = [50.0, 53.0, 57.0, 55.0, 52.0, 50.0, 45.0, 48.0];
+const CELLO_LOW: [f64; 8] = [36.0, 43.0, 41.0, 38.0, 39.0, 36.0, 31.0, 34.0];
+
+/// Real and realistic tracks Dream Eater must be clearly heard on, as the user hears it: two
+/// factory samples, which are textures with little at the chord's notes, and legato cello.
+fn audible_tracks(rate: f64) -> Vec<(&'static str, Vec<Vec<f32>>)> {
+    vec![
+        ("Paper", factory_track("Paper", rate, 12.0)),
+        ("Stone", factory_track("Stone", rate, 12.0)),
+        ("Wind", factory_track("Wind", rate, 12.0)),
+        ("legato cello in D minor", cello(&CELLO_D_MINOR, rate, 12.0, 1.5)),
+        ("low legato cello", cello(&CELLO_LOW, rate, 12.0, 1.5)),
+    ]
+}
+
+#[test]
+fn dream_eater_is_clearly_audible_on_real_tracks_through_the_vst3_wrapper() {
+    for rate in [48_000.0, 44_100.0] {
+        for (name, track) in audible_tracks(rate) {
+            let result = real_change(&track, Settings { block: 512, ..Settings::at(rate, 2, 1.0) });
+            let label = format!("{name} at {rate} Hz: {result}");
+            assert!(result.spectral_db > -12.0, "{label}: the spectrum changes clearly");
+            assert!(result.difference_db > -12.0, "{label}: the difference is no more than 12 dB under the track");
+            assert!(result.chord_db > 4.0, "{label}: the chord's notes come up");
+            assert!(result.chord_db > result.others_db + 4.0, "{label}: and more than the other notes");
+            assert!(result.loudness_db.abs() < 1.5, "{label}: about as loud as Off");
+            assert!(result.peak <= 1.0, "{label}");
+            assert!(result.spread < 0.5, "{label}: the chord is wide");
+        }
+    }
+}
+
+#[test]
+fn dream_eater_is_audible_on_mono_cello_through_the_vst3_wrapper() {
+    let track = cello(&CELLO_D_MINOR, 48_000.0, 12.0, 1.5);
+    let result = real_change(&track, Settings { block: 512, ..Settings::at(48_000.0, 1, 1.0) });
+    assert!(result.difference_db > -12.0 && result.chord_db > 4.0, "mono: {result}");
+    assert!(result.loudness_db.abs() < 1.5 && result.peak <= 1.0, "mono: {result}");
+}
+
+#[test]
+#[ignore]
+fn real_material_report() {
+    let rate = 48_000.0;
+    let mut tracks: Vec<(String, Vec<Vec<f32>>)> =
+        ["Water", "Paper", "Stone", "Umber", "Wind"].iter().map(|name| (name.to_string(), factory_track(name, rate, 12.0))).collect();
+    for path in extra_tracks() {
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        tracks.push((name, real_track(&path, rate, 12.0)));
+    }
+    tracks.push(("legato cello in D minor".into(), cello(&CELLO_D_MINOR, rate, 12.0, 1.5)));
+    tracks.push(("low legato cello".into(), cello(&CELLO_LOW, rate, 12.0, 1.5)));
+    for (name, track) in &tracks {
+        for amount in [0.1, 0.5, 1.0] {
+            let result = real_change(track, Settings { block: 512, ..Settings::at(rate, 2, amount) });
+            println!("{name} at {amount}: {result}");
+        }
+        let mono = real_change(track, Settings { block: 512, ..Settings::at(rate, 1, 1.0) });
+        println!("{name} in mono at 1: {mono}");
+    }
 }

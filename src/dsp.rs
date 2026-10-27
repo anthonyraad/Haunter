@@ -1528,6 +1528,70 @@ mod tests {
 
     const A_MINOR: &[&[u8]] = &[&[45, 57, 60, 64], &[41, 57, 60, 65], &[48, 55, 60, 64], &[43, 55, 59, 62]];
 
+    /// Inside Dream Eater on real recordings, with Water ducking: the factory samples, and any
+    /// files in `HAUNTER_REAL_TRACKS`, separated by semicolons.
+    #[test]
+    #[ignore]
+    fn real_material_probe() {
+        let water = crate::preset::Preset::factory("Water").unwrap().sample.unwrap();
+        let mut paths: Vec<std::path::PathBuf> = ["Water", "Paper", "Stone", "Umber", "Wind"]
+            .iter()
+            .map(|name| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("presets").join(format!("{name}.wav")))
+            .collect();
+        if let Ok(list) = std::env::var("HAUNTER_REAL_TRACKS") {
+            paths.extend(list.split(';').filter(|p| !p.trim().is_empty()).map(|p| p.trim().into()));
+        }
+        for path in paths {
+            let audio = crate::audio_file::decode_file(&path).unwrap();
+            let left = crate::sample::resample(&audio.channels[0], audio.sample_rate, RATE);
+            let right = crate::sample::resample(&audio.channels[audio.channels.len() - 1], audio.sample_rate, RATE);
+            let frames = 12 * RATE as usize;
+            let peak = left.iter().chain(&right).fold(0.0f32, |m, v| m.max(v.abs())).max(1e-9);
+            let mut sides: Vec<Vec<f32>> =
+                [&left, &right].iter().map(|s| (0..frames).map(|n| 0.5 * s[n % s.len()] / peak).collect()).collect();
+            let mut engine = Engine::new(RATE);
+            engine.set_sample(Some(Arc::new(PreparedSample::new(&water, RATE))));
+            engine.finish_analysis();
+            let mut keys = Vec::new();
+            let mut beat = 0.0;
+            let (l, r) = sides.split_at_mut(1);
+            for (left, right) in l[0].chunks_mut(512).zip(r[0].chunks_mut(512)) {
+                if beat >= 12.0 && engine.dream.probe.frames == 0.0 {
+                    engine.dream.probe = Default::default();
+                }
+                let transport = TransportInfo::playing_at(beat, 120.0, RATE);
+                engine.process(&mut [left, right], &transport, || ducking(1.0));
+                beat += 512.0 * 2.0 / RATE;
+                if keys.last() != Some(&(engine.dream_key(), engine.detected_key())) {
+                    keys.push((engine.dream_key(), engine.detected_key()));
+                }
+                if beat < 12.0 {
+                    engine.dream.probe = Default::default();
+                }
+            }
+            let p = &engine.dream.probe;
+            let n = p.frames.max(1.0);
+            let db = |power: f64| 10.0 * (power / n).max(1e-30).log10();
+            println!(
+                "{}: keys {:?}\n  mid {:.1} dB, delayed {:.1} dB, into resonators {:.1} dB, open {:.2}, raw wet {:.1} dB, \
+                 ducked track {:.1} dB, leveller {:.2} (capped {:.0}%), makeup {:.2}, limiter {:.2}, wet out {:.1} dB",
+                path.file_stem().unwrap().to_string_lossy(),
+                keys,
+                db(p.mid_power),
+                db(p.delayed_power),
+                db(p.input_power),
+                p.open / n,
+                db(p.raw_wet_power),
+                db(p.ducked_power),
+                p.leveller / n,
+                100.0 * p.capped / n,
+                p.makeup / n,
+                p.limiter / n,
+                db(p.wet_out_power),
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn dream_eater_report() {

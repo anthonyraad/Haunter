@@ -773,6 +773,7 @@ impl Engine {
             for (index, channel) in channels.iter().take(2).enumerate() {
                 track[index] = channel[frame];
             }
+            self.dream.set_driven(self.sample.is_some());
             let eaten = self.dream.process(track, channel_count.min(2), envelope, track_gain, gains.dream_eater);
             for (index, channel) in channels.iter_mut().enumerate() {
                 let add = match (channel_count, index) {
@@ -1684,6 +1685,101 @@ mod tests {
             process_track(&mut was_on, &input[24_000..], next_beat, || ducking(0.0)),
             process_track(&mut never_on, &input[24_000..], next_beat, || ducking(0.0)),
         );
+    }
+
+    /// Plays `input` on both channels in 512-frame blocks from beat 0 at 120 bpm with Dream Eater
+    /// at `amount`, no ducking and no blended sample, calling `between` before each block with
+    /// the frame it starts at. Returns the left output.
+    fn play_dream(engine: &mut Engine, input: &[f32], amount: f32, mut between: impl FnMut(&mut Engine, usize)) -> Vec<f32> {
+        let gains = FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: amount };
+        let mut out = Vec::with_capacity(input.len());
+        for (block, chunk) in input.chunks(512).enumerate() {
+            between(engine, block * 512);
+            let transport = TransportInfo::playing_at((block * 512) as f64 * 2.0 / RATE, 120.0, RATE);
+            out.extend(process_track(engine, chunk, transport, || gains));
+        }
+        out
+    }
+
+    /// The same partials as `track`, without the noise, so a click stands out.
+    fn smooth_track(frames: usize) -> Vec<f32> {
+        let partials = [sine(110.0, frames), sine(233.0, frames), sine(587.0, frames)];
+        (0..frames).map(|n| 0.15 * partials.iter().map(|p| p[n]).sum::<f32>()).collect()
+    }
+
+    #[test]
+    fn without_a_sample_dream_eater_is_bit_exact_off() {
+        // There is nothing ducking the track, so Dream Eater at 100% leaves it exactly as Off
+        // does, from a fresh instance's first frame, playing or stopped. (1.7.7 rang a standing
+        // chord here and turned the track down.)
+        let input = track(4 * RATE as usize);
+        for transport in [TransportInfo::playing_at(0.0, 120.0, RATE), TransportInfo::stopped()] {
+            let mut on = Engine::new(RATE);
+            let mut off = Engine::new(RATE);
+            let (mut eaten, mut plain) = (Vec::new(), Vec::new());
+            for chunk in input.chunks(512) {
+                eaten.extend(process_both(&mut on, chunk, transport, || ducking(1.0)));
+                plain.extend(process_both(&mut off, chunk, transport, || ducking(0.0)));
+            }
+            let difference: Vec<f32> = eaten.iter().zip(&plain).map(|(a, b)| a - b).collect();
+            assert!(eaten == plain, "playing {}: differs from Off by {} of the track's RMS", transport.playing, rms(&difference) / rms(&plain));
+        }
+    }
+
+    #[test]
+    fn a_loaded_sample_keeps_dream_eater_on_even_while_stopped() {
+        // As in 1.7.7: with a sample loaded, the chord rings between hits and with the transport
+        // stopped, from the 10% the voices stay open.
+        let input = track(2 * RATE as usize);
+        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0 };
+        let output = process_track(&mut kick_engine(), &input, TransportInfo::stopped(), full);
+        let change: Vec<f32> = output.iter().zip(&input).map(|(a, b)| a - b).collect();
+        assert!(rms(&change[RATE as usize..]) > 0.1 * rms(&input), "{}", rms(&change) / rms(&input));
+    }
+
+    #[test]
+    fn unloading_the_sample_lets_the_chord_ring_out_and_brings_the_track_back() {
+        let input = smooth_track(8 * RATE as usize);
+        // On a block boundary, about 2 s in.
+        let unload = 188 * 512;
+        let mut engine = kick_engine();
+        let output = play_dream(&mut engine, &input, 1.0, |engine, at| {
+            if at == unload {
+                engine.set_sample(None);
+            }
+        });
+        let change: Vec<f32> = output.iter().zip(&input).map(|(a, b)| a - b).collect();
+
+        let before = biggest_step(&change[unload - 24_000..unload]);
+        let across = biggest_step(&change[unload - 2_400..unload + 24_000]);
+        assert!(across <= before * 1.2, "no click as the sample goes: {across} against {before} before");
+        let ringing = rms(&change[unload + 2_400..unload + 7_200]);
+        assert!(ringing > 0.1 * rms(&change[unload - 24_000..unload]), "the chord rings on: {ringing}");
+        // The track's dip is back to unity within about 30 ms, and the chord has died away and
+        // Dream Eater stepped aside, bit-exact, well before 6 s.
+        let later = rms(&change[unload + 2 * RATE as usize..unload + 3 * RATE as usize]);
+        assert!(later < 1e-3 * rms(&input), "{later}");
+        assert!(output[6 * RATE as usize..] == input[6 * RATE as usize..], "bit-exact once it has rung out");
+    }
+
+    #[test]
+    fn loading_a_sample_brings_dream_eater_in_without_a_click() {
+        let input = smooth_track(6 * RATE as usize);
+        // Half a block after the block boundary where it is loaded, about 2 s in.
+        let load = 188 * 512 + 256;
+        let mut engine = Engine::new(RATE);
+        let output = play_dream(&mut engine, &input, 1.0, |engine, at| {
+            if at == load - 256 {
+                engine.set_sample(Some(prepared(vec![kick(300.0)])));
+                engine.finish_analysis();
+            }
+        });
+        assert!(output[..load - 256] == input[..load - 256], "bit-exact before the sample is loaded");
+        let change: Vec<f32> = output.iter().zip(&input).map(|(a, b)| a - b).collect();
+        let arriving = biggest_step(&change[load - 2_400..load + 4_800]);
+        let settled = biggest_step(&change[load + 48_000..load + 96_000]);
+        assert!(arriving <= settled * 1.2, "the dip comes in smoothly: {arriving} against {settled} later");
+        assert!(rms(&change[load + 48_000..]) > 0.1 * rms(&input), "and Dream Eater is on");
     }
 
     #[test]

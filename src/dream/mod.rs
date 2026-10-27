@@ -478,6 +478,13 @@ const SURGE_BLOCK_MS: f64 = 250.0;
 const CEILING: f64 = 1.0;
 const PEAK_RELEASE_MS: f32 = 1_000.0;
 const LIMITER_RELEASE_MS: f32 = 80.0;
+/// How long Dream Eater takes to come in when a sample is loaded, or to hand the track back
+/// when it is unloaded.
+const DRIVE_MS: f64 = 30.0;
+/// Once the sample is gone, the chord counts as rung out when it stays under this for
+/// `RUNG_OUT_MS`, and Dream Eater steps aside, bit-exact.
+const RUNG_OUT: f64 = 1e-6;
+const RUNG_OUT_MS: f64 = 50.0;
 /// The chord rings the track's own notes, so it can line up with the track and make the sum
 /// louder than the two apart, and where the track has little at the chord's pitches the chord
 /// stays quiet. So the output is brought back to the ducked track's loudness, turned down by at
@@ -768,6 +775,19 @@ pub struct DreamEater {
     leveller_glide: f64,
     leveller_rise: f64,
     limiter_release: f64,
+    /// Whether a sample is loaded to duck the track. Without one Dream Eater has nothing to
+    /// answer and stays out of the way, as at Off.
+    driven: bool,
+    /// 0..1, glides towards 1 while `driven` and 0 while not, over `DRIVE_MS`: how much the
+    /// voices hear the track and how far the track dips and is made up.
+    drive: f64,
+    drive_step: f64,
+    /// Set by `reset`: the next frame takes `drive` straight to where it belongs, as there is
+    /// nothing before it to glide from.
+    fresh: bool,
+    /// Frames the chord has stayed rung out since the sample went.
+    quiet: usize,
+    rung_out_frames: usize,
     #[cfg(test)]
     pub(crate) probe: Probe,
 }
@@ -836,6 +856,12 @@ impl DreamEater {
             leveller_glide: 0.0,
             leveller_rise: 1.0,
             limiter_release: 0.0,
+            driven: true,
+            drive: 1.0,
+            drive_step: 0.0,
+            fresh: true,
+            quiet: 0,
+            rung_out_frames: 1,
             #[cfg(test)]
             probe: Probe::default(),
         };
@@ -866,6 +892,8 @@ impl DreamEater {
         self.leveller_rise = 10f64.powf(LEVELLER_RISE_DB_PER_SECOND / 20.0 / sample_rate);
         self.limiter_release = 1.0 - one_pole(LIMITER_RELEASE_MS, sample_rate);
         self.peak_release = 1.0 - one_pole(PEAK_RELEASE_MS, sample_rate);
+        self.drive_step = 1.0 / (DRIVE_MS * 0.001 * sample_rate).max(1.0);
+        self.rung_out_frames = ((RUNG_OUT_MS * 0.001 * sample_rate) as usize).max(1);
         self.reset();
     }
 
@@ -877,6 +905,14 @@ impl DreamEater {
         self.hit = 0.0;
         self.bloom = 0.0;
         self.swell = 0.0;
+        self.fresh = true;
+        self.quiet = 0;
+    }
+
+    /// Tells Dream Eater whether a sample is loaded. Without one it bypasses, bit-exact like
+    /// Off, after letting any chord already ringing die away; with one it is as it always was.
+    pub fn set_driven(&mut self, driven: bool) {
+        self.driven = driven;
     }
 
     /// Follows the ducking's Attack, which sets how late the resonators hear the track.
@@ -988,12 +1024,26 @@ impl DreamEater {
         self.hit = if envelope > self.hit { envelope } else { self.hit + self.hit_release * (envelope - self.hit) };
         self.bloom += self.bloom_rate * (self.hit - self.bloom);
         self.swell += self.bloom_rate * (self.bloom - self.swell);
+        let aim_drive = if self.driven { 1.0 } else { 0.0 };
+        if self.fresh {
+            self.drive = aim_drive;
+            self.fresh = false;
+        } else if self.drive < aim_drive {
+            self.drive = (self.drive + self.drive_step).min(aim_drive);
+        } else if self.drive > aim_drive {
+            self.drive = (self.drive - self.drive_step).max(aim_drive);
+        }
         if amount.is_nan() || amount <= 0.0 {
             self.running = false;
             return None;
         }
         if !self.running {
+            // Nothing to answer without a sample: the track passes as at Off.
+            if !self.driven {
+                return None;
+            }
             self.start();
+            self.quiet = 0;
         }
         let amount = amount.min(1.0) as f64;
         if self.countdown == 0 {
@@ -1007,6 +1057,7 @@ impl DreamEater {
         // the voices open mostly on the hit itself.
         let delayed = self.excitation.read(self.delay);
         let open = RESTING_OPEN + (1.0 - RESTING_OPEN) * self.swell.clamp(0.0, 1.0).powi(2);
+        let open = if self.drive < 1.0 { open * self.drive } else { open };
         let mut wet = [0.0f64; 2];
         for (index, bank) in self.banks.iter_mut().enumerate() {
             let share = open * if index == self.active { self.crossfade } else { 1.0 - self.crossfade };
@@ -1044,8 +1095,14 @@ impl DreamEater {
         let wet_power = self.wet_power.update(wet[0] * wet[0] + wet[1] * wet[1], rate, surge_rate, block);
         let target = (WET_LEVEL * amount * (dry_power / wet_power.max(1e-30)).sqrt()).min(MAX_GAIN);
         let glided = self.leveller + self.leveller_glide * (target - self.leveller);
-        self.leveller = glided.min(self.leveller.max(1.0) * self.leveller_rise);
-        let dry = track.map(|side| heard * dry_gain(amount) * side);
+        self.leveller = if self.driven {
+            glided.min(self.leveller.max(1.0) * self.leveller_rise)
+        } else {
+            // With the sample gone, the chord is left to ring out, never brought back up.
+            glided.min(self.leveller)
+        };
+        let dip = if self.drive < 1.0 { 1.0 + self.drive * (dry_gain(amount) - 1.0) } else { dry_gain(amount) };
+        let dry = track.map(|side| heard * dip * side);
         let wet = wet.map(|side| self.leveller * side);
         // Brings the sum back to the ducked track's loudness, where the chord lines up with the
         // track or finds little in it to ring.
@@ -1059,12 +1116,15 @@ impl DreamEater {
         let aim = dry_power * makeup_aim(amount);
         let makeup = if sum_power > 1e-30 { (aim / sum_power).sqrt().clamp(MIN_MAKEUP, most) } else { 1.0 };
         self.makeup += self.leveller_glide * (makeup - self.makeup);
-        let (dry, wet) = (dry.map(|side| self.makeup * side), wet.map(|side| self.makeup * side));
+        let makeup = if self.drive < 1.0 { 1.0 + self.drive * (self.makeup - 1.0) } else { self.makeup };
+        let (dry, wet) = (dry.map(|side| makeup * side), wet.map(|side| makeup * side));
         // Turns the wet down, never the track, so the output stays under the ceiling or the
         // track's own peak. The track itself is never above its level at Off.
         let loudest = track[0].abs().max(track[1].abs());
         self.track_peak = loudest.max(self.track_peak * (1.0 - self.peak_release));
-        let room = self.track_peak.min(CEILING);
+        // With the sample gone the track is back at full level, so a tail ringing over it is
+        // only held under the ceiling: clamping it to the track's own peak would chop it.
+        let room = if self.driven { self.track_peak.min(CEILING) } else { CEILING };
         let mut fits = 1.0f64;
         for side in 0..2 {
             let limit = dry[side].abs().max(room);
@@ -1089,6 +1149,14 @@ impl DreamEater {
             p.makeup += self.makeup;
             p.limiter += self.limiter;
             p.wet_out_power += (self.limiter * self.limiter) * (wet[0] * wet[0] + wet[1] * wet[1]);
+        }
+        if !self.driven && self.drive <= 0.0 {
+            let left = (self.limiter * wet[0].abs()).max(self.limiter * wet[1].abs());
+            self.quiet = if left < RUNG_OUT { self.quiet + 1 } else { 0 };
+            if self.quiet >= self.rung_out_frames {
+                // Rung out: from the next frame the track passes as at Off.
+                self.running = false;
+            }
         }
         Some([0, 1].map(|side| (dry[side] + self.limiter * wet[side]) as f32))
     }

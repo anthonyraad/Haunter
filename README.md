@@ -31,6 +31,8 @@ The HP and LP filters work on the sample itself as it plays. An envelope followe
 
 Fully counter-clockwise reads Off, and the track is untouched, bit for bit. Dream Eater listens to the track before the ducking, and the blended sample doesn't go through it.
 
+**Only with a sample loaded (since 1.7.8).** Dream Eater answers the sample's ducking, so with no sample loaded (as in `--`) it does nothing at any setting: the track comes out bit for bit as at Off, from the first frame, with no chord, no dip, and no makeup. Before 1.7.8 it still ran without a sample: the voices stay 10% open between hits, so they rang a standing chord from the track, the leveller brought it up to about 4 dB under the track, and the track was turned down about 2.4 dB and then made up. With a sample loaded it works exactly as in 1.7.7, playing or stopped, between hits and without any, 10% floor included. Unloading the sample while the chord rings stops feeding it, and over 30 ms brings the track's dip and makeup back to unity; the chord rings out on its own, kept only under 0 dBFS, and once it has died away Dream Eater steps aside, bit-exact. Loading a sample brings it in over the same 30 ms. The key is followed either way.
+
 **Choosing the key yourself.** Right-click the Dream Eater knob for a menu with **Auto** (the default) and the twelve keys, each shown by its root alone: C, C#, D, D#, E, F, F#, G, G#, A, A#, B. A key also covers its relative minor (C covers A minor), since the chord is the pentatonic both share. Nothing on the panel shows the choice. It is saved in the project and in user presets. Factory presets and `--` set it back to Auto, and projects and presets from before 1.6 load on Auto. Right-clicking doesn't turn the knob, and changing the key doesn't add a `*` to the preset name.
 
 The output is always at unity gain. There is no output level control.
@@ -103,6 +105,8 @@ The unit tests cover:
 - HP and LP measurably changing both the blended sample and the ducking.
 - Dream Eater:
   - Off is a bit-exact bypass, even right after it was on, and the key is still followed while it is Off.
+  - With no sample loaded, 100% is bit-identical to Off from a fresh instance's first frame, playing and stopped (1.7.7 changed the track by about half its RMS here). With a sample loaded and the transport stopped it still rings, as in 1.7.7.
+  - Unloading the sample mid-ring steps no harder than the chord did before it, the chord keeps ringing, and the output is bit-identical to the track once it has died away. Loading a sample mid-song keeps the output bit-identical until then and brings Dream Eater in no harder than it steps once settled.
   - Turning it up changes the track more.
   - The chord swells on the sample's hits and rings out between them, on the key's root, fifth, and ninth and not between them, with no pitch sweep.
   - A silent track stays exactly silent at 100%, with the voices opened by every hit, at 44.1, 48, and 96 kHz: there is no hiss, and the chord rings out to true silence once the track stops.

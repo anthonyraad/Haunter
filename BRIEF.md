@@ -2,7 +2,7 @@
 
 Build a Windows 64-bit **VST3 audio effect** (not an instrument) for Cubase called **Haunter**. The user loads a sample (typically a kick or any one-shot), and the sample's volume shape ducks the incoming track, like a ghost-kick sidechain. The sample can also be blended into the output.
 
-Follow the same Rust approach as `..\Sparkletop\plugin` (look at its Cargo.toml, .cargo config, static CRT, and VST3 bundle layout) and the knob look of the Dropout plugin (`..\Sparkletop` commit 56acf79 copied Dropout's disc, track, and blue arc knobs; reuse that style). Since 1.6.1 the accent is #7C6EBB instead of blue, everywhere: knob arcs, lit toggles, the waveform region, the meter, menu selections, the text cursor, and the Dream Eater fill, with the light and grey tints derived from it.
+Follow the same Rust approach as `..\Sparkletop\plugin` (look at its Cargo.toml, .cargo config, static CRT, and VST3 bundle layout) and the knob look of the Dropout plugin (`..\Sparkletop` commit 56acf79 copied Dropout's disc, track, and blue arc knobs; reuse that style). Since 1.6.1 the accent is #7C6EBB instead of blue, everywhere: knob arcs, lit toggles, the waveform region, the meter, menu selections, the text cursor, and the Dream Eater fill, with the light and grey tints derived from it. Since 1.7.10 the playhead line on the waveform is pink, #EB789A (RGB 235, 120, 154; it was orange-red #D85A3E).
 
 ## Behaviour
 - **Trigger:** synced to Cubase's tempo and transport. Rate choices are 1/1, 1/2, 1/4, 1/8, 1/16, plus dotted and triplet variants. Retrigger on the grid only while the transport plays.

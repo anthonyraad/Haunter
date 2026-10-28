@@ -26,7 +26,8 @@ const ARC: Color32 = Color32::from_rgb(0x7c, 0x6e, 0xbb);
 const ARC_LIGHT: Color32 = Color32::from_rgb(0xcb, 0xc5, 0xe4);
 /// The accent darkened, for selected text, focus outlines, and the text cursor.
 const ARC_DARK: Color32 = Color32::from_rgb(0x4a, 0x42, 0x70);
-const PLAYHEAD: Color32 = Color32::from_rgb(0xd8, 0x5a, 0x3e);
+/// The playhead line on the waveform, #EB789A since 1.7.10 (#D85A3E before).
+const PLAYHEAD: Color32 = Color32::from_rgb(0xeb, 0x78, 0x9a);
 /// The Rate readout while Restart is off.
 const MUTED: Color32 = Color32::from_rgb(0x8c, 0x8c, 0x8c);
 const ERROR: Color32 = Color32::from_rgb(0xb0, 0x30, 0x20);

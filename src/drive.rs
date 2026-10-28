@@ -260,24 +260,72 @@ impl Filters {
     }
 }
 
-/// What one frame's Drive works out to.
-#[derive(Debug, Clone, Copy)]
-struct Curve {
+/// The saturation curve for one Drive, 0 to 1, on its own: tanh with a bias, moved so 0 stays
+/// at 0 and the slope there is 1. As Drive goes to 0 this becomes the identity, so the knob
+/// comes in from nothing. The audio and the waveform display both bend through this, so what
+/// you see is what you hear. It expects its input brought to a peak of about 1.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Transfer {
     gain: f64,
     bias: f64,
     offset: f64,
     scale: f64,
+}
+
+impl Transfer {
+    pub fn new(drive: f64) -> Self {
+        let drive = if drive.is_finite() { drive.clamp(0.0, 1.0) } else { 0.0 };
+        let gain = (MAX_GAIN * drive * drive).max(1e-6);
+        let bias = MAX_BIAS * drive;
+        let offset = bias.tanh();
+        let scale = 1.0 / (gain * (1.0 - offset * offset));
+        Transfer { gain, bias, offset, scale }
+    }
+
+    #[inline]
+    pub fn apply(&self, x: f64) -> f64 {
+        ((self.gain * x + self.bias).tanh() - self.offset) * self.scale
+    }
+}
+
+/// `x` through the curve at `drive`; at 0 (or below) it is `x` exactly, as the saturator gives
+/// back its input bit for bit there.
+pub fn transfer(x: f64, drive: f64) -> f64 {
+    if drive > 0.0 { Transfer::new(drive).apply(x) } else { x }
+}
+
+/// The waveform display's columns (each a column's lowest and highest sample) as Drive bends
+/// them: brought to a peak of 1 as the saturator brings its input to its held peak, through the
+/// curve, matched back to the loudness they had (as the saturator matches its output, and held
+/// to the same range), and returned at their own scale. Peaks round off and quieter parts swell.
+/// At 0 they are returned untouched.
+pub fn driven_columns(columns: &[(f32, f32)], drive: f32) -> Vec<(f32, f32)> {
+    if !(drive > 0.0) {
+        return columns.to_vec();
+    }
+    let transfer = Transfer::new(drive as f64);
+    let peak = columns.iter().fold(1e-6f64, |m, &(lo, hi)| m.max((lo as f64).abs()).max((hi as f64).abs()));
+    let bent: Vec<(f64, f64)> =
+        columns.iter().map(|&(lo, hi)| (transfer.apply(lo as f64 / peak), transfer.apply(hi as f64 / peak))).collect();
+    let power_in: f64 = columns.iter().map(|&(lo, hi)| ((lo as f64).powi(2) + (hi as f64).powi(2)) / (peak * peak)).sum();
+    let power_out: f64 = bent.iter().map(|&(lo, hi)| lo * lo + hi * hi).sum();
+    let matched = ((power_in + 1e-24) / (power_out + 1e-24)).sqrt().clamp(1.0 / MAX_MATCH, MAX_MATCH);
+    bent.into_iter().map(|(lo, hi)| ((lo * matched * peak) as f32, (hi * matched * peak) as f32)).collect()
+}
+
+/// What one frame's Drive works out to.
+#[derive(Debug, Clone, Copy)]
+struct Curve {
+    transfer: Transfer,
     pre: [f64; 3],
     post: [f64; 3],
     low_pass: f64,
 }
 
 impl Curve {
-    /// tanh with a bias, moved so 0 stays at 0 and the slope there is 1: as Drive goes to 0
-    /// this becomes the identity, so the knob comes in from nothing.
     #[inline]
     fn shape(&self, x: f64) -> f64 {
-        ((self.gain * x + self.bias).tanh() - self.offset) * self.scale
+        self.transfer.apply(x)
     }
 }
 
@@ -362,10 +410,7 @@ impl Saturator {
     }
 
     fn curve(&self, drive: f64) -> Curve {
-        let gain = (MAX_GAIN * drive * drive).max(1e-6);
-        let bias = MAX_BIAS * drive;
-        let offset = bias.tanh();
-        let scale = 1.0 / (gain * (1.0 - offset * offset));
+        let transfer = Transfer::new(drive);
         // A first-order high shelf, cut by `cut` above EMPHASIS_HZ, and its exact inverse.
         let cut = 10f64.powf(-EMPHASIS_DB * drive / 20.0);
         let w = self.shelf_warp;
@@ -373,7 +418,7 @@ impl Saturator {
         let post = [(1.0 + w) / (cut + w), (w - 1.0) / (cut + w), (w - cut) / (cut + w)];
         let low_pass_hz = LOW_PASS_OPEN_HZ * (LOW_PASS_CLOSED_HZ / LOW_PASS_OPEN_HZ).powf(drive);
         let low_pass = 1.0 - (-2.0 * PI * low_pass_hz / (4.0 * self.sample_rate)).exp();
-        Curve { gain, bias, offset, scale, pre, post, low_pass }
+        Curve { transfer, pre, post, low_pass }
     }
 
     /// Saturates one stereo frame by `drive`, 0 to 1. At 0, once any fade out is done, the
@@ -440,6 +485,99 @@ mod tests {
     use super::*;
 
     const RATE: f64 = 48_000.0;
+
+    #[test]
+    fn the_shared_curve_is_the_identity_at_0_rising_and_bounded() {
+        for x in [-1e9, -3.0, -1.0, -0.37, -1e-12, 0.0, 1e-12, 0.5, 1.0, 7.0, 1e9] {
+            assert_eq!(transfer(x, 0.0).to_bits(), x.to_bits(), "{x}");
+            assert_eq!(transfer(x, -0.5).to_bits(), x.to_bits(), "{x}");
+        }
+        for drive in [1e-4, 0.01, 0.1, 0.25, 0.5, 0.75, 1.0] {
+            let curve = Transfer::new(drive);
+            assert_eq!(curve.apply(0.0), 0.0);
+            // Slope 1 at 0, so quiet parts are left as they are.
+            let slope = (curve.apply(1e-7) - curve.apply(-1e-7)) / 2e-7;
+            assert!((slope - 1.0).abs() < 1e-6, "{drive}: slope {slope}");
+            let mut last = f64::NEG_INFINITY;
+            for n in -4000..=4000 {
+                let x = n as f64 / 1000.0;
+                let y = curve.apply(x);
+                assert!(y.is_finite() && (y > last || (x.abs() > 1.0 && y >= last)), "{drive}: not rising at {x}");
+                last = y;
+                // Never past the input's own peak by more than a hair, near the identity.
+                if x.abs() <= 1.0 {
+                    assert!(y.abs() <= 1.0 + 0.01, "{drive}: {x} gives {y}");
+                }
+            }
+            // Bounded however hard it is pushed.
+            let bound = (1.0 + curve.offset) * curve.scale;
+            for x in [-1e12, -1e6, 1e6, 1e12] {
+                assert!(curve.apply(x).abs() <= bound, "{drive}");
+            }
+            if drive >= 0.5 {
+                // Peaks round off: a full-scale input comes out well under the identity.
+                assert!(curve.apply(1.0) < 0.9 && curve.apply(-1.0) > -0.95, "{drive}");
+            }
+        }
+        // The curve the saturator runs is this one.
+        let saturator = Saturator::new(RATE);
+        for drive in [0.1, 0.6, 1.0] {
+            assert_eq!(saturator.curve(drive).transfer, Transfer::new(drive));
+        }
+    }
+
+    fn kick_columns() -> Vec<(f32, f32)> {
+        (0..1024)
+            .map(|n| {
+                let level = 0.8 * (-(n as f32) / 200.0).exp();
+                let wobble = (n as f32 * 0.07).sin();
+                (-level * (0.6 + 0.4 * wobble.abs()), level * (0.7 + 0.3 * wobble))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_waveform_at_0_is_the_waveform() {
+        let columns = kick_columns();
+        for drive in [0.0, -0.0, -1.0, f32::NAN] {
+            let shown = driven_columns(&columns, drive);
+            assert_eq!(shown.len(), columns.len());
+            for (a, b) in shown.iter().zip(&columns) {
+                assert_eq!((a.0.to_bits(), a.1.to_bits()), (b.0.to_bits(), b.1.to_bits()));
+            }
+        }
+    }
+
+    #[test]
+    fn drive_rounds_the_waveforms_peaks_and_swells_its_tail_smoothly() {
+        let columns = kick_columns();
+        let peak_of = |c: &[(f32, f32)]| c.iter().fold(0f32, |m, &(lo, hi)| m.max(lo.abs()).max(hi.abs()));
+        let tail_of = |c: &[(f32, f32)]| c[700..].iter().map(|&(lo, hi)| hi - lo).sum::<f32>();
+        let (peak, tail) = (peak_of(&columns), tail_of(&columns));
+        let mut last = (1.0f32, 1.0f32);
+        let mut previous = columns.clone();
+        for step in 1..=100 {
+            let drive = step as f32 / 100.0;
+            let shown = driven_columns(&columns, drive);
+            let (crest, swell) = (peak_of(&shown) / peak, tail_of(&shown) / tail);
+            // The tail grows relative to the peak, step by step (within a hair while the curve barely
+            // bends, where the asymmetry and the loudness match nudge both by under 0.2%).
+            let ratio = swell / crest;
+            assert!(ratio >= last.1 / last.0 - 2e-3, "{drive}: {ratio}");
+            last = (crest, swell);
+            // A small turn moves the picture a little: no jumps to flicker.
+            let moved = shown.iter().zip(&previous).map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs())).fold(0f32, f32::max);
+            assert!(moved < 0.03 * peak, "{drive}: moved {moved}");
+            previous = shown;
+            // Every column keeps its sign and order.
+            for (&(lo, hi), &(lo0, hi0)) in previous.iter().zip(&columns) {
+                assert!(lo <= hi && lo.signum() == lo0.signum() && hi.signum() == hi0.signum());
+            }
+        }
+        let full = driven_columns(&columns, 1.0);
+        assert!(tail_of(&full) / peak_of(&full) > 2.0 * tail / peak, "the quiet part swells");
+        assert!(peak_of(&full) < 0.8 * peak, "the peaks round off");
+    }
 
     fn sine(freq: f64, frames: usize, level: f64) -> Vec<f64> {
         (0..frames).map(|n| level * (2.0 * PI * freq * n as f64 / RATE).sin()).collect()

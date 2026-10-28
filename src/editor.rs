@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::dream::KeyChoice;
+use crate::drive::driven_columns;
 use crate::dsp::Direction;
+use crate::sample::Overview;
 use crate::preset::{self, Choice};
 use crate::{apply_preset, load_file, read_preset, save_preset, HaunterParams, Shared};
 
@@ -46,6 +48,13 @@ const METER_RANGE_DB: f32 = 36.0;
 const AUDIO_EXTENSIONS: [&str; 6] = ["wav", "wave", "aif", "aiff", "aifc", "mp3"];
 /// How far either side of a Start or End handle a press grabs it instead of loading a file.
 const HANDLE_REACH: f32 = 12.0;
+/// How quickly the waveform follows the Drive knob: it covers about two thirds of the way in
+/// this long, so the morph glides rather than steps.
+const DRIVE_GLIDE_S: f32 = 0.06;
+/// How far the Drive shown may move before the bent waveform is worked out again.
+const DRIVE_REDRAW: f32 = 0.002;
+/// How far toward the playhead colour the waveform warms at full Drive.
+const DRIVE_TINT: f32 = 0.15;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Handle {
@@ -69,6 +78,20 @@ struct EditorState {
     save_error: Option<String>,
     /// `Shared::processed_blocks` when a preset's parameters were sent to the host.
     preset_sent_at: Option<u64>,
+    /// The Drive the waveform shows, gliding toward the knob's.
+    shown_drive: Option<f32>,
+    /// The waveform bent by Drive, kept until the sample or the Drive shown changes.
+    driven: Option<Driven>,
+    /// Stands in for the Drive parameter, which tests can't set.
+    #[cfg(test)]
+    drive_for_test: Option<f32>,
+}
+
+/// A loaded sample's waveform columns as one Drive bends them.
+struct Driven {
+    overview: Arc<Overview>,
+    drive: f32,
+    columns: Arc<Vec<(f32, f32)>>,
 }
 
 pub fn create(params: Arc<HaunterParams>, shared: Arc<Shared>, state: Arc<EguiState>) -> Option<Box<dyn Editor>> {
@@ -466,18 +489,29 @@ fn waveform(
         }
     }
 
-    // Waveform, brighter inside the region.
+    // Waveform, brighter inside the region. Since 1.7.13 it bends through the same curve as the
+    // sample does as Drive turns up, at the same scale, and warms a little; at 0 it is as before.
     let middle = inner.center().y;
     let half_height = inner.height() * 0.5;
+    let drive = shown_drive(ui.ctx(), params, state);
+    let bent = (drive > 0.0).then(|| bent_columns(state, &overview, drive, drive_target(params, state)));
+    let columns: &[(f32, f32)] = bent.as_deref().map_or(&overview.columns, |bent| bent.as_slice());
     let peak = overview.columns.iter().fold(1e-6f32, |m, (lo, hi)| m.max(lo.abs()).max(hi.abs()));
+    let peak = if bent.is_some() { columns.iter().fold(peak, |m, (lo, hi)| m.max(lo.abs()).max(hi.abs())) } else { peak };
     let scale = half_height / peak;
+    let (inside, outside) = if drive > 0.0 {
+        let warm = |color: Color32| color.lerp_to_gamma(PLAYHEAD, DRIVE_TINT * drive);
+        (warm(ARC), warm(TRACK))
+    } else {
+        (ARC, TRACK)
+    };
     let pixels = inner.width().max(1.0) as usize;
     for pixel in 0..pixels {
         let fraction = (pixel as f32 + 0.5) / pixels as f32;
-        let column = ((fraction * overview.columns.len() as f32) as usize).min(overview.columns.len() - 1);
-        let (lo, hi) = overview.columns[column];
+        let column = ((fraction * columns.len() as f32) as usize).min(columns.len() - 1);
+        let (lo, hi) = columns[column];
         let x = inner.left() + pixel as f32 + 0.5;
-        let color = if fraction >= low && fraction <= high { ARC } else { TRACK };
+        let color = if fraction >= low && fraction <= high { inside } else { outside };
         painter.line_segment(
             [Pos2::new(x, middle - hi * scale - 0.5), Pos2::new(x, middle - lo * scale + 0.5)],
             Stroke::new(1.0_f32, color),
@@ -513,6 +547,46 @@ fn waveform(
 
     drop_overlay(&painter, rect, hovering_files);
     (rect, browse)
+}
+
+/// The Drive the waveform should end up showing, 0 to 1.
+fn drive_target(params: &HaunterParams, state: &EditorState) -> f32 {
+    #[cfg(test)]
+    if let Some(drive) = state.drive_for_test {
+        return drive;
+    }
+    let _ = state;
+    let drive = params.drive.modulated_plain_value();
+    if drive.is_finite() { drive.clamp(0.0, 1.0) } else { 0.0 }
+}
+
+/// Moves the Drive shown toward the knob's, a frame at a time, and lands on it exactly.
+fn shown_drive(context: &egui::Context, params: &HaunterParams, state: &mut EditorState) -> f32 {
+    let target = drive_target(params, state);
+    let dt = context.input(|input| input.stable_dt).clamp(0.0, 0.1);
+    let shown = match state.shown_drive {
+        Some(shown) if shown != target => {
+            let next = shown + (target - shown) * (1.0 - (-dt / DRIVE_GLIDE_S).exp());
+            if (target - next).abs() < 1e-3 { target } else { next }
+        }
+        _ => target,
+    };
+    state.shown_drive = Some(shown);
+    shown
+}
+
+/// The waveform bent by `drive`, worked out again only for another sample, once the Drive shown
+/// has moved by more than `DRIVE_REDRAW`, or when it lands on the knob's.
+fn bent_columns(state: &mut EditorState, overview: &Arc<Overview>, drive: f32, target: f32) -> Arc<Vec<(f32, f32)>> {
+    let current = state.driven.as_ref().is_some_and(|driven| {
+        Arc::ptr_eq(&driven.overview, overview)
+            && (driven.drive == drive || (drive != target && (driven.drive - drive).abs() <= DRIVE_REDRAW))
+    });
+    if !current {
+        let columns = Arc::new(driven_columns(&overview.columns, drive));
+        state.driven = Some(Driven { overview: overview.clone(), drive, columns });
+    }
+    state.driven.as_ref().expect("just set").columns.clone()
 }
 
 fn handle_param(params: &HaunterParams, handle: Handle) -> &FloatParam {
@@ -2060,6 +2134,111 @@ mod tests {
         assert!(editor.state.naming.is_none(), "Escape cancels");
         let cancel_and_back = editor.frame();
         assert_ne!(cancel_and_back.preset_menu, Rect::NOTHING, "the preset controls come back");
+    }
+
+    /// The waveform's columns as painted: each one-point-wide vertical line inside `rect`.
+    fn waveform_lines(editor: &Editor, rect: Rect) -> Vec<([Pos2; 2], Color32)> {
+        editor
+            .screen
+            .shapes
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::LineSegment { points, stroke }
+                    if stroke.width == 1.0 && points[0].x == points[1].x && rect.contains(points[0]) =>
+                {
+                    Some((*points, stroke.color))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The waveform as 1.7.12 drew it, worked out here on its own.
+    fn waveform_as_in_1_7_12(editor: &Editor, rect: Rect) -> Vec<([Pos2; 2], Color32)> {
+        let overview = editor.plugin.shared.overview.lock().unwrap().clone().unwrap();
+        let p = &editor.plugin.params;
+        let (start, end) = (p.start.modulated_plain_value(), p.end.modulated_plain_value());
+        let (low, high) = (start.min(end), start.max(end));
+        let inner = rect.shrink2(egui::vec2(10.0, 14.0));
+        let (middle, half_height) = (inner.center().y, inner.height() * 0.5);
+        let peak = overview.columns.iter().fold(1e-6f32, |m, (lo, hi)| m.max(lo.abs()).max(hi.abs()));
+        let scale = half_height / peak;
+        let pixels = inner.width().max(1.0) as usize;
+        (0..pixels)
+            .map(|pixel| {
+                let fraction = (pixel as f32 + 0.5) / pixels as f32;
+                let column = ((fraction * overview.columns.len() as f32) as usize).min(overview.columns.len() - 1);
+                let (lo, hi) = overview.columns[column];
+                let x = inner.left() + pixel as f32 + 0.5;
+                let color = if fraction >= low && fraction <= high { ARC } else { TRACK };
+                ([Pos2::new(x, middle - hi * scale - 0.5), Pos2::new(x, middle - lo * scale + 0.5)], color)
+            })
+            .collect()
+    }
+
+    fn line_heights(lines: &[([Pos2; 2], Color32)]) -> Vec<f32> {
+        lines.iter().map(|(points, _)| points[1].y - points[0].y).collect()
+    }
+
+    #[test]
+    fn the_waveform_at_drive_0_is_drawn_exactly_as_in_1_7_12() {
+        let mut editor = Editor::new(true);
+        let rect = editor.settle().waveform;
+        let before = waveform_lines(&editor, rect);
+        assert!(before.len() > 500, "{} lines", before.len());
+        assert_eq!(before, waveform_as_in_1_7_12(&editor, rect));
+        // Turned up and back to 0, it is the same to the last bit.
+        editor.state.drive_for_test = Some(1.0);
+        editor.wait(1.0);
+        assert_ne!(waveform_lines(&editor, rect), before);
+        editor.state.drive_for_test = Some(0.0);
+        editor.wait(1.0);
+        assert_eq!(editor.state.shown_drive, Some(0.0));
+        assert_eq!(waveform_lines(&editor, rect), before);
+    }
+
+    #[test]
+    fn drive_glides_the_waveform_into_a_rounder_fuller_shape() {
+        let mut editor = Editor::new(true);
+        let rect = editor.settle().waveform;
+        let clean = waveform_lines(&editor, rect);
+        let clean_heights = line_heights(&clean);
+        editor.state.drive_for_test = Some(1.0);
+        let mut shown = Vec::new();
+        let mut frames = vec![clean_heights.clone()];
+        for _ in 0..60 {
+            editor.frame();
+            shown.push(editor.state.shown_drive.unwrap());
+            frames.push(line_heights(&waveform_lines(&editor, rect)));
+        }
+        // It glides: no jump to the end, every frame further on, and there within a second.
+        assert!(shown[0] > 0.0 && shown[0] < 0.4, "first frame shows {}", shown[0]);
+        assert!(shown.windows(2).all(|w| w[1] >= w[0]), "{shown:?}");
+        assert!(shown.iter().filter(|&&s| s < 1.0).count() >= 5, "{shown:?}");
+        assert_eq!(*shown.last().unwrap(), 1.0);
+        // Each frame moves the picture a little and never back: no flicker.
+        for pair in frames.windows(2) {
+            let moved = pair[0].iter().zip(&pair[1]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(moved < 25.0, "a frame moved a line by {moved} points");
+        }
+        let full = frames.last().unwrap();
+        let tallest = |h: &[f32]| h.iter().copied().fold(0f32, f32::max);
+        let tail = |h: &[f32]| h[h.len() * 3 / 4..].iter().sum::<f32>();
+        assert!(tallest(full) < 0.95 * tallest(&clean_heights), "the peaks round off");
+        assert!(tail(full) / tallest(full) > 1.2 * tail(&clean_heights) / tallest(&clean_heights), "the quiet part swells");
+        // Still inside the waveform, the playhead and handles as they were, and just a touch warmer.
+        let lines = waveform_lines(&editor, rect);
+        let inner = rect.shrink2(egui::vec2(10.0, 14.0));
+        assert!(lines.iter().all(|(p, _)| p[0].y >= inner.top() - 1.0 && p[1].y <= inner.bottom() + 1.0));
+        assert!(editor.screen.shapes.iter().any(|shape| matches!(shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == PLAYHEAD && stroke.width == 1.5)));
+        let warm = ARC.lerp_to_gamma(PLAYHEAD, DRIVE_TINT);
+        assert!(lines.iter().any(|(_, c)| *c == warm), "the region is warmed");
+        let shift = |a: Color32, b: Color32| (a.r() as i32 - b.r() as i32).abs().max((a.g() as i32 - b.g() as i32).abs()).max((a.b() as i32 - b.b() as i32).abs());
+        assert!(shift(warm, ARC) <= 25, "subtle: {warm:?}");
+        // Settled, the bent waveform isn't worked out again.
+        let cached = editor.state.driven.as_ref().unwrap().columns.clone();
+        editor.wait(0.2);
+        assert!(Arc::ptr_eq(&cached, &editor.state.driven.as_ref().unwrap().columns));
     }
 
     fn kick_like() -> crate::sample::EmbeddedSample {

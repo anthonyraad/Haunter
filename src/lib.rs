@@ -588,6 +588,7 @@ impl Plugin for Haunter {
             playing: transport.playing,
             beat: transport.pos_beats(),
             beats_per_frame: transport.tempo.map(|tempo| tempo / 60.0 / sample_rate),
+            cycle: transport.loop_range_beats(),
         };
 
         let params = &self.params;

@@ -137,11 +137,14 @@ impl SyncRate {
 #[derive(Debug, Default, Clone)]
 pub struct GridClock {
     last_line: Option<i64>,
+    /// The song position of the last frame seen, to notice the host jumping back.
+    last_beat: Option<f64>,
 }
 
 impl GridClock {
     pub fn reset(&mut self) {
         self.last_line = None;
+        self.last_beat = None;
     }
 
     /// `beat` is the song position of this frame in quarter notes. Each frame owns the half-open
@@ -155,6 +158,17 @@ impl GridClock {
     /// the song's start (line 0 at beat 0, negative before it), so it depends only on the song
     /// position and not on where playback started.
     pub fn tick_line(&mut self, beat: f64, beats_per_frame: f64, interval: f64) -> Option<i64> {
+        // Playback only moves forward, so landing more than a quarter of a step (and at least two
+        // frames) behind the last frame means the host jumped back: a cycle wrap or a locate. The
+        // line it lands on fires again even if it is the one that fired last, so a cycle one step
+        // long plays every pass. Smaller wobbles, such as tempo drift between blocks, change
+        // nothing.
+        if let Some(previous) = self.last_beat {
+            if beat < previous - (0.25 * interval).max(2.0 * beats_per_frame) {
+                self.last_line = None;
+            }
+        }
+        self.last_beat = Some(beat);
         let half = 0.5 * beats_per_frame;
         let line = ((beat - half) / interval).ceil();
         if line * interval < beat + half {
@@ -165,6 +179,22 @@ impl GridClock {
             }
         }
         None
+    }
+}
+
+/// The song position of `frame` in a block that starts at `beat`. When the host is cycling and
+/// the block runs past the cycle's end, positions from the frame that owns the end onwards are
+/// folded back to the cycle's start, so no step beyond the end fires and the cycle's first step
+/// fires at the wrap. Hosts that end the block at the wrap never reach the fold, and without
+/// cycle information the position just runs on.
+pub fn grid_beat(beat: f64, frame: usize, beats_per_frame: f64, cycle: Option<(f64, f64)>) -> f64 {
+    let position = beat + frame as f64 * beats_per_frame;
+    let half = 0.5 * beats_per_frame;
+    match cycle {
+        Some((start, end)) if end - start > beats_per_frame && beat <= end - half && position > end - half => {
+            start + (position - end + half).rem_euclid(end - start) - half
+        }
+        _ => position,
     }
 }
 
@@ -341,15 +371,23 @@ pub struct TransportInfo {
     /// Song position of the block's first frame, in quarter notes.
     pub beat: Option<f64>,
     pub beats_per_frame: Option<f64>,
+    /// The host's cycle (loop) in quarter notes, start included and end not, while it is on and
+    /// the host says so.
+    pub cycle: Option<(f64, f64)>,
 }
 
 impl TransportInfo {
     pub fn playing_at(beat: f64, tempo: f64, sample_rate: f64) -> Self {
-        TransportInfo { playing: true, beat: Some(beat), beats_per_frame: Some(tempo / 60.0 / sample_rate) }
+        TransportInfo { playing: true, beat: Some(beat), beats_per_frame: Some(tempo / 60.0 / sample_rate), cycle: None }
     }
 
     pub fn stopped() -> Self {
-        TransportInfo { playing: false, beat: None, beats_per_frame: None }
+        TransportInfo { playing: false, beat: None, beats_per_frame: None, cycle: None }
+    }
+
+    /// The same transport with the host cycling from `start` to `end`.
+    pub fn cycling(self, start: f64, end: f64) -> Self {
+        TransportInfo { cycle: Some((start, end)), ..self }
     }
 }
 
@@ -761,7 +799,7 @@ impl Engine {
         for frame in 0..frames {
             // The grid line that fired, if one did. Levitate with Restart on goes by its parity.
             let (trigger, line) = match grid {
-                Some((beat, step)) => match self.clock.tick_line(beat + frame as f64 * step, step, interval) {
+                Some((beat, step)) => match self.clock.tick_line(grid_beat(beat, frame, step, transport.cycle), step, interval) {
                     Some(line) => (true, Some(line)),
                     None => (false, None),
                 },
@@ -1001,6 +1039,168 @@ mod tests {
         assert!(!clock.tick(step, step, 1.0));
         assert!(clock.tick(4.0, step, 1.0));
         assert!(clock.tick(0.0, step, 1.0), "jumping back to the cycle start fires again");
+    }
+    /// Blocks a host playing at 120 bpm from `start` reports, as (first frame, length, beat),
+    /// wrapping at the end of `cycle` like Cubase. With `split` every block ends at the wrap;
+    /// otherwise blocks run across it and the next one starts inside the cycle.
+    fn host_blocks(start: f64, cycle: Option<(f64, f64)>, frames: usize, block: usize, split: bool) -> Vec<(usize, usize, f64)> {
+        let step = 120.0 / 60.0 / RATE;
+        let (mut blocks, mut offset, mut beat) = (Vec::new(), 0, start);
+        while offset < frames {
+            let mut length = block.min(frames - offset);
+            if let (true, Some((_, end))) = (split, cycle) {
+                let left = ((end - beat) / step).round();
+                if left >= 1.0 {
+                    length = length.min(left as usize);
+                }
+            }
+            blocks.push((offset, length, beat));
+            let inside = cycle.map_or(false, |(_, end)| beat < end);
+            beat += length as f64 * step;
+            if let Some((cycle_start, end)) = cycle {
+                if inside && beat >= end - 1e-9 {
+                    beat = cycle_start + (beat - end).max(0.0);
+                }
+            }
+            offset += length;
+        }
+        blocks
+    }
+
+    /// The grid lines that fire, as (frame, line), when `rate` plays through `blocks` at 120 bpm
+    /// with `cycle` passed on to the grid.
+    fn grid_lines(rate: SyncRate, blocks: &[(usize, usize, f64)], cycle: Option<(f64, f64)>) -> Vec<(usize, i64)> {
+        let step = 120.0 / 60.0 / RATE;
+        let mut clock = GridClock::default();
+        let mut lines = Vec::new();
+        for &(offset, length, beat) in blocks {
+            for frame in 0..length {
+                if let Some(line) = clock.tick_line(grid_beat(beat, frame, step, cycle), step, rate.beats()) {
+                    lines.push((offset + frame, line));
+                }
+            }
+        }
+        lines
+    }
+
+    #[test]
+    fn a_cycle_one_step_long_fires_every_pass() {
+        // Bar 2 cycled at 1/1: one step, line 1, every 96,000 frames at 120 bpm.
+        let cycle = Some((4.0, 8.0));
+        let passes: Vec<(usize, i64)> = (0..5).map(|pass| (pass * 96_000, 1)).collect();
+        for block in [512, 700, 4096] {
+            let split = host_blocks(4.0, cycle, 5 * 96_000, block, true);
+            assert_eq!(grid_lines(SyncRate::Whole, &split, cycle), passes, "blocks of {block} split at the wrap");
+            assert_eq!(grid_lines(SyncRate::Whole, &split, None), passes, "blocks of {block} split, no cycle info");
+            let across = host_blocks(4.0, cycle, 5 * 96_000, block, false);
+            assert_eq!(grid_lines(SyncRate::Whole, &across, cycle), passes, "blocks of {block} across the wrap");
+        }
+    }
+
+    #[test]
+    fn a_cycle_fires_its_steps_in_order_and_none_past_its_end() {
+        // Bars 2 to 4 cycled at 1/1: lines 1, 2, 3, then 1 again, never 4.
+        let cycle = Some((4.0, 16.0));
+        let expected: Vec<(usize, i64)> = (0..9).map(|n| (n * 96_000, 1 + (n % 3) as i64)).collect();
+        for block in [512, 700, 4096] {
+            for split in [true, false] {
+                let blocks = host_blocks(4.0, cycle, 9 * 96_000, block, split);
+                assert_eq!(grid_lines(SyncRate::Whole, &blocks, cycle), expected, "blocks of {block}, split {split}");
+            }
+            let split = host_blocks(4.0, cycle, 9 * 96_000, block, true);
+            assert_eq!(grid_lines(SyncRate::Whole, &split, None), expected, "blocks of {block} split, no cycle info");
+        }
+        // Dotted quarters over bars 2 and 3: lines 3 to 7 each pass. Line 8 sits exactly on the
+        // cycle's end and must not fire there.
+        let cycle = Some((4.0, 12.0));
+        let expected: Vec<(usize, i64)> =
+            (0..3).flat_map(|pass| (0..5).map(move |k| (pass * 192_000 + 12_000 + k * 36_000, 3 + k as i64))).collect();
+        for block in [512, 700, 4096] {
+            for split in [true, false] {
+                let blocks = host_blocks(4.0, cycle, 3 * 192_000, block, split);
+                assert_eq!(grid_lines(SyncRate::QuarterDotted, &blocks, cycle), expected, "dotted, blocks of {block}, split {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_play_fires_every_line_once_through_tempo_changes() {
+        // The tempo and block size change every block, and with a lag the host reports each
+        // block a little behind where the last one ran to, as when the tempo drifts. A cycle
+        // that playback is past changes nothing.
+        for rate in [SyncRate::Quarter, SyncRate::SixteenthTriplet, SyncRate::EighthDotted, SyncRate::Whole] {
+            for cycle in [None, Some((16.0, 32.0))] {
+                for lag in [0.0, 1.5] {
+                    let mut clock = GridClock::default();
+                    let mut beat = 100.0;
+                    let mut lines = Vec::new();
+                    for index in 0..3_000 {
+                        let tempo = 120.0 + 50.0 * (index as f64 * 0.05).sin();
+                        let step = tempo / 60.0 / RATE;
+                        let block = 64 + (index * 37) % 900;
+                        for frame in 0..block {
+                            if let Some(line) = clock.tick_line(grid_beat(beat, frame, step, cycle), step, rate.beats()) {
+                                lines.push(line);
+                            }
+                        }
+                        beat += (block as f64 - lag) * step;
+                    }
+                    let first = (100.0 / rate.beats()).ceil() as i64;
+                    assert_eq!(lines[0], first, "{rate:?} {cycle:?} lag {lag}");
+                    // About 64 beats in all.
+                    assert!(lines.windows(2).all(|pair| pair[1] == pair[0] + 1), "{rate:?} {cycle:?} lag {lag}: a line doubled or went missing");
+                }
+            }
+        }
+    }
+
+    fn play_grid(clock: &mut GridClock, from: f64, frames: usize) -> Vec<i64> {
+        let step = 120.0 / 60.0 / RATE;
+        (0..frames).filter_map(|frame| clock.tick_line(from + frame as f64 * step, step, 1.0)).collect()
+    }
+
+    #[test]
+    fn locating_fires_the_line_it_lands_on() {
+        let mut clock = GridClock::default();
+        assert_eq!(play_grid(&mut clock, 0.0, 84_000), vec![0, 1, 2, 3], "beats 0 to 3.5");
+        assert_eq!(play_grid(&mut clock, 3.0, 12_000), vec![3], "back onto the line that just fired: it fires again");
+        assert_eq!(play_grid(&mut clock, 3.25, 24_000), vec![4], "back to just past a line: nothing until the next");
+        assert_eq!(play_grid(&mut clock, 1.0, 1_000), vec![1], "back over several lines");
+        assert_eq!(play_grid(&mut clock, 7.0, 1_000), vec![7], "forward");
+        assert_eq!(play_grid(&mut clock, 7.0 + 1_000.0 * 120.0 / 60.0 / RATE, 1_000), Vec::<i64>::new(), "and on from there");
+    }
+
+    #[test]
+    fn restart_plays_every_pass_of_a_cycle_one_step_long() {
+        // Bar 2 cycled at 1/1, blocks running across the wrap: every pass plays the region.
+        let mut engine = Engine::new(RATE);
+        engine.settings.rate = SyncRate::Whole;
+        engine.set_sample(Some(prepared(vec![ramp(1_000)])));
+        let mut left = Vec::new();
+        for (_, length, beat) in host_blocks(4.0, Some((4.0, 8.0)), 3 * 96_000, 700, false) {
+            left.extend(play(&mut engine, length, TransportInfo::playing_at(beat, 120.0, RATE).cycling(4.0, 8.0)));
+        }
+        for pass in 0..3 {
+            assert_eq!(left[pass * 96_000 + 500], 501.0 / 1_000.0, "pass {pass}");
+        }
+    }
+
+    #[test]
+    fn levitate_in_a_cycle_goes_by_each_steps_parity_with_no_step_past_the_end() {
+        // Bars 2 to 4 cycled at 1/1 with blocks across the wrap: lines 1, 2, 3, 1, 2, 3 play
+        // backward, forward, backward, backward, forward, backward. A stray line 4 at the wrap
+        // would play forward there.
+        let mut engine = levitate_with_restart(0.25);
+        engine.settings.rate = SyncRate::Whole;
+        let mut left = Vec::new();
+        for (_, length, beat) in host_blocks(4.0, Some((4.0, 16.0)), 6 * 96_000, 700, false) {
+            left.extend(play(&mut engine, length, TransportInfo::playing_at(beat, 120.0, RATE).cycling(4.0, 16.0)));
+        }
+        for step in 0..6 {
+            let at = step * 96_000;
+            let backwards = left[at + 3_000] > left[at + 6_000];
+            assert_eq!(backwards, step % 3 != 1, "step {step}");
+        }
     }
 
     #[test]

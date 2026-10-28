@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
-use crate::dsp::{one_pole, Svf};
+use crate::dsp::{one_pole, Svf, HP_OFF_HZ, LP_OFF_HZ};
 
 /// Pitch class names, C first.
 pub const KEY_NAMES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -481,6 +481,9 @@ const LIMITER_RELEASE_MS: f32 = 80.0;
 /// How long Dream Eater takes to come in when a sample is loaded, or to hand the track back
 /// when it is unloaded.
 const DRIVE_MS: f64 = 30.0;
+/// How fast the chord's HP and LP follow their knobs, and fade in or out at Off.
+const PANEL_GLIDE_MS: f32 = 20.0;
+const PANEL_FADE_MS: f32 = 20.0;
 /// Once the sample is gone, the chord counts as rung out when it stays under this for
 /// `RUNG_OUT_MS`, and Dream Eater steps aside, bit-exact.
 const RUNG_OUT: f64 = 1e-6;
@@ -682,8 +685,143 @@ impl WetFilter {
     }
 }
 
-/// A signal's mean power over a few hits, which still drops within a second when the signal
-/// falls far below it, and is never far below the signal's power right now.
+/// Haunter's HP and LP knobs on the chord: the same 12 dB/oct Butterworth high-pass then
+/// low-pass as on the sample, one pair per side. A knob's move glides the cutoff in octaves
+/// over about `PANEL_GLIDE_MS`, so nothing zips; a filter turned on from Off, or back to Off,
+/// fades in or out over `PANEL_FADE_MS` instead of switching. At Off a filter is skipped, so
+/// with both at Off the chord is untouched, bit for bit.
+#[derive(Debug, Clone)]
+struct PanelFilter {
+    high_pass: [Svf; 2],
+    low_pass: [Svf; 2],
+    /// Cutoffs in octaves above 1 Hz: where each knob is, and where each filter is now.
+    high_target: f64,
+    low_target: f64,
+    high: f64,
+    low: f64,
+    /// 0..1, how much of each filter is heard. 0 is Off, and the filter is not run.
+    high_mix: f64,
+    low_mix: f64,
+    glide: f64,
+    fade_step: f64,
+    sample_rate: f64,
+}
+
+impl Default for PanelFilter {
+    fn default() -> Self {
+        let (high, low) = ((HP_OFF_HZ as f64).log2(), (LP_OFF_HZ as f64).log2());
+        PanelFilter {
+            high_pass: Default::default(),
+            low_pass: Default::default(),
+            high_target: high,
+            low_target: low,
+            high,
+            low,
+            high_mix: 0.0,
+            low_mix: 0.0,
+            glide: 1.0,
+            fade_step: 1.0,
+            sample_rate: 48_000.0,
+        }
+    }
+}
+
+impl PanelFilter {
+    fn prepare(&mut self, sample_rate: f64) {
+        self.sample_rate = sample_rate;
+        self.glide = 1.0 - one_pole(PANEL_GLIDE_MS, sample_rate);
+        self.fade_step = 1.0 / (PANEL_FADE_MS as f64 * 0.001 * sample_rate).max(1.0);
+        self.tune();
+    }
+
+    fn high_on(&self) -> bool {
+        self.high_target > (HP_OFF_HZ as f64).log2()
+    }
+
+    fn low_on(&self) -> bool {
+        self.low_target < (LP_OFF_HZ as f64).log2()
+    }
+
+    /// Follows the HP and LP knobs. Their Off ends (20 Hz and 20 kHz) skip the filter.
+    fn set(&mut self, high_pass_hz: f32, low_pass_hz: f32) {
+        self.high_target = (high_pass_hz.max(HP_OFF_HZ) as f64).log2();
+        self.low_target = (low_pass_hz.min(LP_OFF_HZ) as f64).log2();
+    }
+
+    /// Goes straight to where the knobs are, with nothing before to glide from.
+    fn snap(&mut self) {
+        self.high_mix = if self.high_on() { 1.0 } else { 0.0 };
+        self.low_mix = if self.low_on() { 1.0 } else { 0.0 };
+        if self.high_on() {
+            self.high = self.high_target;
+        }
+        if self.low_on() {
+            self.low = self.low_target;
+        }
+        self.tune();
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.high_pass.iter_mut().chain(&mut self.low_pass).for_each(Svf::reset);
+    }
+
+    fn tune(&mut self) {
+        for stage in &mut self.high_pass {
+            stage.set(self.high.exp2(), self.sample_rate);
+        }
+        for stage in &mut self.low_pass {
+            stage.set(self.low.exp2(), self.sample_rate);
+        }
+    }
+
+    fn process(&mut self, wet: [f64; 2]) -> [f64; 2] {
+        let (high_on, low_on) = (self.high_on(), self.low_on());
+        // Turning on from Off: start from silence, at the knob's cutoff, and fade in.
+        let mut retune = false;
+        if high_on && self.high_mix <= 0.0 {
+            self.high = self.high_target;
+            self.high_pass.iter_mut().for_each(Svf::reset);
+            retune = true;
+        }
+        if low_on && self.low_mix <= 0.0 {
+            self.low = self.low_target;
+            self.low_pass.iter_mut().for_each(Svf::reset);
+            retune = true;
+        }
+        self.high_mix = if high_on { (self.high_mix + self.fade_step).min(1.0) } else { (self.high_mix - self.fade_step).max(0.0) };
+        self.low_mix = if low_on { (self.low_mix + self.fade_step).min(1.0) } else { (self.low_mix - self.fade_step).max(0.0) };
+        // A filter fading out keeps its last cutoff.
+        for (now, target, on) in [(&mut self.high, self.high_target, high_on), (&mut self.low, self.low_target, low_on)] {
+            if on && *now != target {
+                *now += self.glide * (target - *now);
+                if (target - *now).abs() < 1e-4 {
+                    *now = target;
+                }
+                retune = true;
+            }
+        }
+        if retune {
+            self.tune();
+        }
+        let mut out = wet;
+        if self.high_mix > 0.0 {
+            for side in 0..2 {
+                let filtered = self.high_pass[side].process(out[side]).1;
+                out[side] = if self.high_mix >= 1.0 { filtered } else { out[side] + self.high_mix * (filtered - out[side]) };
+            }
+        }
+        if self.low_mix > 0.0 {
+            for side in 0..2 {
+                let filtered = self.low_pass[side].process(out[side]).0;
+                out[side] = if self.low_mix >= 1.0 { filtered } else { out[side] + self.low_mix * (filtered - out[side]) };
+            }
+        }
+        out
+    }
+}
+
+/// A signal's mean power over a few hits, which still drops within a second when the signal/// falls far below it, and is never far below the signal's power right now.
 #[derive(Debug, Clone, Default)]
 struct PowerMeter {
     slow: f64,
@@ -757,6 +895,8 @@ pub struct DreamEater {
     delay: f64,
     delay_glide: f64,
     wet_filters: [WetFilter; 2],
+    /// The HP and LP knobs, on the chord after its own tone.
+    panel: PanelFilter,
     /// The track's power after the duck, and the chord's before the leveller.
     dry_power: PowerMeter,
     wet_power: PowerMeter,
@@ -842,6 +982,7 @@ impl DreamEater {
             delay: 0.0,
             delay_glide: 0.0,
             wet_filters: Default::default(),
+            panel: PanelFilter::default(),
             dry_power: PowerMeter::default(),
             wet_power: PowerMeter::default(),
             out_power: PowerMeter::default(),
@@ -893,6 +1034,7 @@ impl DreamEater {
         self.limiter_release = 1.0 - one_pole(LIMITER_RELEASE_MS, sample_rate);
         self.peak_release = 1.0 - one_pole(PEAK_RELEASE_MS, sample_rate);
         self.drive_step = 1.0 / (DRIVE_MS * 0.001 * sample_rate).max(1.0);
+        self.panel.prepare(sample_rate);
         self.rung_out_frames = ((RUNG_OUT_MS * 0.001 * sample_rate) as usize).max(1);
         self.reset();
     }
@@ -913,6 +1055,11 @@ impl DreamEater {
     /// Off, after letting any chord already ringing die away; with one it is as it always was.
     pub fn set_driven(&mut self, driven: bool) {
         self.driven = driven;
+    }
+
+    /// Follows the HP and LP knobs, which also filter the chord (not the track).
+    pub fn set_filters(&mut self, high_pass_hz: f32, low_pass_hz: f32) {
+        self.panel.set(high_pass_hz, low_pass_hz);
     }
 
     /// Follows the ducking's Attack, which sets how late the resonators hear the track.
@@ -972,6 +1119,7 @@ impl DreamEater {
         for filter in &mut self.wet_filters {
             filter.reset();
         }
+        self.panel.reset();
         self.dry_power.reset();
         self.wet_power.reset();
         self.out_power.reset();
@@ -1027,6 +1175,7 @@ impl DreamEater {
         let aim_drive = if self.driven { 1.0 } else { 0.0 };
         if self.fresh {
             self.drive = aim_drive;
+            self.panel.snap();
             self.fresh = false;
         } else if self.drive < aim_drive {
             self.drive = (self.drive + self.drive_step).min(aim_drive);
@@ -1103,7 +1252,10 @@ impl DreamEater {
         };
         let dip = if self.drive < 1.0 { 1.0 + self.drive * (dry_gain(amount) - 1.0) } else { dry_gain(amount) };
         let dry = track.map(|side| heard * dip * side);
-        let wet = wet.map(|side| self.leveller * side);
+        // HP and LP shape the chord after the leveller has judged it, so turning HP up thins
+        // the chord rather than having the leveller bring back what HP took away. The makeup
+        // and limiter below see the chord as filtered, so loudness and peaks still hold.
+        let wet = self.panel.process(wet).map(|side| self.leveller * side);
         // Brings the sum back to the ducked track's loudness, where the chord lines up with the
         // track or finds little in it to ring.
         let sum_power = self.out_power.update(
@@ -1439,6 +1591,60 @@ mod tests {
         }
     }
 
+    /// Like `wet_on_noise`, with the HP and LP knobs at `high_pass_hz` and `low_pass_hz`.
+    fn wet_filtered(key: u8, high_pass_hz: f32, low_pass_hz: f32) -> [Vec<f32>; 2] {
+        let input: Vec<f32> = noise((3.0 * RATE) as usize, 11).iter().map(|v| v * 0.3).collect();
+        let mut dream = DreamEater::new(RATE);
+        dream.choose(KeyChoice::Fixed(key));
+        dream.set_filters(high_pass_hz, low_pass_hz);
+        let mut wet = [Vec::new(), Vec::new()];
+        for (n, &v) in input.iter().enumerate() {
+            let out = dream.process([v, v], 2, 1.0, 1.0, 1.0).unwrap();
+            if n >= RATE as usize {
+                for side in 0..2 {
+                    wet[side].push(out[side] - (dream.makeup() * dry_gain(1.0)) as f32 * v);
+                }
+            }
+        }
+        wet
+    }
+
+    #[test]
+    fn hp_and_lp_shape_the_chord() {
+        use crate::dsp::{HP_OFF_HZ, LP_OFF_HZ};
+        let key = 0;
+        let root = root_hz(key);
+        let fifth = root * (VOICING[1] / 12.0).exp2();
+        let top = sparkle_hz(key);
+        // Power near `hz` in both sides, in dB.
+        let level = |wet: &[Vec<f32>; 2], hz: f64| {
+            let power: f64 = wet.iter().map(|side| band_share(side, hz * 0.97, hz * 1.03) * (rms(side) as f64).powi(2)).sum();
+            10.0 * power.max(1e-30).log10()
+        };
+        let whole = |wet: &[Vec<f32>; 2]| 10.0 * wet.iter().map(|side| (rms(side) as f64).powi(2)).sum::<f64>().log10();
+        let open = wet_filtered(key, HP_OFF_HZ, LP_OFF_HZ);
+        assert!(open == wet_on_noise(key, 3.0), "at Off the chord is untouched");
+        let high_passed = wet_filtered(key, 1_000.0, LP_OFF_HZ);
+        let low_passed = wet_filtered(key, HP_OFF_HZ, 500.0);
+        let change = |wet: &[Vec<f32>; 2], hz: f64| level(wet, hz) - level(&open, hz);
+        let label = format!(
+            "HP 1 kHz: root {:.1}, fifth {:.1}, sparkle {:.1}, whole {:.1} dB; LP 500 Hz: root {:.1}, sparkle {:.1} dB",
+            change(&high_passed, root),
+            change(&high_passed, fifth),
+            change(&high_passed, top),
+            whole(&high_passed) - whole(&open),
+            change(&low_passed, root),
+            change(&low_passed, top),
+        );
+        println!("{label}");
+        // HP at 1 kHz takes the root and fifth away and keeps the sparkle, and the chord comes
+        // out thinner and quieter: the leveller doesn't bring back what HP took.
+        assert!(change(&high_passed, root) < -15.0 && change(&high_passed, fifth) < -12.0, "{label}");
+        assert!(change(&high_passed, top).abs() < 3.0, "{label}");
+        assert!(whole(&high_passed) - whole(&open) < -3.0, "{label}");
+        // LP at 500 Hz takes the sparkle away and keeps the root.
+        assert!(change(&low_passed, top) < -20.0 && change(&low_passed, root).abs() < 3.0, "{label}");
+    }
     #[test]
     fn summed_to_mono_the_chord_loses_nothing() {
         for key in [0, 5, 8] {

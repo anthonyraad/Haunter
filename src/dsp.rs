@@ -725,6 +725,7 @@ impl Engine {
         self.raw_follower.set(settings.attack_ms, settings.release_ms, self.sample_rate);
         self.dream.choose(settings.dream_key);
         self.dream.set_attack(settings.attack_ms);
+        self.dream.set_filters(settings.high_pass_hz, settings.low_pass_hz);
         if let Some(sample) = self.sample.clone() {
             self.update_region(sample.frames());
             let key = self.analysis_key(&sample);
@@ -1715,6 +1716,9 @@ mod tests {
         let input = track(4 * RATE as usize);
         for transport in [TransportInfo::playing_at(0.0, 120.0, RATE), TransportInfo::stopped()] {
             let mut on = Engine::new(RATE);
+            // HP and LP, which also filter the chord since 1.7.9, change nothing here either.
+            on.settings.high_pass_hz = 1_000.0;
+            on.settings.low_pass_hz = 500.0;
             let mut off = Engine::new(RATE);
             let (mut eaten, mut plain) = (Vec::new(), Vec::new());
             for chunk in input.chunks(512) {
@@ -1726,6 +1730,84 @@ mod tests {
         }
     }
 
+    /// FNV-1a over the bits of `samples`.
+    fn fingerprint(samples: &[f32]) -> u64 {
+        samples.iter().fold(0xcbf2_9ce4_8422_2325, |hash, v| {
+            v.to_bits().to_le_bytes().iter().fold(hash, |hash, &byte| (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3))
+        })
+    }
+
+    #[test]
+    fn hp_and_lp_at_off_leave_dream_eater_as_in_1_7_8() {
+        // The fingerprint of 1.7.8's output (both sides, Water's kick ducking at 120 bpm, Dream
+        // Eater at 100%): with HP and LP at Off the chord skips them, bit for bit.
+        let input = track(3 * RATE as usize);
+        let mut engine = kick_engine();
+        let mut output = Vec::new();
+        for (block, chunk) in input.chunks(512).enumerate() {
+            let transport = TransportInfo::playing_at((block * 512) as f64 * 2.0 / RATE, 120.0, RATE);
+            output.extend(process_both(&mut engine, chunk, transport, || ducking(1.0)));
+        }
+        let print = fingerprint(&output);
+        assert_eq!(print, 0x8077_7e64_9bfc_8bfe, "{print:#x}");
+    }
+    /// Goertzel power of `signal` at `hz`.
+    fn power_at(signal: &[f32], hz: f64) -> f64 {
+        let coefficient = 2.0 * (std::f64::consts::TAU * hz / RATE).cos();
+        let (mut s1, mut s2) = (0.0, 0.0);
+        for &v in signal {
+            let s0 = v as f64 + coefficient * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        (s1 * s1 + s2 * s2 - coefficient * s1 * s2) / (signal.len() as f64).powi(2)
+    }
+
+    #[test]
+    fn hp_and_lp_filter_the_chord_but_not_the_track() {
+        // A 100 Hz and a 5 kHz tone: HP at 1 kHz or LP at 500 Hz on the track would take one
+        // away by 30 dB or more. On the chord only, each stays within 2.5 dB: the makeup may
+        // bring the track up a little (at most the 2.4 dB dip) as the chord gets quieter.
+        let frames = 3 * RATE as usize;
+        let (low, high) = (sine(100.0, frames), sine(5_000.0, frames));
+        let input: Vec<f32> = (0..frames).map(|n| 0.2 * (low[n] + high[n])).collect();
+        let run = |high_pass_hz: f32, low_pass_hz: f32| {
+            let mut engine = kick_engine();
+            engine.settings.high_pass_hz = high_pass_hz;
+            engine.settings.low_pass_hz = low_pass_hz;
+            play_dream(&mut engine, &input, 1.0, |_, _| {})[RATE as usize..].to_vec()
+        };
+        let open = run(HP_OFF_HZ, LP_OFF_HZ);
+        let filtered = run(1_000.0, 500.0);
+        for hz in [100.0, 5_000.0] {
+            let change = 10.0 * (power_at(&filtered, hz) / power_at(&open, hz)).log10();
+            assert!(change.abs() < 2.5, "{hz} Hz: {change:.2} dB");
+        }
+    }
+
+    #[test]
+    fn sweeping_hp_and_lp_on_the_chord_does_not_click() {
+        // The knobs jump every 0.1 s, on and off and across the range, as automation might.
+        let input = smooth_track(5 * RATE as usize);
+        let highs = [HP_OFF_HZ, 400.0, 1_500.0, 300.0, HP_OFF_HZ, 2_000.0, 800.0, HP_OFF_HZ];
+        let lows = [LP_OFF_HZ, 3_000.0, 600.0, LP_OFF_HZ, 1_200.0, 400.0, LP_OFF_HZ, 5_000.0];
+        let changed = |sweep: bool| {
+            let mut engine = kick_engine();
+            let output = play_dream(&mut engine, &input, 1.0, |engine, at| {
+                if sweep && at >= RATE as usize {
+                    let step = (at - RATE as usize) / 4_800;
+                    engine.settings.high_pass_hz = highs[step % highs.len()];
+                    engine.settings.low_pass_hz = lows[(step / 3) % lows.len()];
+                }
+            });
+            output.iter().zip(&input).map(|(a, b)| a - b).collect::<Vec<f32>>()
+        };
+        let (swept, still) = (changed(true), changed(false));
+        let span = RATE as usize..input.len();
+        let (swept_step, still_step) = (biggest_step(&swept[span.clone()]), biggest_step(&still[span]));
+
+        assert!(swept_step <= 1.2 * still_step, "{swept_step} sweeping against {still_step} still");
+    }
     #[test]
     fn a_loaded_sample_keeps_dream_eater_on_even_while_stopped() {
         // As in 1.7.7: with a sample loaded, the chord rings between hits and with the transport

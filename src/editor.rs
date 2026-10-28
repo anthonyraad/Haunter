@@ -53,7 +53,10 @@ const HANDLE_REACH: f32 = 12.0;
 const DRIVE_GLIDE_S: f32 = 0.06;
 /// How far the Drive shown may move before the bent waveform is worked out again.
 const DRIVE_REDRAW: f32 = 0.002;
-/// How far toward the playhead colour the waveform warms at full Drive.
+/// The colour the waveform leans toward as Drive turns up, #BFBFEC since 1.7.14 (the playhead
+/// colour before).
+const DRIVE_TINT_TO: Color32 = Color32::from_rgb(0xbf, 0xbf, 0xec);
+/// How far toward `DRIVE_TINT_TO` the waveform leans at full Drive.
 const DRIVE_TINT: f32 = 0.15;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -490,7 +493,7 @@ fn waveform(
     }
 
     // Waveform, brighter inside the region. Since 1.7.13 it bends through the same curve as the
-    // sample does as Drive turns up, at the same scale, and warms a little; at 0 it is as before.
+    // sample does as Drive turns up, at the same scale, and is tinted a little; at 0 it is as before.
     let middle = inner.center().y;
     let half_height = inner.height() * 0.5;
     let drive = shown_drive(ui.ctx(), params, state);
@@ -500,8 +503,8 @@ fn waveform(
     let peak = if bent.is_some() { columns.iter().fold(peak, |m, (lo, hi)| m.max(lo.abs()).max(hi.abs())) } else { peak };
     let scale = half_height / peak;
     let (inside, outside) = if drive > 0.0 {
-        let warm = |color: Color32| color.lerp_to_gamma(PLAYHEAD, DRIVE_TINT * drive);
-        (warm(ARC), warm(TRACK))
+        let tint = |color: Color32| color.lerp_to_gamma(DRIVE_TINT_TO, DRIVE_TINT * drive);
+        (tint(ARC), tint(TRACK))
     } else {
         (ARC, TRACK)
     };
@@ -2198,7 +2201,7 @@ mod tests {
     }
 
     #[test]
-    fn drive_glides_the_waveform_into_a_rounder_fuller_shape() {
+    fn drive_glides_the_waveform_into_a_fuller_shape_at_full_height() {
         let mut editor = Editor::new(true);
         let rect = editor.settle().waveform;
         let clean = waveform_lines(&editor, rect);
@@ -2206,10 +2209,13 @@ mod tests {
         editor.state.drive_for_test = Some(1.0);
         let mut shown = Vec::new();
         let mut frames = vec![clean_heights.clone()];
+        let mut painted = Vec::new();
         for _ in 0..60 {
             editor.frame();
             shown.push(editor.state.shown_drive.unwrap());
-            frames.push(line_heights(&waveform_lines(&editor, rect)));
+            let lines = waveform_lines(&editor, rect);
+            frames.push(line_heights(&lines));
+            painted.push(lines);
         }
         // It glides: no jump to the end, every frame further on, and there within a second.
         assert!(shown[0] > 0.0 && shown[0] < 0.4, "first frame shows {}", shown[0]);
@@ -2224,15 +2230,33 @@ mod tests {
         let full = frames.last().unwrap();
         let tallest = |h: &[f32]| h.iter().copied().fold(0f32, f32::max);
         let tail = |h: &[f32]| h[h.len() * 3 / 4..].iter().sum::<f32>();
-        assert!(tallest(full) < 0.95 * tallest(&clean_heights), "the peaks round off");
-        assert!(tail(full) / tallest(full) > 1.2 * tail(&clean_heights) / tallest(&clean_heights), "the quiet part swells");
-        // Still inside the waveform, the playhead and handles as they were, and just a touch warmer.
+        let _ = tallest;
+        assert!(tail(full) > 1.5 * tail(&clean_heights), "the quiet part swells");
+        // The loudest point stays as high as it was on every frame (since 1.7.14), so the picture
+        // never shrinks.
+        let middle = rect.shrink2(egui::vec2(10.0, 14.0)).center().y;
+        let reach = |lines: &[([Pos2; 2], Color32)]| {
+            lines.iter().fold(0f32, |m, (p, _)| m.max(middle - p[0].y - 0.5).max(p[1].y - 0.5 - middle))
+        };
+        let clean_reach = reach(&clean);
+        let reaches: Vec<f32> = painted.iter().map(|lines| reach(lines)).collect();
+        for (frame, lines) in reaches.iter().enumerate() {
+            assert!((lines / clean_reach - 1.0).abs() < 0.01, "frame {frame}: reaches {lines} against {clean_reach}");
+        }
+        // Still inside the waveform, the playhead and handles as they were, and tinted just a touch
+        // toward #BFBFEC, not the playhead colour.
         let lines = waveform_lines(&editor, rect);
         let inner = rect.shrink2(egui::vec2(10.0, 14.0));
         assert!(lines.iter().all(|(p, _)| p[0].y >= inner.top() - 1.0 && p[1].y <= inner.bottom() + 1.0));
         assert!(editor.screen.shapes.iter().any(|shape| matches!(shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == PLAYHEAD && stroke.width == 1.5)));
-        let warm = ARC.lerp_to_gamma(PLAYHEAD, DRIVE_TINT);
-        assert!(lines.iter().any(|(_, c)| *c == warm), "the region is warmed");
+        let warm = ARC.lerp_to_gamma(DRIVE_TINT_TO, DRIVE_TINT);
+        let outside = TRACK.lerp_to_gamma(DRIVE_TINT_TO, DRIVE_TINT);
+        // The region covers the whole sample here, so everything is the region's colour.
+        assert!(lines.iter().any(|(_, c)| *c == warm), "the region is tinted");
+        assert!(lines.iter().all(|(_, c)| *c == warm || *c == outside), "the rest is tinted alike");
+        assert_eq!((warm, outside), (Color32::from_rgb(0x86, 0x7a, 0xc2), Color32::from_rgb(0xbb, 0xb7, 0xd5)));
+        assert!(lines.iter().all(|(_, c)| *c != ARC.lerp_to_gamma(PLAYHEAD, DRIVE_TINT)), "not toward the playhead");
+        assert_eq!(PLAYHEAD, Color32::from_rgb(0xeb, 0x78, 0x9a));
         let shift = |a: Color32, b: Color32| (a.r() as i32 - b.r() as i32).abs().max((a.g() as i32 - b.g() as i32).abs()).max((a.b() as i32 - b.b() as i32).abs());
         assert!(shift(warm, ARC) <= 25, "subtle: {warm:?}");
         // Settled, the bent waveform isn't worked out again.

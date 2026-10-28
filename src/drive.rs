@@ -296,9 +296,11 @@ pub fn transfer(x: f64, drive: f64) -> f64 {
 
 /// The waveform display's columns (each a column's lowest and highest sample) as Drive bends
 /// them: brought to a peak of 1 as the saturator brings its input to its held peak, through the
-/// curve, matched back to the loudness they had (as the saturator matches its output, and held
-/// to the same range), and returned at their own scale. Peaks round off and quieter parts swell.
-/// At 0 they are returned untouched.
+/// curve, and brought back so the loudest point is exactly as high as it was (since 1.7.14; 1.7.13
+/// matched the loudness instead, which shrank the picture). So the waveform never shrinks: the
+/// peaks stay full height and flatten, and the quieter parts swell, as the sound fattens. The
+/// audio itself is loudness-matched; this is only how it is drawn. At 0 they are returned
+/// untouched.
 pub fn driven_columns(columns: &[(f32, f32)], drive: f32) -> Vec<(f32, f32)> {
     if !(drive > 0.0) {
         return columns.to_vec();
@@ -307,10 +309,9 @@ pub fn driven_columns(columns: &[(f32, f32)], drive: f32) -> Vec<(f32, f32)> {
     let peak = columns.iter().fold(1e-6f64, |m, &(lo, hi)| m.max((lo as f64).abs()).max((hi as f64).abs()));
     let bent: Vec<(f64, f64)> =
         columns.iter().map(|&(lo, hi)| (transfer.apply(lo as f64 / peak), transfer.apply(hi as f64 / peak))).collect();
-    let power_in: f64 = columns.iter().map(|&(lo, hi)| ((lo as f64).powi(2) + (hi as f64).powi(2)) / (peak * peak)).sum();
-    let power_out: f64 = bent.iter().map(|&(lo, hi)| lo * lo + hi * hi).sum();
-    let matched = ((power_in + 1e-24) / (power_out + 1e-24)).sqrt().clamp(1.0 / MAX_MATCH, MAX_MATCH);
-    bent.into_iter().map(|(lo, hi)| ((lo * matched * peak) as f32, (hi * matched * peak) as f32)).collect()
+    let bent_peak = bent.iter().fold(0f64, |m, &(lo, hi)| m.max(lo.abs()).max(hi.abs()));
+    let matched = if bent_peak > 0.0 { peak / bent_peak } else { peak };
+    bent.into_iter().map(|(lo, hi)| ((lo * matched) as f32, (hi * matched) as f32)).collect()
 }
 
 /// What one frame's Drive works out to.
@@ -549,22 +550,23 @@ mod tests {
     }
 
     #[test]
-    fn drive_rounds_the_waveforms_peaks_and_swells_its_tail_smoothly() {
+    fn drive_keeps_the_waveforms_peak_and_swells_its_tail_smoothly() {
         let columns = kick_columns();
         let peak_of = |c: &[(f32, f32)]| c.iter().fold(0f32, |m, &(lo, hi)| m.max(lo.abs()).max(hi.abs()));
         let tail_of = |c: &[(f32, f32)]| c[700..].iter().map(|&(lo, hi)| hi - lo).sum::<f32>();
         let (peak, tail) = (peak_of(&columns), tail_of(&columns));
-        let mut last = (1.0f32, 1.0f32);
+        let mut last = 1.0f32;
         let mut previous = columns.clone();
         for step in 1..=100 {
             let drive = step as f32 / 100.0;
             let shown = driven_columns(&columns, drive);
             let (crest, swell) = (peak_of(&shown) / peak, tail_of(&shown) / tail);
-            // The tail grows relative to the peak, step by step (within a hair while the curve barely
-            // bends, where the asymmetry and the loudness match nudge both by under 0.2%).
-            let ratio = swell / crest;
-            assert!(ratio >= last.1 / last.0 - 2e-3, "{drive}: {ratio}");
-            last = (crest, swell);
+            // The loudest point stays at its height, so the picture never shrinks, and the tail
+            // grows, step by step (within a hair while the curve barely bends, where the asymmetry
+            // nudges it by about 0.01%, far under a pixel).
+            assert!((crest - 1.0).abs() < 0.01, "{drive}: peak at {crest}");
+            assert!(swell >= last * (1.0 - 1e-3), "{drive}: tail {swell} after {last}");
+            last = swell;
             // A small turn moves the picture a little: no jumps to flicker.
             let moved = shown.iter().zip(&previous).map(|(a, b)| (a.0 - b.0).abs().max((a.1 - b.1).abs())).fold(0f32, f32::max);
             assert!(moved < 0.03 * peak, "{drive}: moved {moved}");
@@ -575,8 +577,10 @@ mod tests {
             }
         }
         let full = driven_columns(&columns, 1.0);
-        assert!(tail_of(&full) / peak_of(&full) > 2.0 * tail / peak, "the quiet part swells");
-        assert!(peak_of(&full) < 0.8 * peak, "the peaks round off");
+        assert!(tail_of(&full) > 2.0 * tail, "the quiet part swells");
+        // Below the peak everything is lifted: the loud part flattens toward full height.
+        let near_peak = |c: &[(f32, f32)]| c.iter().filter(|&&(_, hi)| hi > 0.5 * peak).count();
+        assert!(near_peak(&full) > near_peak(&columns) * 5 / 4, "{} against {}", near_peak(&full), near_peak(&columns));
     }
 
     fn sine(freq: f64, frames: usize, level: f64) -> Vec<f64> {

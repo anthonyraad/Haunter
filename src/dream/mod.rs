@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
 
+use crate::drive::Saturator;
 use crate::dsp::{one_pole, Svf, HP_OFF_HZ, LP_OFF_HZ};
 
 /// Pitch class names, C first.
@@ -928,6 +929,9 @@ pub struct DreamEater {
     /// Frames the chord has stayed rung out since the sample went.
     quiet: usize,
     rung_out_frames: usize,
+    /// The Drive knob, which saturates the chord after HP and LP, and the saturator.
+    saturation_drive: f64,
+    saturation: Saturator,
     #[cfg(test)]
     pub(crate) probe: Probe,
 }
@@ -1003,6 +1007,8 @@ impl DreamEater {
             fresh: true,
             quiet: 0,
             rung_out_frames: 1,
+            saturation_drive: 0.0,
+            saturation: Saturator::new(sample_rate),
             #[cfg(test)]
             probe: Probe::default(),
         };
@@ -1036,6 +1042,7 @@ impl DreamEater {
         self.drive_step = 1.0 / (DRIVE_MS * 0.001 * sample_rate).max(1.0);
         self.panel.prepare(sample_rate);
         self.rung_out_frames = ((RUNG_OUT_MS * 0.001 * sample_rate) as usize).max(1);
+        self.saturation.prepare(sample_rate);
         self.reset();
     }
 
@@ -1049,12 +1056,19 @@ impl DreamEater {
         self.swell = 0.0;
         self.fresh = true;
         self.quiet = 0;
+        self.saturation.reset();
     }
 
     /// Tells Dream Eater whether a sample is loaded. Without one it bypasses, bit-exact like
     /// Off, after letting any chord already ringing die away; with one it is as it always was.
     pub fn set_driven(&mut self, driven: bool) {
         self.driven = driven;
+    }
+
+    /// Follows the Drive knob, 0 to 1, which saturates the chord after HP and LP. At 0 the chord
+    /// is left as it was, bit for bit.
+    pub fn set_saturation(&mut self, drive: f32) {
+        self.saturation_drive = drive as f64;
     }
 
     /// Follows the HP and LP knobs, which also filter the chord (not the track).
@@ -1120,6 +1134,7 @@ impl DreamEater {
             filter.reset();
         }
         self.panel.reset();
+        self.saturation.reset();
         self.dry_power.reset();
         self.wet_power.reset();
         self.out_power.reset();
@@ -1256,6 +1271,9 @@ impl DreamEater {
         // the chord rather than having the leveller bring back what HP took away. The makeup
         // and limiter below see the chord as filtered, so loudness and peaks still hold.
         let wet = self.panel.process(wet).map(|side| self.leveller * side);
+        // Drive warms the chord where HP and LP shape it, loudness matched, so the makeup and
+        // limiter below still hold it to the track's level and peaks.
+        let wet = self.saturation.process(wet, self.saturation_drive);
         // Brings the sum back to the ducked track's loudness, where the chord lines up with the
         // track or finds little in it to ring.
         let sum_power = self.out_power.update(

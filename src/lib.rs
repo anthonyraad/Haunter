@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub mod audio_file;
 pub mod dream;
+pub mod drive;
 pub mod dsp;
 mod editor;
 pub mod preset;
@@ -276,8 +277,8 @@ pub struct HaunterParams {
     #[id = "lp"]
     pub low_pass: FloatParam,
 
-    #[id = "sample-volume"]
-    pub sample_volume: FloatParam,
+    #[id = "drive"]
+    pub drive: FloatParam,
     #[id = "blend"]
     pub blend: FloatParam,
 
@@ -342,22 +343,6 @@ fn cutoff_param(name: &str, default: f32, min: f32, max: f32, off_at: f32) -> Fl
         .with_string_to_value(formatters::s2v_f32_hz_then_khz())
 }
 
-fn gain_param(name: &str, default_db: f32, min_db: f32, max_db: f32) -> FloatParam {
-    FloatParam::new(
-        name,
-        util::db_to_gain(default_db),
-        FloatRange::Skewed {
-            min: util::db_to_gain(min_db),
-            max: util::db_to_gain(max_db),
-            factor: FloatRange::gain_skew_factor(min_db, max_db),
-        },
-    )
-    .with_smoother(SmoothingStyle::Logarithmic(20.0))
-    .with_unit(" dB")
-    .with_value_to_string(formatters::v2s_f32_gain_to_db(1))
-    .with_string_to_value(formatters::s2v_f32_gain_to_db())
-}
-
 /// Whole-percent steps, so the knob is either exactly Off or at least 1%.
 fn dream_eater_param() -> FloatParam {
     FloatParam::new("Dream Eater", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
@@ -396,7 +381,7 @@ impl HaunterParams {
             release: time_param("Release", 80.0, 5.0, 1000.0),
             high_pass: cutoff_param("HP", HP_OFF_HZ, HP_OFF_HZ, 2_000.0, HP_OFF_HZ),
             low_pass: cutoff_param("LP", LP_OFF_HZ, 50.0, LP_OFF_HZ, LP_OFF_HZ),
-            sample_volume: gain_param("Sample Volume", 0.0, -48.0, 12.0),
+            drive: percent_param("Drive", 0.0),
             blend: percent_param("Sample Blend", 0.0),
             mix: percent_param("Mix", 1.0),
             dream_eater: dream_eater_param(),
@@ -424,7 +409,8 @@ impl HaunterParams {
 /// output is now always at unity. A state without Dream Eater loads with it Off, and one without
 /// a Dream Eater key loads on Auto, since whatever a state leaves out would otherwise keep the
 /// value it had. Up to 1.6, Reverse on becomes Direction Backward and off becomes Forward, and a
-/// state with neither loads on Forward.
+/// state with neither loads on Forward. Up to 1.7.11, Sample Volume is folded into Sample Blend,
+/// capped at 100%, and Drive, which took its place, loads at 0.
 fn migrate_state(state: &mut PluginState) {
     if let Some(reverse) = state.params.remove("reverse") {
         let backward = matches!(reverse, ParamValue::Bool(true))
@@ -440,6 +426,14 @@ fn migrate_state(state: &mut PluginState) {
     }
     state.params.remove("invert");
     state.params.remove("output");
+    if let Some(ParamValue::F32(volume)) = state.params.remove("sample-volume") {
+        let blend = match state.params.get("blend") {
+            Some(ParamValue::F32(blend)) => *blend,
+            _ => 0.0,
+        };
+        state.params.insert("blend".to_owned(), ParamValue::F32(preset::fold_sample_volume(blend, volume)));
+    }
+    state.params.entry("drive".to_owned()).or_insert(ParamValue::F32(0.0));
     state.params.entry("dream-eater".to_owned()).or_insert(ParamValue::F32(0.0));
     state
         .fields
@@ -593,13 +587,12 @@ impl Plugin for Haunter {
 
         let params = &self.params;
         let report = self.engine.process(buffer.as_slice(), &info, || {
-            let volume = params.sample_volume.smoothed.next();
-            let blend = params.blend.smoothed.next();
             FrameGains {
                 depth: params.depth.smoothed.next(),
                 mix: params.mix.smoothed.next(),
-                sample_level: volume * blend,
+                sample_level: params.blend.smoothed.next(),
                 dream_eater: params.dream_eater.smoothed.next(),
+                drive: params.drive.smoothed.next(),
             }
         });
 
@@ -681,7 +674,7 @@ mod tests {
         let frames = host_rate as usize;
         let mut left = vec![1.0f32; frames];
         let mut right = vec![1.0f32; frames];
-        let gains = FrameGains { depth: 0.8, mix: 1.0, sample_level: 0.5, dream_eater: 0.0 };
+        let gains = FrameGains { depth: 0.8, mix: 1.0, sample_level: 0.5, dream_eater: 0.0, drive: 0.0 };
         plugin.engine.process(
             &mut [&mut left[..], &mut right[..]],
             &TransportInfo::playing_at(0.0, 120.0, host_rate),
@@ -758,11 +751,12 @@ mod tests {
         let ids: Vec<String> = plugin.params.param_map().into_iter().map(|(id, _, _)| id).collect();
         for id in [
             "rate", "restart", "direction", "start", "end", "depth", "attack", "release", "hp", "lp",
-            "sample-volume", "blend", "mix", "dream-eater",
+            "drive", "blend", "mix", "dream-eater",
         ] {
             assert!(ids.iter().any(|known| known == id), "missing parameter {id}");
         }
         assert!(!ids.iter().any(|id| id == "mode" || id == "invert" || id == "output" || id == "reverse"));
+        assert!(!ids.iter().any(|id| id == "sample-volume"), "Drive took Sample Volume's place");
         let fields = plugin.params.serialize_fields();
         assert_eq!(fields.get("sample").map(String::as_str), Some("null"));
         assert!(fields.contains_key("editor-state"));
@@ -933,11 +927,13 @@ mod tests {
     #[test]
     fn defaults() {
         let params = &Haunter::default().params;
-        let volume = &params.sample_volume;
-        assert_eq!(volume.default_plain_value(), 1.0);
-        assert_eq!(volume.to_string(), "0.0 dB");
+        let drive = &params.drive;
+        assert_eq!(drive.default_plain_value(), 0.0);
+        assert_eq!(drive.to_string(), "0%");
         // What the host shows for the default it was given.
-        assert_eq!(volume.normalized_value_to_string(volume.default_normalized_value(), true), "0.0 dB");
+        assert_eq!(drive.normalized_value_to_string(drive.default_normalized_value(), true), "0%");
+        assert_eq!(drive.normalized_value_to_string(1.0, true), "100%");
+        assert_eq!(params.blend.default_plain_value(), 0.0);
 
         let dream = &params.dream_eater;
         assert_eq!(dream.default_plain_value(), 0.0);
@@ -985,6 +981,7 @@ mod tests {
         current.params.insert("restart".to_owned(), ParamValue::Bool(false));
         current.params.insert("dream-eater".to_owned(), ParamValue::F32(0.4));
         current.params.insert("direction".to_owned(), ParamValue::String("levitate".into()));
+        current.params.insert("drive".to_owned(), ParamValue::F32(0.2));
         let before = format!("{:?}", current.params);
         Haunter::filter_state(&mut current);
         assert_eq!(format!("{:?}", current.params), before, "new states are left alone");
@@ -1073,6 +1070,9 @@ mod tests {
         assert!(matches!(state.params.get("dream-eater"), Some(ParamValue::F32(v)) if *v == 0.0));
         assert!(!state.params.contains_key("reverse"), "Reverse is now Direction");
         assert!(matches!(state.params.get("direction"), Some(ParamValue::String(d)) if d == "backward"), "Reverse on is Backward");
+        assert!(!state.params.contains_key("sample-volume"), "Sample Volume is folded into Blend");
+        assert!(matches!(state.params.get("blend"), Some(ParamValue::F32(v)) if *v == 0.0));
+        assert!(matches!(state.params.get("drive"), Some(ParamValue::F32(v)) if *v == 0.0), "Drive loads at 0");
 
         // The wrapper looks each saved parameter up by ID and skips any it doesn't know, so every
         // one must still exist with a matching type.
@@ -1097,8 +1097,34 @@ mod tests {
     }
 
     #[test]
-    fn restoring_state_replaces_the_playing_sample() {
-        let mut plugin = Haunter::default();
+    fn states_from_1_7_11_fold_sample_volume_into_blend_and_load_drive_at_0() {
+        for (volume, blend, folded) in [(1.0, 0.6, 0.6), (0.5, 0.8, 0.4), (4.0, 0.5, 1.0), (0.25, 0.0, 0.0)] {
+            let mut state = state_from_1_1();
+            state.version = "1.7.11".into();
+            state.params.insert("sample-volume".to_owned(), ParamValue::F32(volume));
+            state.params.insert("blend".to_owned(), ParamValue::F32(blend));
+            Haunter::filter_state(&mut state);
+            assert!(!state.params.contains_key("sample-volume"));
+            assert!(
+                matches!(state.params.get("blend"), Some(ParamValue::F32(v)) if (*v - folded).abs() < 1e-6),
+                "{volume} x {blend}: {:?}",
+                state.params.get("blend")
+            );
+            assert!(matches!(state.params.get("drive"), Some(ParamValue::F32(v)) if *v == 0.0));
+        }
+
+        // A state that has Drive keeps it.
+        let mut state = state_from_1_1();
+        state.params.remove("sample-volume");
+        state.params.insert("drive".to_owned(), ParamValue::F32(0.7));
+        state.params.insert("blend".to_owned(), ParamValue::F32(0.3));
+        Haunter::filter_state(&mut state);
+        assert!(matches!(state.params.get("drive"), Some(ParamValue::F32(v)) if *v == 0.7));
+        assert!(matches!(state.params.get("blend"), Some(ParamValue::F32(v)) if *v == 0.3));
+    }
+
+    #[test]
+    fn restoring_state_replaces_the_playing_sample() {        let mut plugin = Haunter::default();
         render(&mut plugin, 48_000.0);
         assert!(plugin.engine.sample().is_none());
 

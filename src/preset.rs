@@ -39,10 +39,28 @@ const TOLERANCE: f32 = 1e-4;
 pub type Values = BTreeMap<String, f32>;
 
 /// Brings values saved before 1.7 up to date: the Reverse toggle (`reverse`, 0 or 1) became the
-/// Direction choice (`direction`, 0 Forward, 1 Backward, 2 Levitate).
+/// Direction choice (`direction`, 0 Forward, 1 Backward, 2 Levitate). Values saved before 1.7.12
+/// have Sample Volume (`sample-volume`, as a gain), which is folded into Sample Blend (`blend`),
+/// and no Drive (`drive`), which loads at 0.
 pub fn migrate_values(values: &mut Values) {
     if let Some(reverse) = values.remove("reverse") {
         values.entry("direction".to_owned()).or_insert(if reverse >= 0.5 { 1.0 } else { 0.0 });
+    }
+    if let Some(volume) = values.remove("sample-volume") {
+        let blend = values.get("blend").copied().unwrap_or(0.0);
+        values.insert("blend".to_owned(), fold_sample_volume(blend, volume));
+        values.entry("drive".to_owned()).or_insert(0.0);
+    }
+}
+
+/// Sample Blend with the Sample Volume of before 1.7.12 folded in, as near as Blend can get: the
+/// level of the blended sample, capped at 100%.
+pub fn fold_sample_volume(blend: f32, volume: f32) -> f32 {
+    let folded = blend * volume;
+    if folded.is_finite() {
+        folded.clamp(0.0, 1.0)
+    } else {
+        blend.clamp(0.0, 1.0)
     }
 }
 
@@ -157,8 +175,9 @@ impl SelectionSlot {
 }
 
 impl<'a> PersistentField<'a, Selection> for SelectionSlot {
-    /// Restoring a state. A preset chosen before 1.7 remembers Reverse, so it is mapped the same
-    /// way as the parameter, and the preset doesn't show as changed.
+    /// Restoring a state. A preset chosen before 1.7 remembers Reverse, and one chosen before
+    /// 1.7.12 Sample Volume, so they are mapped the same way as the parameters, and the preset
+    /// doesn't show as changed.
     fn set(&self, mut new_value: Selection) {
         migrate_values(&mut new_value.values);
         SelectionSlot::set(self, new_value);
@@ -399,8 +418,41 @@ mod tests {
     }
 
     #[test]
-    fn user_presets_saved_before_a_factory_preset_took_their_name_stay_listed() {
+    fn presets_saved_with_sample_volume_fold_it_into_blend() {
         let folder = crate::test_support::TempDir::new();
+        std::fs::create_dir_all(folder.path()).unwrap();
+        for (name, volume, blend) in [("Quiet", 0.5, 0.8), ("Loud", 4.0, 0.5)] {
+            let file = format!(
+                r#"{{"haunter_preset":1,"name":"{name}","plugin_version":"1.7.11","params":{{"depth":0.5,"sample-volume":{volume:.1},"blend":{blend:.1}}},"sample":null,"dream_key":"auto"}}"#
+            );
+            std::fs::write(folder.path().join(format!("{name}.json")), file).unwrap();
+        }
+        let presets = UserPresets::new(folder.path().to_owned());
+        for (name, blend) in [("Quiet", 0.4), ("Loud", 1.0)] {
+            let preset = presets.load(name).unwrap();
+            assert!((preset.values["blend"] - blend).abs() < 1e-6, "{name}: {:?}", preset.values);
+            assert_eq!(preset.values.get("drive"), Some(&0.0));
+            assert!(!preset.values.contains_key("sample-volume"));
+            assert_eq!(preset.values.get("depth"), Some(&0.5));
+        }
+
+        // A project that had a 1.7.11 preset selected folds it the same way, so the preset doesn't
+        // show as changed once the parameters have been folded too.
+        let slot = SelectionSlot::default();
+        let values: Values = [("sample-volume".to_owned(), 0.5), ("blend".to_owned(), 0.8)].into_iter().collect();
+        PersistentField::set(&slot, Selection { choice: Choice::User("Quiet".into()), values, sample: 0 });
+        let values = slot.get().values;
+        assert!((values["blend"] - 0.4).abs() < 1e-6 && values.get("drive") == Some(&0.0) && values.len() == 2, "{values:?}");
+
+        // Newer values are left alone.
+        let mut values: Values = [("drive".to_owned(), 0.3), ("blend".to_owned(), 0.8)].into_iter().collect();
+        let before = values.clone();
+        migrate_values(&mut values);
+        assert_eq!(values, before);
+    }
+
+    #[test]
+    fn user_presets_saved_before_a_factory_preset_took_their_name_stay_listed() {        let folder = crate::test_support::TempDir::new();
         std::fs::create_dir_all(folder.path()).unwrap();
         for name in ["Paper", "Init", "con", "Mine"] {
             std::fs::write(folder.path().join(format!("{name}.json")), "{}").unwrap();

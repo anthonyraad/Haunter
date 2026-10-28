@@ -4,6 +4,7 @@ use nih_plug::prelude::Enum;
 use std::sync::Arc;
 
 use crate::dream::{DreamEater, KeyChoice};
+use crate::drive::{bend_envelope, Saturator};
 use crate::sample::PreparedSample;
 
 /// At or below this the high-pass is bypassed.
@@ -353,15 +354,18 @@ pub struct FrameGains {
     pub depth: f32,
     /// 0..1, dry/wet for the ducking.
     pub mix: f32,
-    /// Sample volume times sample blend.
+    /// 0..1, how much of the sample is blended into the output: Sample Blend.
     pub sample_level: f32,
     /// 0..1, how strongly the sample plays Dream Eater's resonances on the track. 0 bypasses them.
     pub dream_eater: f32,
+    /// 0..1, Drive: saturates the blended sample and Dream Eater's chord, and thickens the dips.
+    /// 0 leaves everything as it was, bit for bit.
+    pub drive: f32,
 }
 
 impl Default for FrameGains {
     fn default() -> Self {
-        FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 }
+        FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0, drive: 0.0 }
     }
 }
 
@@ -604,6 +608,8 @@ pub struct Engine {
     was_playing: bool,
     /// Dream Eater's resonances on the track, and the key detection that tunes them.
     dream: DreamEater,
+    /// Drive on the blended sample.
+    saturator: Saturator,
 }
 
 impl Engine {
@@ -624,6 +630,7 @@ impl Engine {
             region: (0, 0),
             was_playing: false,
             dream: DreamEater::new(sample_rate),
+            saturator: Saturator::new(sample_rate),
         };
         engine.prepare(sample_rate);
         engine
@@ -634,6 +641,7 @@ impl Engine {
         self.sample_rate = sample_rate;
         self.declick = ((DECLICK_SECONDS * sample_rate).round() as usize).max(1);
         self.dream.prepare(sample_rate);
+        self.saturator.prepare(sample_rate);
         self.reset();
     }
 
@@ -648,6 +656,7 @@ impl Engine {
         self.raw_follower.reset();
         self.was_playing = false;
         self.dream.reset();
+        self.saturator.reset();
     }
 
     /// The key Dream Eater is tuned to, C = 0.
@@ -813,6 +822,7 @@ impl Engine {
                 track[index] = channel[frame];
             }
             self.dream.set_driven(self.sample.is_some());
+            self.dream.set_saturation(gains.drive);
             let eaten = self.dream.process(track, channel_count.min(2), envelope, track_gain, gains.dream_eater);
             for (index, channel) in channels.iter_mut().enumerate() {
                 let add = match (channel_count, index) {
@@ -842,6 +852,9 @@ impl Engine {
     /// Returns (track gain, sample left, sample right, normalised envelope) for one frame.
     fn frame(&mut self, trigger: bool, line: Option<i64>, playing: bool, gains: &FrameGains) -> (f32, f32, f32, f32) {
         let Some(sample) = self.sample.clone() else {
+            if self.saturator.engaged() {
+                self.saturator.reset();
+            }
             return (1.0, 0.0, 0.0, 0.0);
         };
         let frames = sample.frames();
@@ -909,8 +922,15 @@ impl Engine {
         self.live_peak = self.live_peak.max(self.raw_follower.process(raw_key as f64));
         let peak = self.normaliser();
         let normalised = if peak > 1e-9 { (level / peak).min(1.0) as f32 } else { 0.0 };
+        // Drive bends the envelope as it bends the sample: the dips fill out and hold longer, but
+        // reach no deeper. Dream Eater hears the same bent envelope.
+        let normalised = bend_envelope(normalised, gains.drive);
         let ducked = 1.0 - gains.depth * normalised;
         let track_gain = 1.0 - gains.mix * (1.0 - ducked);
+        // The blended sample is saturated after HP and LP, and only while it is blended in. The
+        // follower above hears it clean, so Drive moves the dips only through the bend.
+        let drive = if gains.sample_level > 0.0 { gains.drive as f64 } else { 0.0 };
+        let [left, right] = self.saturator.process([left, right], drive);
         (track_gain, left as f32 * gains.sample_level, right as f32 * gains.sample_level, normalised)
     }
 }
@@ -966,7 +986,7 @@ mod tests {
     }
 
     fn sample_only() -> FrameGains {
-        FrameGains { depth: 0.0, mix: 0.0, sample_level: 1.0, dream_eater: 0.0 }
+        FrameGains { depth: 0.0, mix: 0.0, sample_level: 1.0, dream_eater: 0.0, drive: 0.0 }
     }
 
     /// Frames where the grid fires, found by playing a one-frame click sample.
@@ -1256,7 +1276,7 @@ mod tests {
         let mut engine = Engine::new(RATE);
         engine.set_sample(Some(prepared(vec![kick(400.0)])));
         engine.finish_analysis();
-        let gains = FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
+        let gains = FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater: 0.0, drive: 0.0 };
         let (left, right) = run(&mut engine, 24_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
         let lowest = left.iter().cloned().fold(f32::MAX, f32::min);
         assert!((lowest - 0.25).abs() < 1e-4, "75% depth leaves 25% at the peak, got {lowest}");
@@ -1271,7 +1291,7 @@ mod tests {
         engine.settings.direction = Direction::Backward;
         engine.set_sample(Some(prepared(vec![kick(400.0)])));
         engine.finish_analysis();
-        let gains = FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
+        let gains = FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater: 0.0, drive: 0.0 };
         let (left, _) = run(&mut engine, 24_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
         let (deepest, lowest) =
             left.iter().cloned().enumerate().fold((0, f32::MAX), |best, (n, v)| if v < best.1 { (n, v) } else { best });
@@ -1316,7 +1336,7 @@ mod tests {
             engine.settings.low_pass_hz = low_pass_hz;
             engine.set_sample(Some(prepared(vec![kick(300.0)])));
             engine.finish_analysis();
-            let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
+            let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0, drive: 0.0 };
             let (left, _) = run(&mut engine, 14_400, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
             left.iter().cloned().fold(f32::MAX, f32::min)
         };
@@ -1346,7 +1366,7 @@ mod tests {
         let mut engine = Engine::new(RATE);
         engine.set_sample(Some(prepared(vec![kick(400.0)])));
         engine.finish_analysis();
-        let gains = FrameGains { depth: 1.0, mix: 0.5, sample_level: 0.0, dream_eater: 0.0 };
+        let gains = FrameGains { depth: 1.0, mix: 0.5, sample_level: 0.0, dream_eater: 0.0, drive: 0.0 };
         let (left, _) = run(&mut engine, 24_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
         let lowest = left.iter().cloned().fold(f32::MAX, f32::min);
         assert!((lowest - 0.5).abs() < 1e-4, "half the duck, got {lowest}");
@@ -1682,7 +1702,7 @@ mod tests {
         engine.settings.direction = Direction::Levitate;
         engine.set_sample(Some(prepared(vec![kick(400.0)])));
         engine.finish_analysis();
-        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
+        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0, drive: 0.0 };
         let (gain, _) = play_along(&mut engine, 0.0, 500, 144, gains);
         let deepest = |range: std::ops::Range<usize>| {
             range.clone().min_by(|&a, &b| gain[a].total_cmp(&gain[b])).unwrap() - range.start
@@ -1766,7 +1786,7 @@ mod tests {
         engine.settings.start = 0.5;
         engine.set_sample(Some(prepared(vec![sample])));
         engine.finish_analysis();
-        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
+        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0, drive: 0.0 };
         let (left, _) = run(&mut engine, 12_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
         let lowest = left.iter().cloned().fold(f32::MAX, f32::min);
         assert!(lowest < 1e-4, "{lowest}");
@@ -1776,7 +1796,7 @@ mod tests {
     fn stereo_samples_blend_into_matching_channels_and_mono_tracks_get_the_sum() {
         let mut engine = Engine::new(RATE);
         engine.set_sample(Some(prepared(vec![vec![0.4; 100], vec![-0.2; 100]])));
-        let gains = FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.5, dream_eater: 0.0 };
+        let gains = FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.5, dream_eater: 0.0, drive: 0.0 };
         let (left, right) = run(&mut engine, 200, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
         assert!((left[10] - 1.2).abs() < 1e-6 && (right[10] - 0.9).abs() < 1e-6);
         assert_eq!((left[150], right[150]), (1.0, 1.0));
@@ -1790,7 +1810,7 @@ mod tests {
     #[test]
     fn no_sample_passes_audio_through() {
         let mut engine = Engine::new(RATE);
-        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 1.0, dream_eater: 0.0 };
+        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 1.0, dream_eater: 0.0, drive: 0.0 };
         let (left, _) = run(&mut engine, 1_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains);
         assert!(left.iter().all(|&v| v == 1.0));
     }
@@ -1799,7 +1819,7 @@ mod tests {
     fn analysis_runs_incrementally_on_the_audio_thread() {
         let mut engine = Engine::new(RATE);
         engine.set_sample(Some(prepared(vec![kick(2_000.0)])));
-        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0 };
+        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0, drive: 0.0 };
         // 96000 frames of analysis at 32768 per block takes three blocks.
         for _ in 0..3 {
             run(&mut engine, 64, TransportInfo::stopped(), gains);
@@ -1864,7 +1884,7 @@ mod tests {
     }
 
     fn ducking(dream_eater: f32) -> FrameGains {
-        FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater }
+        FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater, drive: 0.0 }
     }
 
     #[test]
@@ -1892,7 +1912,7 @@ mod tests {
     /// at `amount`, no ducking and no blended sample, calling `between` before each block with
     /// the frame it starts at. Returns the left output.
     fn play_dream(engine: &mut Engine, input: &[f32], amount: f32, mut between: impl FnMut(&mut Engine, usize)) -> Vec<f32> {
-        let gains = FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: amount };
+        let gains = FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: amount, drive: 0.0 };
         let mut out = Vec::with_capacity(input.len());
         for (block, chunk) in input.chunks(512).enumerate() {
             between(engine, block * 512);
@@ -2013,7 +2033,7 @@ mod tests {
         // As in 1.7.7: with a sample loaded, the chord rings between hits and with the transport
         // stopped, from the 10% the voices stay open.
         let input = track(2 * RATE as usize);
-        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0 };
+        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0, drive: 0.0 };
         let output = process_track(&mut kick_engine(), &input, TransportInfo::stopped(), full);
         let change: Vec<f32> = output.iter().zip(&input).map(|(a, b)| a - b).collect();
         assert!(rms(&change[RATE as usize..]) > 0.1 * rms(&input), "{}", rms(&change) / rms(&input));
@@ -2083,7 +2103,7 @@ mod tests {
     fn the_sample_swells_the_resonance_in_time_with_its_hits() {
         // No ducking, so the track only changes where Dream Eater adds to it.
         let input = track(192_000);
-        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0 };
+        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0, drive: 0.0 };
         let mut kicked = kick_engine();
         let (mut swelled, mut levels) = ([Vec::new(), Vec::new()], Vec::new());
         for chunk in 0..(input.len() / 2_400) {
@@ -2124,7 +2144,7 @@ mod tests {
         // spectrum at C, G, and D stays put while the hit comes and goes.
         let input: Vec<f32> = noise(96_000).iter().map(|v| v * 0.3).collect();
         let playing = TransportInfo::playing_at(0.0, 120.0, RATE);
-        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0 };
+        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0, drive: 0.0 };
         let mut engine = kick_engine();
         engine.settings.dream_key = KeyChoice::Fixed(0);
         let output = process_track(&mut engine, &input, playing, full);
@@ -2216,7 +2236,7 @@ mod tests {
         engine.settings.release_ms = 5.0;
         engine.set_sample(Some(prepared(vec![kick(300.0)])));
         engine.finish_analysis();
-        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0 };
+        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0, drive: 0.0 };
         let frames = 4 * RATE as usize;
         let mut input = noise(frames / 2);
         input.extend(sine(crate::dream::root_hz(engine.dream_key()), frames / 2));
@@ -2238,7 +2258,7 @@ mod tests {
         let (mut engine, peak) = worst_case();
         assert!(peak <= 1.02, "peaks stay at full scale on full-scale material: {peak}");
 
-        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0 };
+        let full = || FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0, drive: 0.0 };
         let tail = process_track(&mut engine, &vec![0.0; 4 * RATE as usize], TransportInfo::stopped(), full);
         assert!(tail[..2_400].iter().any(|v| v.abs() > 1e-4), "it rings on after the track stops");
         assert!(tail[tail.len() - 2_400..].iter().all(|v| v.abs() < 1e-6), "and dies away");
@@ -2527,5 +2547,150 @@ mod tests {
             })
             .collect();
         println!("test track keys by second: {keys:?}");
+    }
+
+    /// Water's kick ducking `track` at 120 bpm, with HP at 150 Hz and LP at 9 kHz, both sides.
+    fn drive_scene(engine: &mut Engine, gains: impl Fn() -> FrameGains + Copy) -> Vec<f32> {
+        let input = track(3 * RATE as usize);
+        engine.settings.high_pass_hz = 150.0;
+        engine.settings.low_pass_hz = 9_000.0;
+        let mut output = Vec::new();
+        for (block, chunk) in input.chunks(512).enumerate() {
+            let transport = TransportInfo::playing_at((block * 512) as f64 * 2.0 / RATE, 120.0, RATE);
+            output.extend(process_both(engine, chunk, transport, gains));
+        }
+        output
+    }
+
+    fn blended(drive: f32) -> FrameGains {
+        FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.5, dream_eater: 0.6, drive }
+    }
+
+    #[test]
+    fn drive_at_0_leaves_everything_as_in_1_7_11() {
+        // Taken from 1.7.11 with Sample Volume at 0 dB, the blended sample, Dream Eater, HP and LP.
+        let output = drive_scene(&mut kick_engine(), || blended(0.0));
+        assert_eq!(fingerprint(&output), 0x0658_2614_134e_2a25);
+    }
+
+    /// The track gain over a 400 ms kick ducking a constant track by 75%.
+    fn dip(drive: f32) -> Vec<f32> {
+        let mut engine = Engine::new(RATE);
+        engine.set_sample(Some(prepared(vec![kick(400.0)])));
+        engine.finish_analysis();
+        let gains = FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater: 0.0, drive };
+        run(&mut engine, 24_000, TransportInfo::playing_at(0.0, 120.0, RATE), gains).0
+    }
+
+    fn frames_below(gain: &[f32], level: f32) -> usize {
+        gain.iter().filter(|&&v| v < level).count()
+    }
+
+    #[test]
+    fn drive_thickens_the_dips_without_deepening_them() {
+        let clean = dip(0.0);
+        let mut last = clean.clone();
+        for drive in [0.5, 1.0] {
+            let driven = dip(drive);
+            let lowest = |gain: &[f32]| gain.iter().cloned().fold(f32::MAX, f32::min);
+            assert!((lowest(&driven) - lowest(&clean)).abs() < 1e-4, "{drive}: {} vs {}", lowest(&driven), lowest(&clean));
+            for level in [0.5, 0.75, 0.9] {
+                assert!(frames_below(&driven, level) > frames_below(&last, level), "{drive} at {level}");
+            }
+            assert!(driven.iter().zip(&clean).all(|(d, c)| *d <= *c + 1e-6), "{drive}: the bend only deepens");
+            last = driven;
+        }
+    }
+
+    #[test]
+    fn drive_warms_the_sample_and_the_chord_at_the_same_loudness() {
+        let clean = drive_scene(&mut kick_engine(), || blended(0.0));
+        for drive in [0.5, 1.0] {
+            let driven = drive_scene(&mut kick_engine(), || blended(drive));
+            let change: Vec<f32> = driven.iter().zip(&clean).map(|(a, b)| a - b).collect();
+            assert!(rms(&change) > 0.01 * rms(&clean), "{drive}: it does something");
+            let db = 20.0 * (rms(&driven) / rms(&clean)).log10();
+            assert!(db.abs() < 1.0, "{drive}: {db} dB");
+            let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            assert!(peak(&driven) < peak(&clean) * 1.12, "{drive}: {} vs {}", peak(&driven), peak(&clean));
+        }
+
+        // The chord alone, with no sample blended in.
+        let chord = |drive: f32| move || FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater: 1.0, drive };
+        let (clean, driven) = (drive_scene(&mut kick_engine(), chord(0.0)), drive_scene(&mut kick_engine(), chord(1.0)));
+        assert_ne!(fingerprint(&clean), fingerprint(&driven));
+        let db = 20.0 * (rms(&driven) / rms(&clean)).log10();
+        assert!(db.abs() < 1.0, "chord: {db} dB");
+    }
+
+    #[test]
+    fn turning_drive_does_not_click() {
+        let held = (0..=10)
+            .map(|step| {
+                let drive = step as f32 / 10.0;
+                let mut engine = kick_engine();
+                let gains = FrameGains { depth: 0.0, mix: 0.0, sample_level: 1.0, dream_eater: 0.0, drive };
+                biggest_step(&process_constant(&mut engine, 4 * RATE as usize, TransportInfo::playing_at(0.0, 120.0, RATE), gains, 0.0).0)
+            })
+            .fold(0.0, f32::max);
+        // Up and down the knob through 0, at the rate a host would ramp it, in blocks.
+        let mut engine = kick_engine();
+        let mut out = Vec::new();
+        let frames = 4 * RATE as usize;
+        for start in (0..frames).step_by(256) {
+            let t = start as f32 / frames as f32;
+            let drive = ((1.0 - (2.0 * t - 1.0).abs()) * 1.2 - 0.1).clamp(0.0, 1.0);
+            let gains = FrameGains { depth: 0.0, mix: 0.0, sample_level: 1.0, dream_eater: 0.0, drive };
+            let transport = TransportInfo::playing_at(start as f64 * 2.0 / RATE, 120.0, RATE);
+            out.extend(process_constant(&mut engine, 256, transport, gains, 0.0).0);
+        }
+        // The steepest moments are the kick's own attack, a little louder while the loudness match
+        // catches up with the knob. A click would jump far beyond them.
+        let biggest = biggest_step(&out);
+        assert!(biggest < held * 1.15, "{biggest} against {held} held");
+    }
+
+    /// Prints what Drive does to the dips, and what it costs. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn drive_report() {
+        let clean = dip(0.0);
+        for drive in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let gain = dip(drive);
+            let ms = |frames: usize| frames as f64 * 1000.0 / RATE;
+            println!(
+                "drive {drive:.2}: deepest {:.4}, under 50% {:.1} ms, under 75% {:.1} ms, under 90% {:.1} ms (clean {:.1} / {:.1} / {:.1})",
+                gain.iter().cloned().fold(f32::MAX, f32::min),
+                ms(frames_below(&gain, 0.5)),
+                ms(frames_below(&gain, 0.75)),
+                ms(frames_below(&gain, 0.9)),
+                ms(frames_below(&clean, 0.5)),
+                ms(frames_below(&clean, 0.75)),
+                ms(frames_below(&clean, 0.9)),
+            );
+        }
+        let clean = drive_scene(&mut kick_engine(), || blended(0.0));
+        for drive in [0.25, 0.5, 0.75, 1.0] {
+            let driven = drive_scene(&mut kick_engine(), || blended(drive));
+            let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            println!(
+                "scene at drive {drive:.2}: loudness {:+.2} dB, peak {:.3} (clean {:.3})",
+                20.0 * (rms(&driven) / rms(&clean)).log10(),
+                peak(&driven),
+                peak(&clean)
+            );
+        }
+        let seconds = 20;
+        let input = track(seconds * RATE as usize);
+        for drive in [0.0, 1.0] {
+            let mut engine = kick_engine();
+            let started = std::time::Instant::now();
+            for (block, chunk) in input.chunks(512).enumerate() {
+                let transport = TransportInfo::playing_at((block * 512) as f64 * 2.0 / RATE, 120.0, RATE);
+                process_both(&mut engine, chunk, transport, || blended(drive));
+            }
+            let spent = started.elapsed().as_secs_f64();
+            println!("drive {drive:.0}: {:.2} ms per second of stereo audio ({:.2}% of one core)", spent * 1000.0 / seconds as f64, spent * 100.0 / seconds as f64);
+        }
     }
 }

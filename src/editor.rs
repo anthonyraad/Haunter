@@ -163,7 +163,7 @@ fn draw(
             let (lower_knobs, lower) = knob_row(ui, setter, &[
                 ("HP", &params.high_pass, true, Face::Plain),
                 ("LP", &params.low_pass, true, Face::Plain),
-                ("Sample Vol", &params.sample_volume, true, Face::Plain),
+                ("Drive", &params.drive, true, Face::Plain),
                 ("Blend", &params.blend, true, Face::Plain),
                 ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level }),
             ]);
@@ -1620,7 +1620,7 @@ mod tests {
             (drawn.upper_knobs, [p.rate.as_ptr(), p.depth.as_ptr(), p.attack.as_ptr(), p.release.as_ptr(), p.mix.as_ptr()]),
             (
                 drawn.lower_knobs,
-                [p.high_pass.as_ptr(), p.low_pass.as_ptr(), p.sample_volume.as_ptr(), p.blend.as_ptr(), p.dream_eater.as_ptr()],
+                [p.high_pass.as_ptr(), p.low_pass.as_ptr(), p.drive.as_ptr(), p.blend.as_ptr(), p.dream_eater.as_ptr()],
             ),
         ];
         editor.screen.take_edits();

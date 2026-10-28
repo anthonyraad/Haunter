@@ -1,6 +1,6 @@
 # Haunter
 
-Haunter is a 64-bit Windows VST3 audio effect for Cubase. You load a sample, usually a kick or another one-shot. On every beat of a tempo-synced grid, the sample's volume shape ducks the track Haunter is inserted on, like sidechaining to a ghost kick. You can also blend the sample into the output, but by default you only hear the ducking.
+Haunter is a 64-bit Windows VST3 audio effect for Cubase. You load a sample, usually a kick or another one-shot. On every beat of a tempo-synced grid, the sample's volume shape ducks the track Haunter is inserted on, like sidechaining to a ghost kick. You can also blend the sample into the output, but by default you only hear the ducking. Drive (since 1.7.12) warms the blended sample and Dream Eater's chord and makes the duck fuller.
 
 The plugin is `release/Haunter.vst3`.
 
@@ -31,6 +31,18 @@ The HP and LP filters work on the sample itself as it plays. An envelope followe
 
 Fully counter-clockwise reads Off, and the track is untouched, bit for bit. Dream Eater listens to the track before the ducking, and the blended sample doesn't go through it.
 
+### Drive (since 1.7.12)
+
+Drive replaces Sample Vol, which only did what Blend already does. It warms things up rather than clipping them, and does three things at once as it turns up:
+
+- **The blended sample** is saturated, at the loudness it had without Drive (within about 0.1 dB on a steady tone, judged over 200 ms). With Blend at 0% you don't hear it.
+- **Dream Eater's chord** is saturated after its leveller, HP, and LP, and before the limiter that keeps the output under the track's peak and 0 dBFS, so peaks are held as before.
+- **The duck** is bent by the same kind of curve: each dip still reaches exactly the same depth, but it gets fuller and longer. On a 300 ms kick at 75% Depth, the time spent more than half way down goes from 62 ms at 0% to 103 ms at 50% and 154 ms at 100%.
+
+The curve is a smooth, slightly asymmetric tanh, so it adds mostly low, even and odd harmonics and never clips: distortion on a sine rises smoothly from 0.05% at 10% to about 8% at 50% and 37% at 100%. It comes in gradually, because the curve is the identity at 0% and the drive rises with the square of the knob. Highs above about 2.5 kHz are cut by up to 9 dB before the curve and given back after it, and a gentle low-pass closes from 40 kHz to 12 kHz as Drive goes up, so the top end stays smooth rather than fizzy. The curve runs at four times the sample rate (polyphase half-band filters with 100 dB of rejection), so aliasing stays more than 100 dB under a 1 kHz tone everywhere below 20 kHz. A 10 Hz DC blocker takes out what the asymmetry leaves. Drive is smoothed and fades the saturation in and out over 10 ms, so turning it, or turning it to 0%, doesn't click. While it is above 0% the oversampling delays the sample and the chord by about a tenth of a millisecond (about 5 frames at 48 kHz), which isn't reported to the host; the duck itself isn't delayed.
+
+Projects and presets saved before 1.7.12 fold Sample Vol into Blend (Blend times the volume, capped at 100%) and load with Drive at 0%, so they sound as they did unless Sample Vol boosted the sample above Blend 100%. Automation recorded on Sample Vol is lost, because the parameter no longer exists.
+
 **Only with a sample loaded (since 1.7.8).** Dream Eater answers the sample's ducking, so with no sample loaded (as in `--`) it does nothing at any setting: the track comes out bit for bit as at Off, from the first frame, with no chord, no dip, and no makeup. Before 1.7.8 it still ran without a sample: the voices stay 10% open between hits, so they rang a standing chord from the track, the leveller brought it up to about 4 dB under the track, and the track was turned down about 2.4 dB and then made up. With a sample loaded it works exactly as in 1.7.7, playing or stopped, between hits and without any, 10% floor included. Unloading the sample while the chord rings stops feeding it, and over 30 ms brings the track's dip and makeup back to unity; the chord rings out on its own, kept only under 0 dBFS, and once it has died away Dream Eater steps aside, bit-exact. Loading a sample brings it in over the same 30 ms. The key is followed either way.
 
 **HP and LP on the chord (since 1.7.9, experimental).** The HP and LP knobs also filter the chord Dream Eater adds, with the same 12 dB/oct Butterworth response and cutoffs as on the sample, separately on each side, after the chord's own tone and before it joins the track. The track itself is never filtered. At Off (20 Hz and 20 kHz) the chord skips them and is exactly as in 1.7.8. Moving a knob glides the cutoff over about 20 ms, and turning a filter on from Off or back to Off fades it in or out over 20 ms, so nothing clicks or zips. The leveller sets the chord's level from the chord before HP and LP, so it doesn't turn the chord up to make up for what they remove: HP at 1 kHz takes the root and fifth away and leaves the chord about 6 dB quieter, with the sparkle kept, and LP at 500 Hz takes the sparkle away. The makeup and the limiter see the chord after HP and LP, so loudness and peaks are held as before; as the chord gets quieter the makeup may bring the track back up by up to the 2.4 dB it was dipped.
@@ -56,13 +68,13 @@ The output is always at unity gain. There is no output level control.
 | Mix | Dry/wet for the ducking. At 50%, the track ducks half as far. |
 | HP | High-pass on the sample, 20 Hz (Off) to 2 kHz. Affects both the ducking and the blended sample. Raise it on a kick to make the duck shallower. Since 1.7.9 it also high-passes Dream Eater's chord (not the track), so turning it up thins the chord. |
 | LP | Low-pass on the sample, 50 Hz to 20 kHz (Off). Affects both the ducking and the blended sample. Since 1.7.9 it also low-passes Dream Eater's chord (not the track), taking its sparkle away first. |
-| Sample Vol | The sample's level, −48 to +12 dB. The default is 0.0 dB. |
+| Drive | 0% (the default) to 100%. Warm saturation on the blended sample and on Dream Eater's chord, at the same loudness, and a thicker duck: see Drive below. At 0% nothing changes, bit for bit. Replaces Sample Vol (since 1.7.12). |
 | Blend | How much of the sample is added to the output. The default is 0%, so you only hear the duck. |
 | Dream Eater | Off (the default) to 100%, in 1% steps. How loud and how long the chord rings in the track's key. The dark knob shows the sample's live swell as a purple fill inside its white arc. Right-click it to choose the key. |
 
 Start and End are automatable parameters too. They show times in milliseconds, measured within the loaded sample. Drag a knob with the left mouse button to turn it. Double-click a knob to reset it. Hold Shift while dragging for fine adjustment.
 
-Projects saved before 1.7 had a Reverse toggle instead of Direction. They load with Reverse on as Backward and Reverse off as Forward, and so do user presets saved before 1.7 and the preset a project had selected, so they don't show a `*`. Direction is a new parameter (ID `direction`; Reverse was `reverse`), so automation recorded on Reverse doesn't carry over. Projects saved with version 1.0 load with One-shot mode as Restart on and Loop mode as Restart off. Invert no longer exists, so it is dropped when an old project loads. Projects saved with 1.1 or earlier load with Dream Eater Off. Their Output setting is ignored, so a project that used Output to change the level plays at unity gain.
+Projects saved before 1.7 had a Reverse toggle instead of Direction. They load with Reverse on as Backward and Reverse off as Forward, and so do user presets saved before 1.7 and the preset a project had selected, so they don't show a `*`. Direction is a new parameter (ID `direction`; Reverse was `reverse`), so automation recorded on Reverse doesn't carry over. Projects saved with version 1.0 load with One-shot mode as Restart on and Loop mode as Restart off. Invert no longer exists, so it is dropped when an old project loads. Projects saved with 1.1 or earlier load with Dream Eater Off. Sample Vol (ID `sample-volume`) was removed in 1.7.12: see Drive. Their Output setting is ignored, so a project that used Output to change the level plays at unity gain.
 
 ## Presets
 
@@ -105,6 +117,12 @@ The unit tests cover:
 - Restart on versus off, Backward, the Start and End region, and Depth and Mix.
 - Direction: choosing Backward mid-pass turns the playhead round within the next block and plays back from where it was, and Forward turns it round again; turning round adds no jump on a ramp and, on a loud 3 kHz tone, no step bigger than the tone's own (within 15%) at several awkward moments; Levitate plays S to E and back again, repeating the frame at each turn without a fade, the playhead rising and falling with it, and stays within a region set by S and E; with Restart on, Levitate plays forward from S on the song's first step, backward from E (fading in mid-sample) on the next, and so on, stopping at the far handle with no bounce, the playhead rising and falling with it; playback started on any step plays exactly what a run from the song's start plays there, also after stopping and starting; cutting passes off at 1/16 steps on a loud 3 kHz tone adds no step bigger than the tone's own (within 15%) and none bigger than Forward or Backward do; a 400 ms kick ducks at the start of forward steps and at the end of backward passes; the ducking peak is judged over a pass each way; and its peak for the ducking is judged over the way there and back without fades.
 - HP and LP measurably changing both the blended sample and the ducking.
+- Drive (since 1.7.12):
+  - At 0% the output is bit-identical to 1.7.11's (a fingerprint of a scene with the blended sample, the duck, and Dream Eater), and the saturator gives back its input bit for bit, also once it has faded out after being on.
+  - The half-band filters pass the audio band and reject the images; on 1 kHz and 5 kHz sines at full Drive, aliasing below 20 kHz stays more than 100 dB under the fundamental and 80 dB under the strongest harmonic.
+  - Distortion rises smoothly as the knob turns, the level stays within 1 dB across the knob, it never clips, and sweeping the knob through 0% steps no harder than holding it.
+  - The bent envelope keeps each dip's deepest point and lifts the rest; in the engine, dips stay as deep and last longer, the sample and the chord change at the same loudness, and turning Drive doesn't click.
+  - Old states and presets with Sample Vol fold it into Blend and load Drive at 0%.
 - Dream Eater:
   - Off is a bit-exact bypass, even right after it was on, and the key is still followed while it is Off.
   - With no sample loaded, 100% is bit-identical to Off from a fresh instance's first frame, playing and stopped (1.7.7 changed the track by about half its RMS here). With a sample loaded and the transport stopped it still rings, as in 1.7.7.

@@ -2231,7 +2231,8 @@ mod tests {
         let tallest = |h: &[f32]| h.iter().copied().fold(0f32, f32::max);
         let tail = |h: &[f32]| h[h.len() * 3 / 4..].iter().sum::<f32>();
         let _ = tallest;
-        assert!(tail(full) > 1.5 * tail(&clean_heights), "the quiet part swells");
+        // The quiet part swells as the audio's body does (about 3 dB at full Drive, since 1.7.15).
+        assert!(tail(full) > 1.25 * tail(&clean_heights), "the quiet part swells");
         // The loudest point stays as high as it was on every frame (since 1.7.14), so the picture
         // never shrinks.
         let middle = rect.shrink2(egui::vec2(10.0, 14.0)).center().y;

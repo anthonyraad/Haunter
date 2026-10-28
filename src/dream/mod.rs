@@ -1271,8 +1271,9 @@ impl DreamEater {
         // the chord rather than having the leveller bring back what HP took away. The makeup
         // and limiter below see the chord as filtered, so loudness and peaks still hold.
         let wet = self.panel.process(wet).map(|side| self.leveller * side);
-        // Drive warms the chord where HP and LP shape it, loudness matched, so the makeup and
-        // limiter below still hold it to the track's level and peaks.
+        // Drive warms the chord where HP and LP shape it, as it does the sample (its body lifted
+        // under its peaks), and the makeup and limiter below still hold it to the track's level
+        // and peaks.
         let wet = self.saturation.process(wet, self.saturation_drive);
         // Brings the sum back to the ducked track's loudness, where the chord lines up with the
         // track or finds little in it to ring.

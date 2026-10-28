@@ -2602,25 +2602,109 @@ mod tests {
         }
     }
 
+    /// The blended sample alone at `drive`, over four seconds at 120 bpm, so it plays every beat.
+    fn sample_alone(sample: &Arc<PreparedSample>, drive: f32) -> Vec<f32> {
+        let mut engine = Engine::new(RATE);
+        engine.set_sample(Some(sample.clone()));
+        engine.finish_analysis();
+        let gains = FrameGains { depth: 0.0, mix: 0.0, sample_level: 1.0, dream_eater: 0.0, drive };
+        let mut out = Vec::new();
+        for start in (0..4 * RATE as usize).step_by(512) {
+            let transport = TransportInfo::playing_at(start as f64 * 2.0 / RATE, 120.0, RATE);
+            out.extend(process_constant(&mut engine, 512, transport, gains, 0.0).0);
+        }
+        out
+    }
+
+    /// A plucked tone: `hz` at half scale, dying away four times over a second, `ms` long.
+    fn pluck(hz: f64, ms: f64) -> Vec<f32> {
+        let frames = (ms * 0.001 * RATE) as usize;
+        sine(hz, frames).iter().enumerate().map(|(n, v)| v * 0.5 * (-4.0 * n as f64 / RATE).exp() as f32).collect()
+    }
+
+    /// The level of `hz` in `x`, in dB.
+    fn level_at(x: &[f32], hz: f64) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * hz / RATE;
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &v in x {
+            let s = v as f64 + 2.0 * w.cos() * s1 - s2;
+            s2 = s1;
+            s1 = s;
+        }
+        10.0 * (s1 * s1 + s2 * s2 - 2.0 * w.cos() * s1 * s2).max(1e-300).log10()
+    }
+
     #[test]
-    fn drive_warms_the_sample_and_the_chord_at_the_same_loudness() {
+    fn drive_brings_the_samples_body_up_under_its_peaks() {
+        let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        // Water's peaks and the kick's are their sub, which the ceiling holds, so their body comes
+        // up less, and stops coming up once the sub is at the ceiling.
+        let factory = ["Daisy", "Paper", "Press", "Spin", "Stone", "Umber", "Water", "Wind"].map(|name| {
+            let sample = crate::preset::Preset::factory(name).unwrap().sample.unwrap();
+            (name, Arc::new(PreparedSample::new(&sample, RATE)), name != "Water")
+        });
+        let made = [("kick", prepared(vec![kick(300.0)])), ("pluck", prepared(vec![pluck(1_000.0, 500.0)]))];
+        for (name, sample, lifted) in factory.into_iter().chain(made.map(|(name, sample)| (name, sample, false))) {
+            let clean = sample_alone(&sample, 0.0);
+            let settled = RATE as usize;
+            let mut last = -1.0;
+            for drive in [0.25, 0.5, 0.75, 1.0] {
+                let driven = sample_alone(&sample, drive);
+                let db = 20.0 * (rms(&driven[settled..]) / rms(&clean[settled..])).log10();
+                // Coming up with the knob, a little at the middle and about 3 dB at the top.
+                if name == "Water" || name == "kick" {
+                    assert!(db > -0.5, "{name} at {drive}: {db} dB");
+                } else {
+                    assert!(db > last, "{name} at {drive}: {db} dB after {last}");
+                }
+                if lifted && drive == 0.5 {
+                    assert!((0.3..2.5).contains(&db), "{name} at {drive}: {db} dB");
+                }
+                if lifted && drive == 1.0 {
+                    assert!((2.0..4.0).contains(&db), "{name} at {drive}: {db} dB");
+                }
+                last = db;
+                // And never past the clean sample's peak (within 0.01 dB).
+                assert!(peak(&driven) <= 1.001 * peak(&clean), "{name} at {drive}: {} vs {}", peak(&driven), peak(&clean));
+            }
+        }
+    }
+
+    #[test]
+    fn drive_leads_with_the_second_harmonic_at_1_khz() {
+        let sample = prepared(vec![pluck(1_000.0, 500.0)]);
+        let mut last = -100.0;
+        for drive in [0.25, 0.5, 0.75, 1.0] {
+            let out = sample_alone(&sample, drive);
+            let out = &out[RATE as usize..];
+            let fundamental = level_at(out, 1_000.0);
+            let (second, third) = (level_at(out, 2_000.0) - fundamental, level_at(out, 3_000.0) - fundamental);
+            assert!(second > third + 3.0, "{drive}: H2 {second} dB, H3 {third} dB");
+            assert!(second > last, "{drive}: H2 {second} dB after {last}");
+            last = second;
+        }
+    }
+
+    #[test]
+    fn drive_warms_the_sample_and_the_chord_and_holds_the_peaks() {
+        let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
         let clean = drive_scene(&mut kick_engine(), || blended(0.0));
         for drive in [0.5, 1.0] {
             let driven = drive_scene(&mut kick_engine(), || blended(drive));
             let change: Vec<f32> = driven.iter().zip(&clean).map(|(a, b)| a - b).collect();
             assert!(rms(&change) > 0.01 * rms(&clean), "{drive}: it does something");
             let db = 20.0 * (rms(&driven) / rms(&clean)).log10();
-            assert!(db.abs() < 1.0, "{drive}: {db} dB");
-            let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            assert!(peak(&driven) < peak(&clean) * 1.12, "{drive}: {} vs {}", peak(&driven), peak(&clean));
+            assert!(db > -0.5 && db < 3.0, "{drive}: {db} dB");
+            assert!(peak(&driven) <= peak(&clean) * 1.02, "{drive}: {} vs {}", peak(&driven), peak(&clean));
         }
 
-        // The chord alone, with no sample blended in.
+        // The chord alone, with no sample blended in: the makeup still holds it to the track.
         let chord = |drive: f32| move || FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater: 1.0, drive };
         let (clean, driven) = (drive_scene(&mut kick_engine(), chord(0.0)), drive_scene(&mut kick_engine(), chord(1.0)));
         assert_ne!(fingerprint(&clean), fingerprint(&driven));
         let db = 20.0 * (rms(&driven) / rms(&clean)).log10();
         assert!(db.abs() < 1.0, "chord: {db} dB");
+        assert!(peak(&driven) <= peak(&clean) * 1.02, "chord: {} vs {}", peak(&driven), peak(&clean));
     }
 
     #[test]
@@ -2674,7 +2758,7 @@ mod tests {
             let driven = drive_scene(&mut kick_engine(), || blended(drive));
             let peak = |x: &[f32]| x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             println!(
-                "scene at drive {drive:.2}: loudness {:+.2} dB, peak {:.3} (clean {:.3})",
+                "scene at drive {drive:.2}: level {:+.2} dB, peak {:.3} (clean {:.3})",
                 20.0 * (rms(&driven) / rms(&clean)).log10(),
                 peak(&driven),
                 peak(&clean)

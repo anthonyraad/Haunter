@@ -346,7 +346,7 @@ fn cutoff_param(name: &str, default: f32, min: f32, max: f32, off_at: f32) -> Fl
 
 /// Whole-percent steps, so the knob is either exactly Off or at least 1%.
 fn dream_eater_param() -> FloatParam {
-    // The gate smooths the knob itself, over 20 ms, the same way Splatter does.
+    // The gate smooths the knob over 20 ms. Each partial then blooms and fades on its own.
     FloatParam::new("Dream Eater", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
         .with_step_size(0.01)
         .with_value_to_string(Arc::new(|value| {

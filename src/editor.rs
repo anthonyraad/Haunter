@@ -38,6 +38,11 @@ const EATER_DISC: Color32 = Color32::from_rgb(0x6e, 0x6e, 0x6e);
 const EATER_OUTLINE: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x2a);
 const EATER_TRACK: Color32 = Color32::from_rgb(0x3f, 0x3f, 0x3f);
 const EATER_ARC: Color32 = Color32::WHITE;
+/// The same knob while no sample is loaded and Dream Eater is bypassed.
+const EATER_DISC_DIM: Color32 = Color32::from_rgb(0xa3, 0xa3, 0xa3);
+const EATER_OUTLINE_DIM: Color32 = Color32::from_rgb(0x8a, 0x8a, 0x8a);
+const EATER_TRACK_DIM: Color32 = Color32::from_rgb(0x96, 0x96, 0x96);
+const EATER_ARC_DIM: Color32 = Color32::from_rgb(0xb4, 0xb4, 0xb4);
 
 const ROTARY_START: f32 = std::f32::consts::PI * 1.2;
 const ROTARY_END: f32 = std::f32::consts::PI * 2.8;
@@ -184,13 +189,15 @@ fn draw(
                 ("Release", &params.release, true, Face::Plain),
                 ("Mix", &params.mix, true, Face::Plain),
             ]);
-            let dream_level = shared.dream_level.load(Ordering::Relaxed);
+            // No sample, no gate: the knob stays settable, and it is drawn dimmed so that reads.
+            let dream_active = params.sample.fingerprint() != 0;
+            let dream_level = if dream_active { shared.dream_level.load(Ordering::Relaxed) } else { 0.0 };
             let (lower_knobs, _) = knob_row(ui, setter, &[
                 ("HP", &params.high_pass, true, Face::Plain),
                 ("LP", &params.low_pass, true, Face::Plain),
                 ("Drive", &params.drive, true, Face::Plain),
                 ("Blend", &params.blend, true, Face::Plain),
-                ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level }),
+                ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level, active: dream_active }),
             ]);
             Drawn { used: ui.min_rect(), preset_menu, save, waveform, browse, restart, direction, upper_knobs, lower_knobs }
         })
@@ -827,7 +834,8 @@ enum Face {
     Plain,
     /// Dropout's Destroy treatment: a dark disc with a white arc and pointer, and `progress`
     /// (0..1, how far the spectral gate has opened) filling the white arc in the accent colour.
-    Eater { progress: f32 },
+    /// `active` is false when no sample is loaded; the gate is bypassed then, and the knob is dimmed.
+    Eater { progress: f32, active: bool },
 }
 
 trait KnobParam {
@@ -893,9 +901,10 @@ fn draw_knob<P: Param>(
     let center = Pos2::new(rect.center().x, rect.top() + dial * 0.5 + 2.0);
     let radius = dial * 0.5 - 3.0;
     let angle = ROTARY_START + normalized * (ROTARY_END - ROTARY_START);
-    let (disc, outline, track, arc, pointer, pointer_width) = match face {
-        Face::Plain => (DISC, OUTLINE, TRACK, ARC, INK, 1.5_f32),
-        Face::Eater { .. } => (EATER_DISC, EATER_OUTLINE, EATER_TRACK, EATER_ARC, EATER_ARC, 2.2),
+    let (disc, outline, track, arc, pointer, pointer_width, readout) = match face {
+        Face::Plain => (DISC, OUTLINE, TRACK, ARC, INK, 1.5_f32, INK),
+        Face::Eater { active: true, .. } => (EATER_DISC, EATER_OUTLINE, EATER_TRACK, EATER_ARC, EATER_ARC, 2.2, INK),
+        Face::Eater { active: false, .. } => (EATER_DISC_DIM, EATER_OUTLINE_DIM, EATER_TRACK_DIM, EATER_ARC_DIM, EATER_ARC_DIM, 2.2, MUTED),
     };
     let painter = ui.painter();
     painter.circle_filled(center, radius - 1.0, disc);
@@ -904,7 +913,7 @@ fn draw_knob<P: Param>(
     if normalized > 0.004 {
         painter.line(arc_points(center, radius - 5.0, ROTARY_START, angle), Stroke::new(2.0_f32, arc));
     }
-    if let Face::Eater { progress } = face {
+    if let Face::Eater { progress, active: true } = face {
         let progress = progress.clamp(0.0, 1.0);
         if progress > 0.004 && angle > ROTARY_START + 0.004 {
             let filled = ROTARY_START + progress * (angle - ROTARY_START);
@@ -915,11 +924,11 @@ fn draw_knob<P: Param>(
     let outer = Pos2::new(center.x + angle.sin() * dial * 0.36, center.y - angle.cos() * dial * 0.36);
     painter.line_segment([inner, outer], Stroke::new(pointer_width, pointer));
 
-    let readout = Pos2::new(rect.center().x, rect.top() + dial + 14.0);
+    let readout_at = Pos2::new(rect.center().x, rect.top() + dial + 14.0);
     if turnable {
-        painter.text(readout, egui::Align2::CENTER_CENTER, param.to_string(), egui::FontId::proportional(13.0), INK);
+        painter.text(readout_at, egui::Align2::CENTER_CENTER, param.to_string(), egui::FontId::proportional(13.0), readout);
     } else {
-        draw_infinity(painter, readout, MUTED);
+        draw_infinity(painter, readout_at, MUTED);
     }
     painter.text(
         Pos2::new(rect.center().x, rect.top() + dial + 30.0),
@@ -928,7 +937,11 @@ fn draw_knob<P: Param>(
         egui::FontId::proportional(11.0),
         SUBTLE,
     );
-    response
+    if matches!(face, Face::Eater { active: false, .. }) {
+        response.on_hover_text("Load a sample. Dream Eater does nothing until one is loaded.")
+    } else {
+        response
+    }
 }
 
 /// An infinity sign centred on `center`, from the font if it has one and drawn otherwise.
@@ -1836,6 +1849,25 @@ mod tests {
         let dream = editor.plugin.params.dream_eater.as_ptr();
         let edits = editor.screen.take_edits();
         assert!(edits.iter().any(|edit| matches!(edit, Edit::Set(p, value) if *p == dream && *value > 0.0)), "{edits:?}");
+    }
+
+    #[test]
+    fn dream_eater_dims_until_a_sample_is_loaded() {
+        let mut editor = Editor::new(false);
+        let row = editor.settle().lower_knobs;
+        assert!(editor.screen.discs(EATER_DISC).is_empty(), "no sample, the live disc is not drawn");
+        let dim = editor.screen.discs(EATER_DISC_DIM);
+        assert_eq!(dim.len(), 1, "the knob is dimmed: {dim:?}");
+        assert!(row.contains(dim[0]));
+        editor.screen.take_edits();
+        editor.move_to(dim[0]);
+        editor.drag(egui::vec2(0.0, -40.0));
+        let dream = editor.plugin.params.dream_eater.as_ptr();
+        let edits = editor.screen.take_edits();
+        assert!(
+            edits.iter().any(|edit| matches!(edit, Edit::Set(p, value) if *p == dream && *value > 0.0)),
+            "it can still be set, for when a sample arrives: {edits:?}"
+        );
     }
 
     #[test]

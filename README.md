@@ -1,6 +1,6 @@
 # Haunter
 
-Haunter is a 64-bit Windows VST3 audio effect for Cubase. You load a sample, usually a kick or another one-shot. On every beat of a tempo-synced grid, the sample's volume shape ducks the track Haunter is inserted on, like sidechaining to a ghost kick. You can also blend the sample into the output, but by default you only hear the ducking. Drive (since 1.7.12) warms the blended sample and makes the duck fuller. Dream Eater (since 1.7.16) thins the ducked track the way Hyperchroma's Splatter knob does, until the strongest partials are what's left.
+Haunter is a 64-bit Windows VST3 audio effect for Cubase. You load a sample, usually a kick or another one-shot. On every beat of a tempo-synced grid, the sample's volume shape ducks the track Haunter is inserted on, like sidechaining to a ghost kick. You can also blend the sample into the output, but by default you only hear the ducking. Drive (since 1.7.12) warms the blended sample and makes the duck fuller. Dream Eater (since 1.7.16) thins the ducked track until the strongest partials are what's left. Since 1.7.18 those partials bloom and fade, and the effect stays out of the signal until a sample is loaded.
 
 The plugin is `release/Haunter.vst3`.
 
@@ -11,7 +11,7 @@ The plugin is `release/Haunter.vst3`.
 3. Insert Haunter on an audio, group, or FX channel. It is listed under Dynamics.
 4. Choose a factory preset such as **Water** from the preset menu, drag a WAV, AIFF, or MP3 onto the plugin window, or click the waveform area to pick a file, then press play.
 
-The plugin works in stereo or mono. Off, it adds no latency. With Dream Eater above Off it delays the output by one spectral frame, about 40 ms at 44.1 and 48 kHz, and reports that to the host. The C runtime is linked statically, so nothing else needs installing.
+The plugin works in stereo or mono. Off, it adds no latency. With Dream Eater above Off and a sample loaded, it delays the output by one spectral frame, about 40 ms at 44.1 and 48 kHz, and reports that to the host. With no sample loaded, Dream Eater is bypassed and adds no latency. The C runtime is linked statically, so nothing else needs installing.
 
 ## How it works
 
@@ -19,13 +19,13 @@ With **Restart** on (the default), Haunter plays the selected region once from S
 
 The HP and LP filters work on the sample itself as it plays. An envelope follower runs on the filtered sample, and its level sets how far the track is turned down. Depth is measured against the unfiltered sample's peak over the region: with the filters off, the track ducks by exactly Depth at the sample's loudest point. Filtering part of the sample away makes the duck shallower, and changes what you hear through Blend.
 
-**Dream Eater** (since 1.7.16) is the spectral gate from Hyperchroma's Splatter knob, on the incoming track. It thins that track until the strongest partials are what remain, and the sample's envelope then ducks it exactly as it does with the knob off. It does not add a chord, and it does not listen for a key.
+**Dream Eater** (since 1.7.16) thins the incoming track until the strongest partials are what remain, and the sample's envelope then ducks that thinned track exactly as it does with the knob off. It does not add a chord, and it does not listen for a key. Since 1.7.18 it only runs when a sample is loaded. With no sample, the track passes through bit for bit, the transform is not run, and the knob is drawn dimmed. It still turns, so the setting is there when a sample arrives.
 
-The gate is one Hann short-time transform, about 40 ms long (2048 samples at 44.1 and 48 kHz, 4096 at 96 kHz), hopping by a quarter of that. Left and right are transformed separately and share one gate decision, so a partial that is loud on either side stays on both and the stereo image holds. Each frame's threshold sits under that frame's loudest bin: about -60 dB at 30%, -30 dB at 60%, and -12 dB at 100%. Bins under the threshold fall toward a floor of about -40 dB at the bottom of the knob and -80 dB at full, across a 6 dB knee. The knob itself eases in over the first 5% and is smoothed over 20 ms.
+The gate is one Hann short-time transform, about 40 ms long (2048 samples at 44.1 and 48 kHz, 4096 at 96 kHz), hopping by an eighth of that, with the same window on the way back out so a moving gain crossfades instead of stepping. Left and right are transformed separately and share one gate decision, so a partial that is loud on either side stays on both and the stereo image holds. Each frame's threshold sits under that frame's loudest bin: about -60 dB at 30%, -30 dB at 60%, and -12 dB at 100%. Bins above the threshold by 3 dB stay fully open, so a strong partial and its main lobe are left whole. Below that they ease down to a floor across 28 dB, rather than switching. The floor is about -22 dB as the effect opens, -31 dB at 30%, -43 dB at 60%, and -64 dB at full, so the body of the sound stays as a soft bed until the knob is well up. Each bin's level is smoothed and blurred across its neighbours, and the gain itself blooms over about 20 ms and fades over about 180 ms, in decibels, so a partial swells in and dies away instead of chirping. The knob eases in over the first 5% and is smoothed over 20 ms.
 
-Fully counter-clockwise reads Off. The incoming track is ducked and the blended sample is added, bit for bit, with no delay. Above Off the incoming track is thinned first, then ducked. The duck gain and the blended sample are delayed by the same frame, so the dips stay as sharp as they are at Off and the sample stays lined up. The sample itself is not thinned, and it is not ducked. Silence in is silence out. The effect runs with or without a sample loaded. Turning it off closes the gate and, once that has settled, the track is bit-exact again.
+Fully counter-clockwise reads Off. The incoming track is ducked and the blended sample is added, bit for bit, with no delay. Above Off, once a sample is loaded, the incoming track is thinned first, then ducked. The duck gain and the blended sample are delayed by the same frame, so the dips stay as sharp as they are at Off and the sample stays lined up. The sample itself is not thinned, and it is not ducked. Silence in is silence out. Turning it off closes the gate and, once that has settled, the track is bit-exact again.
 
-The dark knob is unchanged. The accent fill follows how far the gate has actually opened. There is no key menu. Projects and presets still store `dream-key`, so an older session loads, and the gate ignores it.
+The dark knob is unchanged while a sample is loaded. The accent fill follows how far the gate has actually opened. There is no key menu. Projects and presets still store `dream-key`, so an older session loads, and the gate ignores it.
 
 ### Drive (since 1.7.12)
 
@@ -61,7 +61,7 @@ The output is always at unity gain. There is no output level control.
 | LP | Low-pass on the sample, 50 Hz to 20 kHz (Off). Affects both the ducking and the blended sample. It does not filter the track Dream Eater thins. |
 | Drive | 0% (the default) to 100%. Warm saturation on the blended sample, with its body coming up to about 3 dB under its held peaks at 100%, and a thicker duck: see Drive below. At 0% nothing changes, bit for bit. Replaces Sample Vol (since 1.7.12). It does not saturate Dream Eater. |
 | Blend | How much of the sample is added to the output. The default is 0%, so you only hear the duck. |
-| Dream Eater | Off (the default) to 100%, in 1% steps. Thins the ducked track until the strongest partials remain, the same gate as Hyperchroma's Splatter. The dark knob's accent fill shows how far the gate has opened. |
+| Dream Eater | Off (the default) to 100%, in 1% steps. Thins the ducked track until the strongest partials remain, each one blooming in and fading out. Does nothing until a sample is loaded, and the knob is dimmed until then. The accent fill shows how far the gate has opened. |
 
 Start and End are automatable parameters too. They show times in milliseconds, measured within the loaded sample. Drag a knob with the left mouse button to turn it. Double-click a knob to reset it. Hold Shift while dragging for fine adjustment.
 
@@ -115,9 +115,11 @@ The unit tests cover:
   - The bent envelope keeps each dip's deepest point and lifts the rest; in the engine, dips stay as deep and last longer, and turning Drive doesn't click. In the engine (since 1.7.15), the factory samples' body comes up 0.3 to 2.5 dB at 50% and 2 to 4 dB at 100% (Water, whose peaks are its sub, and a synthetic kick come up less), rising with the knob, with peaks at or under the clean sample's; a plucked 1 kHz tone keeps the second harmonic more than 3 dB over the third at every setting; and Dream Eater is not saturated: with no duck and no blended sample, Drive does not change it.
   - Old states and presets with Sample Vol fold it into Blend and load Drive at 0%.
   - The waveform (since 1.7.13): the shared curve is exactly the identity at 0%, rises everywhere, stays bounded, and is the one the saturator runs; the bent columns at 0% are the columns bit for bit, and the waveform at Drive 0 is painted line for line as 1.7.12 painted it, also after turning Drive up and back. Turning Drive up glides the picture over several frames without a jump or a step back, keeps the loudest point within 1% of its height on every frame, swells the tail step by step (by more than 1.25 times at full Drive, since 1.7.15), leans a steady tone's two sides within 0.15 of the way the audio does, keeps it inside the frame with the playhead as it was, tints it only slightly toward #BFBFEC (not the playhead colour), and doesn't work the bent waveform out again once settled.
-- Dream Eater (since 1.7.16, the Splatter gate):
+- Dream Eater (since 1.7.16; smoothed, and bypassed with no sample, since 1.7.18):
+  - With no sample loaded, every knob position is a bit-exact copy of the input and reports no latency, including on the 1 kHz MP3 fixture.
   - Off is a bit-exact bypass of the ducked track, and it is bit-exact again once it has been off for a second after being on.
   - At 100%, a loud 440 Hz partial stays and a quiet 3 kHz partial is stripped to under a quarter of its share. At 30% the quiet partial keeps more of that share than at 100%.
+  - Across 30%, 60%, and 100%, frame-to-frame gain on a chord-and-noise fixture stays under 1 dB (about 0.6 dB at 60% and at 100%; 1.7.16 was 4.7 dB and 7.2 dB), and turning the knob up keeps thinning.
   - The duck is applied after the gate: at the bottom of a full-depth duck the thinned tone is well under the same tone with no duck, and a lone sine's duck matches Dream Eater off one frame later.
   - The blended sample is delayed with the track and not thinned. HP, LP, and Drive, with no duck and no blend, leave the gated track bit for bit.
   - A silent track stays silent at 100% while a kick ducks it, full-scale noise stays finite and bounded, and a mono track matches a centred stereo one.

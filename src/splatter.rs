@@ -1,21 +1,36 @@
-//! Dream Eater's spectral gate, the same one Hyperchroma's Splatter knob runs.
+//! Dream Eater's spectral gate.
 //!
-//! One Hann STFT. Left and right are transformed separately and share a gate
-//! decision, so the stereo image holds still. The knob sets how far below the
-//! frame's loudest partial a bin has to sit before it is thinned, and how far
-//! a closed bin is pushed down.
-
-
+//! One Hann short-time transform, with the same window on the way back out so a
+//! changing gain crossfades instead of stepping at the hop. Left and right are
+//! transformed separately and share a gate decision, so the stereo image holds
+//! still. The knob sets how far below the frame's loudest partial a bin has to
+//! sit before it is thinned, and how far a closed bin is pushed down.
+//!
+//! A bin is not switched. Its level is smoothed, blurred across its neighbours
+//! so a lone spike cannot become a chirp, and then eased toward the open gain
+//! or the floor in decibels. Partials bloom in and fade out.
 
 use realfft::num_complex::Complex32;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::sync::Arc;
 
-const KNEE_DB: f32 = 6.0;
+/// How far above the threshold a bin is left fully open. The Hann main lobe of a
+/// strong partial sits inside this, so the partial itself is not carved up.
+const OPEN_ABOVE_DB: f32 = 3.0;
+/// How wide the fade is from fully open down to the floor, in dB of bin level.
+const SLOPE_DB: f32 = 28.0;
 const RAMP_KNOB: f32 = 0.05;
-const ATTACK_SEC: f32 = 0.010;
-const RELEASE_SEC: f32 = 0.120;
+/// Per-bin bloom, in the decibel domain.
+const ATTACK_SEC: f32 = 0.022;
+/// Per-bin fade, in the decibel domain.
+const RELEASE_SEC: f32 = 0.180;
+/// Follows a bin's level. Fast enough to catch a new partial, slow enough that
+/// one hop of noise does not open the gate.
+const MAG_ATTACK_SEC: f32 = 0.010;
+const MAG_RELEASE_SEC: f32 = 0.050;
 const KNOB_SEC: f32 = 0.020;
+/// Gaussian blur of the bin levels, in bins. Wider toward the bottom of the knob.
+const BLUR_RADIUS: isize = 8;
 
 pub struct SpectralGate {
     sample_rate: f32,
@@ -38,12 +53,19 @@ pub struct SpectralGate {
     spec_l: Vec<Complex32>,
     spec_r: Vec<Complex32>,
     gains: Vec<f32>,
-    mags: Vec<f32>,
+    /// Smoothed bin level, shared by both channels.
+    env: Vec<f32>,
+    /// `env` blurred across frequency, which is what the gate listens to.
+    blurred: Vec<f32>,
+    /// Synthesis window. The analysis window is `window`, already scaled.
+    synth: Vec<f32>,
     pos: usize,
     knob: f32,
     knob_coeff: f32,
     attack_coeff: f32,
     release_coeff: f32,
+    mag_attack: f32,
+    mag_release: f32,
     /// Rises over one frame after the effect leaves bypass, so a cold STFT fades in.
     warm: f32,
     idle: bool,
@@ -77,12 +99,16 @@ impl SpectralGate {
             spec_l: Vec::new(),
             spec_r: Vec::new(),
             gains: Vec::new(),
-            mags: Vec::new(),
+            env: Vec::new(),
+            blurred: Vec::new(),
+            synth: Vec::new(),
             pos: 0,
             knob: 0.0,
             knob_coeff: 1.0,
             attack_coeff: 1.0,
             release_coeff: 1.0,
+            mag_attack: 1.0,
+            mag_release: 1.0,
             warm: 0.0,
             idle: true,
             tail: 0,
@@ -92,9 +118,10 @@ impl SpectralGate {
         gate
     }
 
-    /// Samples the output lags the input while the gate is in the chain.
-    pub fn hop_samples(&self) -> usize {
-        self.hop
+    /// How long the engine crossfades when the gate opens or closes onto its delay.
+    /// A quarter of the frame, about 10 ms, whatever the hop is.
+    pub fn align_fade_samples(&self) -> usize {
+        (self.frame / 4).max(1)
     }
 
     /// The smoothed knob, 0..1.
@@ -126,7 +153,9 @@ impl SpectralGate {
         }
         self.sample_rate = sample_rate;
         self.frame = frame;
-        self.hop = (frame / 4).max(1);
+        // An eighth of the frame: the squared Hann window still sums flat, and a
+        // gain change is crossfaded eight times per frame instead of four.
+        self.hop = (frame / 8).max(1);
         self.latency = frame as u32;
 
         let mut planner = RealFftPlanner::<f32>::new();
@@ -149,20 +178,19 @@ impl SpectralGate {
         self.wet_r = vec![0.0; frame];
         let bins = self.spec_l.len();
         self.gains = vec![1.0; bins];
-        self.mags = vec![0.0; bins];
+        self.env = vec![0.0; bins];
+        self.blurred = vec![0.0; bins];
 
-        let cola = cola_sum(frame, self.hop);
+        let cola = cola_hann_squared(frame, self.hop);
         let scale = 1.0 / (frame as f32 * cola);
-        self.window = (0..frame)
-            .map(|i| {
-                let phase = i as f32 / frame as f32;
-                (0.5 - 0.5 * (std::f32::consts::TAU * phase).cos()) * scale
-            })
-            .collect();
+        self.synth = (0..frame).map(|i| hann(i, frame)).collect();
+        self.window = self.synth.iter().map(|window| window * scale).collect();
 
         let hop_sec = self.hop as f32 / sample_rate;
         self.attack_coeff = one_pole_coeff(hop_sec, ATTACK_SEC);
         self.release_coeff = one_pole_coeff(hop_sec, RELEASE_SEC);
+        self.mag_attack = one_pole_coeff(hop_sec, MAG_ATTACK_SEC);
+        self.mag_release = one_pole_coeff(hop_sec, MAG_RELEASE_SEC);
         self.knob_coeff = one_pole_coeff(1.0 / sample_rate, KNOB_SEC);
         self.reset();
     }
@@ -183,7 +211,8 @@ impl SpectralGate {
         self.spec_l.fill(Complex32::default());
         self.spec_r.fill(Complex32::default());
         self.gains.fill(1.0);
-        self.mags.fill(0.0);
+        self.env.fill(0.0);
+        self.blurred.fill(0.0);
         self.pos = 0;
         self.knob = 0.0;
         self.warm = 0.0;
@@ -195,7 +224,11 @@ impl SpectralGate {
     /// Writes one block into the delay rings without reading them and without an FFT.
     /// Off uses this so the rings stay current and turning the knob up does not open onto silence.
     pub fn feed(&mut self, wet_l: &[f32], wet_r: &[f32], dry_l: &[f32], dry_r: &[f32]) {
-        let n = wet_l.len().min(wet_r.len()).min(dry_l.len()).min(dry_r.len());
+        let n = wet_l
+            .len()
+            .min(wet_r.len())
+            .min(dry_l.len())
+            .min(dry_r.len());
         if n == 0 || self.frame == 0 {
             return;
         }
@@ -238,7 +271,9 @@ impl SpectralGate {
         dry_r: &[f32],
         amounts: &[f32],
     ) -> Option<usize> {
-        self.process_with(wet_l, wet_r, dry_l, dry_r, |i| amounts.get(i).copied().unwrap_or(0.0))
+        self.process_with(wet_l, wet_r, dry_l, dry_r, |i| {
+            amounts.get(i).copied().unwrap_or(0.0)
+        })
     }
 
     fn process_with(
@@ -335,6 +370,7 @@ impl SpectralGate {
         self.idle = true;
         self.warm = 0.0;
         self.gains.fill(1.0);
+        self.env.fill(0.0);
         self.out_l.fill(0.0);
         self.out_r.fill(0.0);
     }
@@ -368,30 +404,50 @@ impl SpectralGate {
             return;
         }
 
-        let bins = self.spec_l.len().min(self.spec_r.len()).min(self.gains.len());
+        let bins = self
+            .spec_l
+            .len()
+            .min(self.spec_r.len())
+            .min(self.gains.len())
+            .min(self.env.len());
         let mut peak = 0.0f32;
         for i in 0..bins {
             let mag = self.spec_l[i].norm().max(self.spec_r[i].norm());
-            self.mags[i] = mag;
-            if mag > peak {
-                peak = mag;
-            }
+            let coeff = if mag >= self.env[i] {
+                self.mag_attack
+            } else {
+                self.mag_release
+            };
+            let next = self.env[i] + coeff * (mag - self.env[i]);
+            self.env[i] = if next.abs() < 1.0e-20 { 0.0 } else { next };
+            peak = peak.max(self.env[i]);
         }
+        // The decision listens to the neighbourhood, so a one-bin spike is not a partial.
+        // The threshold still follows the loudest smoothed bin, which is where the knob's
+        // anchors are measured.
+        blur_into(
+            &self.env[..bins],
+            blur_sigma(self.knob),
+            &mut self.blurred[..bins],
+        );
         let threshold = peak * db_to_gain(threshold_db(self.knob));
         let floor = db_to_gain(floor_db(self.knob));
         for i in 0..bins {
             let target = if peak <= 1.0e-12 {
                 1.0
             } else {
-                gate_gain(self.mags[i], threshold, floor)
+                gate_gain(self.blurred[i], threshold, floor)
             };
-            let coeff = if target >= self.gains[i] {
+            // Smoothed in decibels, so a partial blooms and fades instead of jumping.
+            let state_db = 20.0 * self.gains[i].max(1.0e-8).log10();
+            let target_db = 20.0 * target.max(1.0e-8).log10();
+            let coeff = if target_db >= state_db {
                 self.attack_coeff
             } else {
                 self.release_coeff
             };
-            self.gains[i] += coeff * (target - self.gains[i]);
-            let gain = self.gains[i];
+            let gain = db_to_gain(state_db + coeff * (target_db - state_db));
+            self.gains[i] = gain;
             self.spec_l[i].re *= gain;
             self.spec_l[i].im *= gain;
             self.spec_r[i].re *= gain;
@@ -412,6 +468,11 @@ impl SpectralGate {
         {
             return;
         }
+        for i in 0..self.frame {
+            let window = self.synth[i];
+            self.time_l[i] *= window;
+            self.time_r[i] *= window;
+        }
         add_ring(&mut self.out_l, &self.time_l, self.pos);
         add_ring(&mut self.out_r, &self.time_r, self.pos);
     }
@@ -431,10 +492,18 @@ fn threshold_db(knob: f32) -> f32 {
     db as f32
 }
 
-/// Closed-gate floor. About -40 dB toward the bottom of the knob, -80 dB at full.
+/// Closed-gate floor. A gentle bed at the bottom of the knob, a deep thin at the top.
+/// About -22 dB as the effect opens, -31 dB at 30%, -43 dB at 60%, and -64 dB at full.
 fn floor_db(knob: f32) -> f32 {
     let k = knob.clamp(0.0, 1.0);
-    -40.0 - 40.0 * k * k
+    -22.0 - 26.0 * k - 16.0 * k * k
+}
+
+/// Wider at the bottom of the knob, where the sound should wash, and still wide
+/// enough at full that a partial is a soft cluster rather than one bin.
+fn blur_sigma(knob: f32) -> f32 {
+    let k = knob.clamp(0.0, 1.0);
+    2.4 - 1.3 * k
 }
 
 fn wet_mix(knob: f32) -> f32 {
@@ -446,19 +515,18 @@ fn gate_gain(mag: f32, threshold: f32, floor: f32) -> f32 {
     if threshold <= 1.0e-12 {
         return 1.0;
     }
-    let half = db_to_gain(KNEE_DB * 0.5);
-    let lower = threshold / half;
-    let upper = threshold * half;
-    if mag >= upper {
-        1.0
-    } else if mag <= lower {
-        floor
-    } else {
-        let pos = ((mag / lower).ln() / (upper / lower).ln()).clamp(0.0, 1.0);
-        let s = pos * pos * (3.0 - 2.0 * pos);
-        let floor_db = 20.0 * floor.max(1.0e-8).log10();
-        db_to_gain(floor_db * (1.0 - s))
+    let open = threshold * db_to_gain(OPEN_ABOVE_DB);
+    if mag >= open {
+        return 1.0;
     }
+    let shut = open * db_to_gain(-SLOPE_DB);
+    if mag <= shut {
+        return floor;
+    }
+    let pos = ((mag / shut).ln() / (open / shut).ln()).clamp(0.0, 1.0);
+    let shape = pos * pos * (3.0 - 2.0 * pos);
+    let floor_db = 20.0 * floor.max(1.0e-8).log10();
+    db_to_gain(floor_db * (1.0 - shape))
 }
 
 fn db_to_gain(db: f32) -> f32 {
@@ -481,17 +549,46 @@ fn finite(sample: f32) -> f32 {
     }
 }
 
-/// Sum of a periodic Hann window at this hop. Flat for a 75% overlap.
-fn cola_sum(frame: usize, hop: usize) -> f32 {
+fn hann(i: usize, frame: usize) -> f32 {
+    let phase = i as f32 / frame as f32;
+    0.5 - 0.5 * (std::f32::consts::TAU * phase).cos()
+}
+
+/// Sum of the squared Hann window at this hop. Flat for hops of a quarter and an
+/// eighth of the frame, which is what analysis-plus-synthesis Hann needs.
+fn cola_hann_squared(frame: usize, hop: usize) -> f32 {
     let hop = hop.max(1);
     let mut sum = 0.0f32;
     let mut i = 0;
     while i < frame {
-        let phase = i as f32 / frame as f32;
-        sum += 0.5 - 0.5 * (std::f32::consts::TAU * phase).cos();
+        let window = hann(i, frame);
+        sum += window * window;
         i += hop;
     }
     sum.max(1.0e-4)
+}
+
+fn blur_into(input: &[f32], sigma: f32, output: &mut [f32]) {
+    let n = input.len().min(output.len());
+    let sigma = sigma.max(0.35);
+    let mut weight = [0.0f32; (BLUR_RADIUS as usize) * 2 + 1];
+    for offset in -BLUR_RADIUS..=BLUR_RADIUS {
+        let x = offset as f32 / sigma;
+        weight[(offset + BLUR_RADIUS) as usize] = (-0.5 * x * x).exp();
+    }
+    for i in 0..n {
+        let mut acc = 0.0f32;
+        let mut sum = 0.0f32;
+        for offset in -BLUR_RADIUS..=BLUR_RADIUS {
+            let j = i as isize + offset;
+            if (0..n as isize).contains(&j) {
+                let w = weight[(offset + BLUR_RADIUS) as usize];
+                acc += input[j as usize] * w;
+                sum += w;
+            }
+        }
+        output[i] = if sum > 1.0e-12 { acc / sum } else { 0.0 };
+    }
 }
 
 fn window_into(ring: &[f32], window: &[f32], start: usize, dest: &mut [f32]) {
@@ -517,7 +614,7 @@ fn add_ring(ring: &mut [f32], src: &[f32], start: usize) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -527,14 +624,29 @@ mod tests {
         let wide = frame_samples(96_000.0);
         assert_eq!(wide, 4096);
         let ms = wide as f32 / 96_000.0 * 1000.0;
-        assert!(ms > 30.0 && ms < 50.0, "96 kHz frame should stay near 40 ms, {ms}");
+        assert!(
+            ms > 30.0 && ms < 50.0,
+            "96 kHz frame should stay near 40 ms, {ms}"
+        );
     }
 
     #[test]
     fn threshold_curve_hits_the_anchor_points() {
-        assert!((threshold_db(0.3) + 60.0).abs() < 0.05, "{}", threshold_db(0.3));
-        assert!((threshold_db(0.6) + 30.0).abs() < 0.05, "{}", threshold_db(0.6));
-        assert!((threshold_db(1.0) + 12.0).abs() < 0.05, "{}", threshold_db(1.0));
+        assert!(
+            (threshold_db(0.3) + 60.0).abs() < 0.05,
+            "{}",
+            threshold_db(0.3)
+        );
+        assert!(
+            (threshold_db(0.6) + 30.0).abs() < 0.05,
+            "{}",
+            threshold_db(0.6)
+        );
+        assert!(
+            (threshold_db(1.0) + 12.0).abs() < 0.05,
+            "{}",
+            threshold_db(1.0)
+        );
         assert!(threshold_db(0.0) < threshold_db(0.3));
         assert!(threshold_db(0.3) < threshold_db(0.6));
         assert!(threshold_db(0.6) < threshold_db(1.0));
@@ -542,21 +654,73 @@ mod tests {
 
     #[test]
     fn floor_stays_open_at_the_bottom_and_closes_at_the_top() {
-        assert!((floor_db(0.0) + 40.0).abs() < 0.01);
-        assert!(floor_db(0.3) < -40.0 && floor_db(0.3) > -50.0);
-        assert!((floor_db(1.0) + 80.0).abs() < 0.01);
+        assert!((floor_db(0.0) + 22.0).abs() < 0.01, "{}", floor_db(0.0));
+        let low = floor_db(0.3);
+        assert!(low < -28.0 && low > -36.0, "30% keeps a gentle bed, {low}");
+        let mid = floor_db(0.6);
+        assert!(mid < low && mid > -50.0, "60% is deeper than 30%, {mid}");
+        assert!((floor_db(1.0) + 64.0).abs() < 0.01, "{}", floor_db(1.0));
+        assert!(floor_db(0.0) > floor_db(0.5) && floor_db(0.5) > floor_db(1.0));
     }
 
     #[test]
-    fn knee_is_open_above_and_at_the_floor_below() {
+    fn slope_is_open_above_and_at_the_floor_below() {
         let floor = db_to_gain(-40.0);
         let threshold = db_to_gain(-30.0);
-        let open = gate_gain(db_to_gain(-20.0), threshold, floor);
-        let shut = gate_gain(db_to_gain(-50.0), threshold, floor);
-        assert!((open - 1.0).abs() < 1.0e-4, "open {open}");
-        assert!((shut - floor).abs() < 1.0e-4, "shut {shut}");
-        let mid = gate_gain(threshold, threshold, floor);
-        assert!(mid < 0.9 && mid > floor * 2.0, "knee center {mid}");
+        let open = gate_gain(threshold * db_to_gain(OPEN_ABOVE_DB), threshold, floor);
+        let above = gate_gain(threshold * db_to_gain(12.0), threshold, floor);
+        let shut = gate_gain(
+            threshold * db_to_gain(OPEN_ABOVE_DB - SLOPE_DB - 3.0),
+            threshold,
+            floor,
+        );
+        assert!(
+            (open - 1.0).abs() < 1.0e-4,
+            "the top of the slope is open, {open}"
+        );
+        assert!(
+            (above - 1.0).abs() < 1.0e-4,
+            "above the slope is open, {above}"
+        );
+        assert!(
+            (shut - floor).abs() < 1.0e-4,
+            "below the slope is the floor, {shut}"
+        );
+        let mid = gate_gain(
+            threshold * db_to_gain(OPEN_ABOVE_DB - SLOPE_DB * 0.5),
+            threshold,
+            floor,
+        );
+        assert!(
+            mid < 0.5 && mid > floor * 4.0,
+            "the middle of the slope is between, {mid}"
+        );
+    }
+
+    #[test]
+    fn squared_hann_sums_flat_at_the_hop() {
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            let frame = frame_samples(rate);
+            let hop = frame / 8;
+            let mut lowest = f32::MAX;
+            let mut highest = 0.0f32;
+            for offset in 0..hop {
+                let mut sum = 0.0f32;
+                let mut i = offset;
+                while i < frame {
+                    let window = hann(i, frame);
+                    sum += window * window;
+                    i += hop;
+                }
+                lowest = lowest.min(sum);
+                highest = highest.max(sum);
+            }
+            assert!(
+                (highest - lowest) / highest < 1.0e-5,
+                "rate {rate} ripples from {lowest} to {highest}"
+            );
+            assert!((cola_hann_squared(frame, hop) - highest).abs() / highest < 1.0e-5);
+        }
     }
 
     #[test]
@@ -681,5 +845,169 @@ mod tests {
             s1 = s0;
         }
         (s1 * s1 + s2 * s2 - coeff * s1 * s2).sqrt() / samples.len() as f32
+    }
+
+    /// A soft chord, a slow swell, and a little noise: the kind of material a hard gate chirps on.
+    pub(crate) fn botanical(seconds: f32, sample_rate: f32) -> Vec<f32> {
+        let n = (seconds * sample_rate) as usize;
+        let mut state = 0x1234_5678u32;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sample_rate;
+                let mut tone = 0.0;
+                for (harmonic, amp) in [
+                    (1.0, 0.22),
+                    (2.02, 0.11),
+                    (3.0, 0.07),
+                    (4.97, 0.045),
+                    (7.0, 0.028),
+                    (9.0, 0.018),
+                ] {
+                    tone += (std::f32::consts::TAU * 196.0 * harmonic * t).sin() * amp;
+                }
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let noise = (state >> 8) as f32 / 16_777_216.0 * 2.0 - 1.0;
+                let swell = 0.62 + 0.38 * (std::f32::consts::TAU * 0.55 * t).sin();
+                (tone + noise * 0.035) * swell
+            })
+            .collect()
+    }
+
+    fn stft_mags(signal: &[f32]) -> Vec<Vec<f32>> {
+        let frame = 2048;
+        let hop = 512;
+        let mut planner = RealFftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(frame);
+        let mut time = fft.make_input_vec();
+        let mut spec = fft.make_output_vec();
+        let mut scratch = vec![Complex32::default(); fft.get_scratch_len()];
+        let mut frames = Vec::new();
+        let mut start = 0;
+        while start + frame <= signal.len() {
+            for i in 0..frame {
+                let window = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / frame as f32).cos();
+                time[i] = signal[start + i] * window;
+            }
+            fft.process_with_scratch(&mut time, &mut spec, &mut scratch)
+                .unwrap();
+            frames.push(spec.iter().map(|bin| bin.norm()).collect());
+            start += hop;
+        }
+        frames
+    }
+
+    /// Mean frame-to-frame spectral flux, normalised by the frame energy.
+    pub(crate) fn spectral_flux(signal: &[f32]) -> f32 {
+        let mags = stft_mags(signal);
+        if mags.len() < 2 {
+            return 0.0;
+        }
+        let mut flux = 0.0f32;
+        let mut energy = 0.0f32;
+        for pair in mags.windows(2) {
+            let mut diff = 0.0f32;
+            let mut frame = 0.0f32;
+            for (earlier, later) in pair[0].iter().zip(&pair[1]) {
+                let delta = later - earlier;
+                diff += delta * delta;
+                frame += later * later;
+            }
+            flux += diff.sqrt();
+            energy += frame.sqrt();
+        }
+        flux / energy.max(1.0e-12)
+    }
+
+    /// Mean standard deviation of the frame-to-frame change in per-bin gain, in dB.
+    /// Bins far under the frame peak are the ones a hard gate turns into chirps.
+    pub(crate) fn gain_chatter(input: &[f32], output: &[f32], latency: usize) -> f32 {
+        let end = input.len().saturating_sub(latency);
+        let incoming = stft_mags(&input[..end]);
+        let gated = stft_mags(&output[latency..]);
+        let frames = incoming.len().min(gated.len());
+        if frames < 16 {
+            return 0.0;
+        }
+        let bins = incoming[0].len();
+        let mut chatter = 0.0f32;
+        let mut counted = 0.0f32;
+        for bin in 1..bins.saturating_sub(1) {
+            let mut previous = None;
+            let mut steps = Vec::new();
+            for frame in 8..frames {
+                let loud = incoming[frame].iter().copied().fold(0.0f32, f32::max);
+                let mag = incoming[frame][bin];
+                if mag < loud * db_to_gain(-46.0) {
+                    previous = None;
+                    continue;
+                }
+                let gain = (gated[frame][bin] / mag).max(1.0e-6);
+                let db = 20.0 * gain.log10();
+                if let Some(before) = previous {
+                    steps.push(db - before);
+                }
+                previous = Some(db);
+            }
+            if steps.len() < 8 {
+                continue;
+            }
+            let mean = steps.iter().sum::<f32>() / steps.len() as f32;
+            let variance = steps
+                .iter()
+                .map(|step| (step - mean) * (step - mean))
+                .sum::<f32>()
+                / steps.len() as f32;
+            chatter += variance.sqrt();
+            counted += 1.0;
+        }
+        chatter / counted.max(1.0)
+    }
+
+    fn render_gate(amount: f32) -> (Vec<f32>, Vec<f32>, usize) {
+        let sample_rate = 48_000.0;
+        let input = botanical(2.0, sample_rate);
+        let mut left = input.clone();
+        let mut right = input.clone();
+        let dry = vec![0.0f32; input.len()];
+        let mut gate = SpectralGate::new(sample_rate);
+        gate.process_block(&mut left, &mut right, &dry, &dry, amount);
+        let latency = gate.latency_samples() as usize;
+        (input, left, latency)
+    }
+
+    #[test]
+    fn the_gate_stays_smooth_while_it_thins() {
+        let mut previous = None;
+        for amount in [0.3_f32, 0.6, 1.0] {
+            let (input, output, latency) = render_gate(amount);
+            let settled = &output[latency + 8_000..];
+            let flux = spectral_flux(settled);
+            let dry_flux = spectral_flux(&input[8_000..input.len() - latency]);
+            let ratio = flux / dry_flux.max(1.0e-9);
+            let chatter = gain_chatter(&input, &output, latency);
+            assert!(
+                output.iter().all(|sample| sample.is_finite()),
+                "amount {amount}"
+            );
+            // 1.7.16 measured 0.02 dB, 4.65 dB and 7.21 dB at 30%, 60% and 100%.
+            // This gate measures about 0.00 dB, 0.57 dB and 0.58 dB on the same fixture.
+            assert!(
+                chatter < 1.0,
+                "amount {amount} still chatters {chatter:.2} dB per frame"
+            );
+            if amount >= 0.6 {
+                assert!(
+                    ratio < 0.85,
+                    "amount {amount} should thin the wash, flux ratio {ratio:.3}"
+                );
+            }
+            if let Some(quieter) = previous {
+                assert!(
+                    ratio <= quieter + 0.05,
+                    "turning up should not bring the wash back: {ratio} vs {quieter}"
+                );
+            }
+            previous = Some(ratio);
+        }
     }
 }

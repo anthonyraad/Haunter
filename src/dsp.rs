@@ -720,9 +720,10 @@ impl Engine {
         self.saturator.reset();
     }
 
-    /// How many samples the output lags while Dream Eater is open. Off is zero.
+    /// How many samples the output lags while Dream Eater is open. Off is zero, and so is a
+    /// track with no sample loaded: the gate is not in the chain then.
     pub fn latency_samples(&self) -> u32 {
-        if self.splatter_on { self.gate.latency_samples() } else { 0 }
+        if self.sample.is_some() && self.splatter_on { self.gate.latency_samples() } else { 0 }
     }
 
     pub fn sample_rate(&self) -> f64 {
@@ -928,12 +929,18 @@ impl Engine {
     /// Gates the incoming track. The sample envelope then ducks that result, and the blended
     /// sample is added on top. Both the duck and the sample take the gate's delay while it is
     /// open, so the dips stay as sharp as they are with Dream Eater off. Off is a bit-exact
-    /// copy of incoming × duck + sample, with no delay.
+    /// copy of incoming × duck + sample, with no delay. With no sample loaded the gate is not
+    /// run at all, knob or not: the track passes through untouched.
     fn splatter(&mut self, frames: usize) -> f32 {
         if frames == 0 {
             return 0.0;
         }
-        let requested = self.amounts[..frames].iter().any(|amount| *amount > 1.0e-5);
+        if self.sample.is_none() {
+            self.splatter_on = false;
+            self.fade_in = 0;
+            self.fade_out = 0;
+        }
+        let requested = self.sample.is_some() && self.amounts[..frames].iter().any(|amount| *amount > 1.0e-5);
         let incoming = |engine: &Engine, frame: usize, right: bool| {
             if right { engine.ducked_r[frame] } else { engine.ducked_l[frame] }
         };
@@ -955,7 +962,7 @@ impl Engine {
         if !self.splatter_on {
             self.splatter_on = true;
             if self.gate.primed() {
-                self.fade_in = self.gate.hop_samples().max(1);
+                self.fade_in = self.gate.align_fade_samples();
             }
         }
         self.wet_l[..frames].copy_from_slice(&self.ducked_l[..frames]);
@@ -971,12 +978,12 @@ impl Engine {
             &self.amounts[..frames],
         );
 
-        let hop = self.gate.hop_samples().max(1) as f32;
+        let fade = self.gate.align_fade_samples().max(1) as f32;
         for frame in 0..frames {
             if self.fade_in == 0 {
                 break;
             }
-            let x = 1.0 - (self.fade_in - 1) as f32 / hop;
+            let x = 1.0 - (self.fade_in - 1) as f32 / fade;
             let (left, right) = (incoming(self, frame, false), incoming(self, frame, true));
             self.wet_l[frame] = left * (1.0 - x) + self.wet_l[frame] * x;
             self.wet_r[frame] = right * (1.0 - x) + self.wet_r[frame] * x;
@@ -987,13 +994,13 @@ impl Engine {
             self.fade_out = 0;
         } else if let Some(at) = closed_at.filter(|_| self.fade_in == 0) {
             if self.fade_out == 0 {
-                self.fade_out = self.gate.hop_samples().max(1);
+                self.fade_out = self.gate.align_fade_samples().max(1);
             }
             for frame in at..frames {
                 if self.fade_out == 0 {
                     break;
                 }
-                let x = self.fade_out as f32 / hop;
+                let x = self.fade_out as f32 / fade;
                 let (left, right) = (incoming(self, frame, false), incoming(self, frame, true));
                 self.wet_l[frame] = left * (1.0 - x) + self.wet_l[frame] * x;
                 self.wet_r[frame] = right * (1.0 - x) + self.wet_r[frame] * x;
@@ -2136,9 +2143,71 @@ mod tests {
 
     fn gated(amount: f32, frames: usize) -> (Vec<f32>, u32) {
         let mut engine = Engine::new(RATE);
+        // The gate only runs once a sample is loaded. Depth stays at 0, so the sample does not duck.
+        engine.set_sample(Some(prepared(vec![vec![0.2; 4_800]])));
         let gains = FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: amount, drive: 0.0 };
         let output = process_track(&mut engine, &partials(frames), TransportInfo::stopped(), || gains);
         (output, engine.latency_samples())
+    }
+
+    #[test]
+    fn dream_eater_without_a_sample_is_bit_transparent() {
+        let input = partials(RATE as usize);
+        let playing = TransportInfo::playing_at(0.0, 120.0, RATE);
+        for amount in [0.0, 0.05, 0.3, 0.6, 1.0] {
+            let mut engine = Engine::new(RATE);
+            let gains = FrameGains { depth: 1.0, mix: 0.5, sample_level: 1.0, dream_eater: amount, drive: 1.0 };
+            let output = process_track(&mut engine, &input, playing, || gains);
+            assert_eq!(engine.latency_samples(), 0, "no sample means no delay at {amount}");
+            assert_eq!(output, input, "Dream Eater {amount} without a sample is the input");
+        }
+    }
+
+    #[test]
+    fn dream_eater_with_a_sample_thins_smoothly_across_the_knob() {
+        let input = crate::splatter::tests::botanical(2.0, RATE as f32);
+        let dry_flux = crate::splatter::tests::spectral_flux(&input[8_000..input.len() - 2_048]);
+        let mut previous = f32::MAX;
+        for amount in [0.3_f32, 0.6, 1.0] {
+            let mut engine = Engine::new(RATE);
+            engine.set_sample(Some(prepared(vec![kick(300.0)])));
+            let gains = FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: amount, drive: 0.0 };
+            let output = process_track(&mut engine, &input, TransportInfo::stopped(), || gains);
+            let latency = engine.latency_samples() as usize;
+            assert!(latency >= 1_024, "an open gate reports its frame at {amount}, got {latency}");
+            let chatter = crate::splatter::tests::gain_chatter(&input, &output, latency);
+            let ratio = crate::splatter::tests::spectral_flux(&output[latency + 8_000..]) / dry_flux;
+            assert!(chatter < 1.0, "knob {amount} chatters {chatter:.2} dB from one frame to the next");
+            assert!(ratio <= previous + 0.05, "turning up should keep thinning: {ratio} after {previous}");
+            if amount == 1.0 {
+                assert!(ratio < 0.85, "full knob still thins the wash, flux ratio {ratio}");
+                assert_ne!(output, input);
+            }
+            previous = ratio;
+        }
+    }
+
+    #[test]
+    fn the_mp3_fixture_is_untouched_without_a_sample_and_stays_a_tone_with_one() {
+        let audio = crate::audio_file::decode(include_bytes!("../tests/fixtures/tone-1khz.mp3")).unwrap();
+        let rate = audio.sample_rate;
+        let left = &audio.channels[0];
+        let gains = |amount: f32| FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: amount, drive: 0.0 };
+        let mut dry = Engine::new(rate);
+        let untouched = process_track(&mut dry, left, TransportInfo::stopped(), || gains(1.0));
+        assert_eq!(dry.latency_samples(), 0);
+        assert_eq!(untouched, *left, "the fixture passes through when no sample is loaded");
+
+        let mut engine = Engine::new(rate);
+        let tick = EmbeddedSample { name: "tick".into(), sample_rate: rate, channels: vec![vec![0.25; 2_048]] };
+        engine.set_sample(Some(Arc::new(PreparedSample::new(&tick, rate))));
+        let gated = process_track(&mut engine, left, TransportInfo::stopped(), || gains(1.0));
+        let latency = engine.latency_samples() as usize;
+        assert!(latency >= 1_024 && latency < left.len() / 2, "latency {latency}");
+        let body = latency + 2_000..left.len() - 200;
+        assert!(rms(&gated[body.clone()]) > rms(&left[body.clone()]) * 0.5, "the 1 kHz fixture tone is kept");
+        let chatter = crate::splatter::tests::gain_chatter(left, &gated, latency);
+        assert!(chatter < 1.5, "the fixture tone is not chopped, {chatter:.2} dB/frame");
     }
 
     #[test]
@@ -2256,6 +2325,7 @@ mod tests {
         assert!(peak < 1.0e-5, "silence in is silence out: {peak}");
 
         let mut engine = Engine::new(RATE);
+        engine.set_sample(Some(prepared(vec![vec![0.2; 4_800]])));
         let noise = noise(RATE as usize);
         let gains = FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0, drive: 0.0 };
         let loud = process_track(&mut engine, &noise, TransportInfo::stopped(), || gains);
@@ -2268,9 +2338,14 @@ mod tests {
     fn a_mono_track_gets_the_same_gate_as_a_centred_stereo_one() {
         let input = partials(RATE as usize);
         let gains = FrameGains { depth: 0.0, mix: 1.0, sample_level: 0.0, dream_eater: 1.0, drive: 0.0 };
+        let mut mono_engine = Engine::new(RATE);
+        let mut stereo_engine = Engine::new(RATE);
+        for engine in [&mut mono_engine, &mut stereo_engine] {
+            engine.set_sample(Some(prepared(vec![vec![0.2; 4_800]])));
+        }
         let mut mono = input.clone();
-        Engine::new(RATE).process(&mut [&mut mono[..]], &TransportInfo::stopped(), || gains);
-        let stereo = process_track(&mut Engine::new(RATE), &input, TransportInfo::stopped(), || gains);
+        mono_engine.process(&mut [&mut mono[..]], &TransportInfo::stopped(), || gains);
+        let stereo = process_track(&mut stereo_engine, &input, TransportInfo::stopped(), || gains);
         let worst = mono.iter().zip(&stereo).fold(0.0f32, |m, (a, b)| m.max((a - b).abs()));
         assert!(worst < 1.0e-5, "mono matches the centred stereo left: {worst}");
     }

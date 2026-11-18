@@ -608,9 +608,9 @@ pub struct Engine {
     declick: usize,
     region: Region,
     was_playing: bool,
-    /// Dream Eater: Hyperchroma's Splatter gate, on the ducked track.
+    /// Dream Eater: Hyperchroma's Splatter gate, on the incoming track.
     gate: SpectralGate,
-    /// Scratch for one block: the ducked track, the blended sample, and the knob.
+    /// Scratch for one block: the incoming track, the blended sample, and the knob.
     ducked_l: Vec<f32>,
     ducked_r: Vec<f32>,
     dry_l: Vec<f32>,
@@ -619,6 +619,14 @@ pub struct Engine {
     wet_r: Vec<f32>,
     amounts: Vec<f32>,
     track_gains: Vec<f32>,
+    /// 0 where this sample is still in live time, 1 where it has the gate's frame of delay.
+    align: Vec<f32>,
+    silence: Vec<f32>,
+    /// Duck gain and blended sample, delayed by one spectral frame so they stay with the gated track.
+    gain_delay: Vec<f32>,
+    add_delay_l: Vec<f32>,
+    add_delay_r: Vec<f32>,
+    delay_pos: usize,
     /// The gate is in the output path, so this block is delayed by one STFT frame.
     splatter_on: bool,
     /// Samples left in the crossfade that opens the gate onto a primed delay line.
@@ -655,6 +663,12 @@ impl Engine {
             wet_r: Vec::new(),
             amounts: Vec::new(),
             track_gains: Vec::new(),
+            align: Vec::new(),
+            silence: Vec::new(),
+            gain_delay: Vec::new(),
+            add_delay_l: Vec::new(),
+            add_delay_r: Vec::new(),
+            delay_pos: 0,
             splatter_on: false,
             fade_in: 0,
             fade_out: 0,
@@ -673,6 +687,21 @@ impl Engine {
         self.reset();
     }
 
+    /// The duck and the blended sample wait one spectral frame, matching the gate's delay.
+    fn resize_duck_delay(&mut self) {
+        let n = self.gate.latency_samples() as usize;
+        if self.gain_delay.len() == n {
+            self.gain_delay.fill(1.0);
+            self.add_delay_l.fill(0.0);
+            self.add_delay_r.fill(0.0);
+        } else {
+            self.gain_delay = vec![1.0; n];
+            self.add_delay_l = vec![0.0; n];
+            self.add_delay_r = vec![0.0; n];
+        }
+        self.delay_pos = 0;
+    }
+
     pub fn reset(&mut self) {
         self.clock.reset();
         self.voice = None;
@@ -687,6 +716,7 @@ impl Engine {
         self.splatter_on = false;
         self.fade_in = 0;
         self.fade_out = 0;
+        self.resize_duck_delay();
         self.saturator.reset();
     }
 
@@ -803,8 +833,8 @@ impl Engine {
         }
     }
 
-    /// Ducks `channels` in place, runs Dream Eater's spectral gate on the ducked track, and
-    /// mixes in the sample. `gains` is called once per frame.
+    /// Runs Dream Eater's spectral gate on the incoming track, then ducks that with the sample
+    /// envelope and mixes the sample in. `gains` is called once per frame.
     pub fn process(
         &mut self,
         channels: &mut [&mut [f32]],
@@ -845,15 +875,16 @@ impl Engine {
             let right = channels.get(1).map_or(left, |channel| channel[frame]);
             self.track_gains[frame] = track_gain;
             self.amounts[frame] = gains.dream_eater;
+            // The gate hears the incoming track at full level. The duck is a gain afterwards.
             if channel_count <= 1 {
                 let add = 0.5 * (add_left + add_right);
-                self.ducked_l[frame] = left * track_gain;
-                self.ducked_r[frame] = self.ducked_l[frame];
+                self.ducked_l[frame] = left;
+                self.ducked_r[frame] = left;
                 self.dry_l[frame] = add;
                 self.dry_r[frame] = add;
             } else {
-                self.ducked_l[frame] = left * track_gain;
-                self.ducked_r[frame] = right * track_gain;
+                self.ducked_l[frame] = left;
+                self.ducked_r[frame] = right;
                 self.dry_l[frame] = add_left;
                 self.dry_r[frame] = add_right;
             }
@@ -890,28 +921,35 @@ impl Engine {
         self.wet_r.resize(n, 0.0);
         self.amounts.resize(n, 0.0);
         self.track_gains.resize(n, 1.0);
+        self.align.resize(n, 0.0);
+        self.silence.resize(n, 0.0);
     }
 
-    /// Runs the spectral gate on the ducked track, with the blended sample on the dry bus so it
-    /// stays aligned and is not thinned. Off is a bit-exact copy of that sum, with no delay.
+    /// Gates the incoming track. The sample envelope then ducks that result, and the blended
+    /// sample is added on top. Both the duck and the sample take the gate's delay while it is
+    /// open, so the dips stay as sharp as they are with Dream Eater off. Off is a bit-exact
+    /// copy of incoming × duck + sample, with no delay.
     fn splatter(&mut self, frames: usize) -> f32 {
         if frames == 0 {
             return 0.0;
         }
         let requested = self.amounts[..frames].iter().any(|amount| *amount > 1.0e-5);
-        let live = |engine: &Engine, frame: usize, right: bool| {
-            if right {
-                engine.ducked_r[frame] + engine.dry_r[frame]
-            } else {
-                engine.ducked_l[frame] + engine.dry_l[frame]
-            }
+        let incoming = |engine: &Engine, frame: usize, right: bool| {
+            if right { engine.ducked_r[frame] } else { engine.ducked_l[frame] }
         };
         if !self.splatter_on && !requested {
             for frame in 0..frames {
-                self.wet_l[frame] = live(self, frame, false);
-                self.wet_r[frame] = live(self, frame, true);
+                self.wet_l[frame] = incoming(self, frame, false);
+                self.wet_r[frame] = incoming(self, frame, true);
+                self.align[frame] = 0.0;
             }
-            self.gate.feed(&self.ducked_l[..frames], &self.ducked_r[..frames], &self.dry_l[..frames], &self.dry_r[..frames]);
+            self.gate.feed(
+                &self.ducked_l[..frames],
+                &self.ducked_r[..frames],
+                &self.silence[..frames],
+                &self.silence[..frames],
+            );
+            self.apply_duck(frames);
             return 0.0;
         }
         if !self.splatter_on {
@@ -922,13 +960,14 @@ impl Engine {
         }
         self.wet_l[..frames].copy_from_slice(&self.ducked_l[..frames]);
         self.wet_r[..frames].copy_from_slice(&self.ducked_r[..frames]);
+        self.align[..frames].fill(1.0);
         // First sample of the stretch that ends in bypass. Fading from there leaves the
         // samples the gate was still thinning alone.
         let closed_at = self.gate.process_varying(
             &mut self.wet_l[..frames],
             &mut self.wet_r[..frames],
-            &self.dry_l[..frames],
-            &self.dry_r[..frames],
+            &self.silence[..frames],
+            &self.silence[..frames],
             &self.amounts[..frames],
         );
 
@@ -938,9 +977,10 @@ impl Engine {
                 break;
             }
             let x = 1.0 - (self.fade_in - 1) as f32 / hop;
-            let (left, right) = (live(self, frame, false), live(self, frame, true));
+            let (left, right) = (incoming(self, frame, false), incoming(self, frame, true));
             self.wet_l[frame] = left * (1.0 - x) + self.wet_l[frame] * x;
             self.wet_r[frame] = right * (1.0 - x) + self.wet_r[frame] * x;
+            self.align[frame] = x;
             self.fade_in -= 1;
         }
         if requested {
@@ -954,21 +994,56 @@ impl Engine {
                     break;
                 }
                 let x = self.fade_out as f32 / hop;
-                let (left, right) = (live(self, frame, false), live(self, frame, true));
+                let (left, right) = (incoming(self, frame, false), incoming(self, frame, true));
                 self.wet_l[frame] = left * (1.0 - x) + self.wet_l[frame] * x;
                 self.wet_r[frame] = right * (1.0 - x) + self.wet_r[frame] * x;
+                self.align[frame] = x;
                 self.fade_out -= 1;
                 if self.fade_out == 0 {
                     self.splatter_on = false;
                     for rest in frame + 1..frames {
-                        self.wet_l[rest] = live(self, rest, false);
-                        self.wet_r[rest] = live(self, rest, true);
+                        self.wet_l[rest] = incoming(self, rest, false);
+                        self.wet_r[rest] = incoming(self, rest, true);
+                        self.align[rest] = 0.0;
                     }
                     break;
                 }
             }
         }
+        self.apply_duck(frames);
         if self.splatter_on { self.gate.amount() } else { 0.0 }
+    }
+
+    /// Ducks the gated track and adds the blended sample. `align` is 1 where the track has the
+    /// gate's delay, so the duck and the sample take that same delay and the dips stay put.
+    fn apply_duck(&mut self, frames: usize) {
+        for frame in 0..frames {
+            let (delayed_gain, delayed_l, delayed_r) = self.shift_duck(self.track_gains[frame], self.dry_l[frame], self.dry_r[frame]);
+            let x = self.align[frame];
+            let gain = self.track_gains[frame] * (1.0 - x) + delayed_gain * x;
+            let add_l = self.dry_l[frame] * (1.0 - x) + delayed_l * x;
+            let add_r = self.dry_r[frame] * (1.0 - x) + delayed_r * x;
+            self.wet_l[frame] = self.wet_l[frame] * gain + add_l;
+            self.wet_r[frame] = self.wet_r[frame] * gain + add_r;
+        }
+    }
+
+    /// Reads the duck and sample from one spectral frame ago and stores the current ones.
+    fn shift_duck(&mut self, gain: f32, left: f32, right: f32) -> (f32, f32, f32) {
+        let n = self.gain_delay.len();
+        if n == 0 {
+            return (gain, left, right);
+        }
+        let index = self.delay_pos;
+        let earlier = (self.gain_delay[index], self.add_delay_l[index], self.add_delay_r[index]);
+        self.gain_delay[index] = gain;
+        self.add_delay_l[index] = left;
+        self.add_delay_r[index] = right;
+        self.delay_pos += 1;
+        if self.delay_pos == n {
+            self.delay_pos = 0;
+        }
+        earlier
     }
 
     fn fade_gain(&self, voice: &Voice, frames: usize, playing: bool) -> f32 {
@@ -1049,7 +1124,7 @@ impl Engine {
         let peak = self.normaliser();
         let normalised = if peak > 1e-9 { (level / peak).min(1.0) as f32 } else { 0.0 };
         // Drive bends the envelope as it bends the sample: the dips fill out and hold longer, but
-        // reach no deeper. The duck, and so the signal Dream Eater hears, uses this bent envelope.
+        // reach no deeper. Dream Eater hears the track before this gain, then the bent duck is applied.
         let normalised = bend_envelope(normalised, gains.drive);
         let ducked = 1.0 - gains.depth * normalised;
         let track_gain = 1.0 - gains.mix * (1.0 - ducked);
@@ -2111,7 +2186,30 @@ mod tests {
         let hole = rms(&holed[at..at + window]);
         let tone = rms(&open[at..at + window]);
         assert!(tone > 0.05, "without the duck the tone is still there, {tone}");
-        assert!(hole < tone * 0.35, "the gate hears the ducked tone, so the hole stays a hole: {hole} vs {tone}");
+        assert!(hole < tone * 0.35, "the ducked tone stays ducked after the gate: {hole} vs {tone}");
+    }
+
+    /// A lone sine is kept whole by the gate, so ducking it must match Dream Eater off, one frame later.
+    /// Gating the already-ducked tone would smear the dip across the spectral window.
+    #[test]
+    fn the_duck_stays_sharp_on_a_gated_sine() {
+        let frames = 2 * RATE as usize;
+        let input = sine(440.0, frames);
+        let playing = TransportInfo::playing_at(0.0, 120.0, RATE);
+        let gains = FrameGains { depth: 1.0, mix: 1.0, sample_level: 0.0, dream_eater: 0.0, drive: 0.0 };
+        let plain = process_track(&mut kick_engine(), &input, playing, || gains);
+        let mut gated_engine = kick_engine();
+        let gated = process_track(&mut gated_engine, &input, playing, || FrameGains { dream_eater: 1.0, ..gains });
+        let latency = gated_engine.latency_samples() as usize;
+        let mut err = 0.0f32;
+        let mut energy = 0.0f32;
+        for i in latency + 8_000..frames {
+            let diff = gated[i] - plain[i - latency];
+            err += diff * diff;
+            energy += plain[i - latency] * plain[i - latency];
+        }
+        let ratio = err / energy.max(1.0e-12);
+        assert!(ratio < 1.0e-3, "the duck on a gated sine matches the unducked path: error {ratio}");
     }
 
     #[test]
@@ -2338,7 +2436,7 @@ mod tests {
         // No blended sample: Drive still bends the duck the gate hears, and the peaks hold.
         let gated = |drive: f32| move || FrameGains { depth: 0.75, mix: 1.0, sample_level: 0.0, dream_eater: 1.0, drive };
         let (clean, driven) = (drive_scene(&mut kick_engine(), gated(0.0)), drive_scene(&mut kick_engine(), gated(1.0)));
-        assert_ne!(fingerprint(&clean), fingerprint(&driven), "the bent duck reaches the gate");
+        assert_ne!(fingerprint(&clean), fingerprint(&driven), "the bent duck still shapes the gated track");
         assert!(peak(&driven) <= peak(&clean) * 1.05 + 0.02, "gated: {} vs {}", peak(&driven), peak(&clean));
     }
 

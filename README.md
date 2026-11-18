@@ -19,11 +19,11 @@ With **Restart** on (the default), Haunter plays the selected region once from S
 
 The HP and LP filters work on the sample itself as it plays. An envelope follower runs on the filtered sample, and its level sets how far the track is turned down. Depth is measured against the unfiltered sample's peak over the region: with the filters off, the track ducks by exactly Depth at the sample's loudest point. Filtering part of the sample away makes the duck shallower, and changes what you hear through Blend.
 
-**Dream Eater** (since 1.7.16) is the spectral gate from Hyperchroma's Splatter knob, on the incoming track after the duck. It thins the ducked signal until the strongest partials are what remain. It does not add a chord, and it does not listen for a key.
+**Dream Eater** (since 1.7.16) is the spectral gate from Hyperchroma's Splatter knob, on the incoming track. It thins that track until the strongest partials are what remain, and the sample's envelope then ducks it exactly as it does with the knob off. It does not add a chord, and it does not listen for a key.
 
 The gate is one Hann short-time transform, about 40 ms long (2048 samples at 44.1 and 48 kHz, 4096 at 96 kHz), hopping by a quarter of that. Left and right are transformed separately and share one gate decision, so a partial that is loud on either side stays on both and the stereo image holds. Each frame's threshold sits under that frame's loudest bin: about -60 dB at 30%, -30 dB at 60%, and -12 dB at 100%. Bins under the threshold fall toward a floor of about -40 dB at the bottom of the knob and -80 dB at full, across a 6 dB knee. The knob itself eases in over the first 5% and is smoothed over 20 ms.
 
-Fully counter-clockwise reads Off. The ducked track and the blended sample pass through untouched, bit for bit, with no delay. Above Off the whole output, including the blended sample, is delayed by one frame so the sample stays lined up with the thinned track. The sample itself is not thinned: it rides the dry side of the gate. Silence in is silence out. The effect runs with or without a sample loaded; with no sample there is simply no duck in front of it. Turning it off closes the gate and, once that has settled, the track is bit-exact again.
+Fully counter-clockwise reads Off. The incoming track is ducked and the blended sample is added, bit for bit, with no delay. Above Off the incoming track is thinned first, then ducked. The duck gain and the blended sample are delayed by the same frame, so the dips stay as sharp as they are at Off and the sample stays lined up. The sample itself is not thinned, and it is not ducked. Silence in is silence out. The effect runs with or without a sample loaded. Turning it off closes the gate and, once that has settled, the track is bit-exact again.
 
 The dark knob is unchanged. The accent fill follows how far the gate has actually opened. There is no key menu. Projects and presets still store `dream-key`, so an older session loads, and the gate ignores it.
 
@@ -118,7 +118,7 @@ The unit tests cover:
 - Dream Eater (since 1.7.16, the Splatter gate):
   - Off is a bit-exact bypass of the ducked track, and it is bit-exact again once it has been off for a second after being on.
   - At 100%, a loud 440 Hz partial stays and a quiet 3 kHz partial is stripped to under a quarter of its share. At 30% the quiet partial keeps more of that share than at 100%.
-  - The gate hears the track after the duck: at the bottom of a full-depth duck the thinned tone is well under the same tone with no duck.
+  - The duck is applied after the gate: at the bottom of a full-depth duck the thinned tone is well under the same tone with no duck, and a lone sine's duck matches Dream Eater off one frame later.
   - The blended sample is delayed with the track and not thinned. HP, LP, and Drive, with no duck and no blend, leave the gated track bit for bit.
   - A silent track stays silent at 100% while a kick ducks it, full-scale noise stays finite and bounded, and a mono track matches a centred stereo one.
   - The saved key choices still round-trip through their IDs, and the gate ignores them.

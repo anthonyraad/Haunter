@@ -1,5 +1,5 @@
-//! Drive: a warm, oversampled tape-style saturator for the blended sample and Dream Eater's
-//! chord, and the bend Drive gives the duck's envelope.
+//! Drive: a warm, oversampled tape-style saturator for the blended sample, and the bend Drive
+//! gives the duck's envelope. Dream Eater's spectral gate is not saturated.
 //!
 //! The saturator runs at four times the sample rate behind two polyphase half-band IIR stages
 //! (about 110 dB of image and alias rejection), and works on a soft asymmetric tanh curve that

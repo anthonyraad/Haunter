@@ -92,7 +92,7 @@ impl Choice {
 pub struct Preset {
     pub values: Values,
     pub sample: Option<EmbeddedSample>,
-    /// The key Dream Eater tunes to. Auto for the factory presets.
+    /// Kept so older presets load. Dream Eater no longer reads it. Auto for the factory presets.
     pub dream_key: KeyChoice,
 }
 

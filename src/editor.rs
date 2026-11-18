@@ -7,7 +7,6 @@ use nih_plug_egui::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::dream::KeyChoice;
 use crate::drive::driven_columns;
 use crate::dsp::Direction;
 use crate::sample::Overview;
@@ -186,14 +185,13 @@ fn draw(
                 ("Mix", &params.mix, true, Face::Plain),
             ]);
             let dream_level = shared.dream_level.load(Ordering::Relaxed);
-            let (lower_knobs, lower) = knob_row(ui, setter, &[
+            let (lower_knobs, _) = knob_row(ui, setter, &[
                 ("HP", &params.high_pass, true, Face::Plain),
                 ("LP", &params.low_pass, true, Face::Plain),
                 ("Drive", &params.drive, true, Face::Plain),
                 ("Blend", &params.blend, true, Face::Plain),
                 ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level }),
             ]);
-            key_menu(&lower[4], params);
             Drawn { used: ui.min_rect(), preset_menu, save, waveform, browse, restart, direction, upper_knobs, lower_knobs }
         })
         .inner
@@ -828,7 +826,7 @@ fn arc_points(center: Pos2, radius: f32, start: f32, end: f32) -> Vec<Pos2> {
 enum Face {
     Plain,
     /// Dropout's Destroy treatment: a dark disc with a white arc and pointer, and `progress`
-    /// (0..1, the sample's live sweep) filling the white arc in the accent colour from the start.
+    /// (0..1, how far the spectral gate has opened) filling the white arc in the accent colour.
     Eater { progress: f32 },
 }
 
@@ -931,20 +929,6 @@ fn draw_knob<P: Param>(
         SUBTLE,
     );
     response
-}
-
-/// Right-clicking Dream Eater chooses the key its resonances are tuned to. Nothing on the panel
-/// shows the choice.
-fn key_menu(knob: &egui::Response, params: &HaunterParams) {
-    knob.context_menu(|ui| {
-        let current = params.dream_key.get();
-        for choice in KeyChoice::all() {
-            if ui.selectable_label(choice == current, choice.label()).clicked() {
-                params.dream_key.set(choice);
-                ui.close_menu();
-            }
-        }
-    });
 }
 
 /// An infinity sign centred on `center`, from the font if it has one and drawn otherwise.
@@ -1855,45 +1839,11 @@ mod tests {
     }
 
     #[test]
-    fn right_clicking_dream_eater_picks_its_key_without_turning_it_or_showing_it() {
+    fn right_clicking_dream_eater_does_not_turn_it() {
         let mut editor = Editor::new(true);
         let row = editor.settle().lower_knobs;
         let dream_eater = knob_centres(row).last().unwrap();
-        // Everything but the gain reduction readout, which falls while the test runs.
-        let panel_texts = |screen: &Screen| {
-            let mut texts: Vec<String> = screen.texts().into_iter().filter(|text| !text.starts_with(" -")).collect();
-            texts.sort();
-            texts
-        };
-        let panel = panel_texts(&editor.screen);
-        let labels: Vec<String> = KeyChoice::all().map(|choice| choice.label()).collect();
-        assert_eq!(labels.len(), 13);
-        let named: Vec<&String> = panel.iter().filter(|text| labels.contains(text)).collect();
-        assert_eq!(named, ["E"], "nothing on the panel names a key; the E is the End handle's tab");
         editor.screen.take_edits();
-
-        editor.move_to(dream_eater);
-        editor.screen.right_button(true);
-        editor.frame();
-        editor.screen.right_button(false);
-        editor.settle();
-        let shown = editor.screen.texts();
-        let count = |texts: &[String], label: &String| texts.iter().filter(|text| *text == label).count();
-        assert!(
-            labels.iter().all(|label| count(&shown, label) == count(&panel, label) + 1),
-            "Auto and the twelve keys, once each: {shown:?}"
-        );
-        assert_eq!(editor.plugin.params.dream_key.get(), KeyChoice::Auto);
-
-        let d_major = editor.screen.find_text(&KeyChoice::Fixed(2).label()).unwrap();
-        editor.click_at(d_major.center());
-        editor.settle();
-        assert_eq!(editor.plugin.params.dream_key.get(), KeyChoice::Fixed(2));
-        assert_eq!(editor.screen.take_edits(), [], "the key is not a parameter, and the knob did not move");
-        assert_eq!(editor.plugin.params.dream_eater.value(), 0.0);
-        assert_eq!(panel_texts(&editor.screen), panel, "the menu closes and the panel looks the same");
-
-        // A right-drag does not turn it either.
         editor.move_to(dream_eater);
         editor.screen.right_button(true);
         editor.frame();
@@ -1902,11 +1852,13 @@ mod tests {
             editor.frame();
         }
         editor.screen.right_button(false);
-        editor.frame();
-        editor.screen.press_key(egui::Key::Escape);
         editor.settle();
         assert_eq!(editor.screen.take_edits(), []);
-        assert_eq!(editor.plugin.params.dream_key.get(), KeyChoice::Fixed(2));
+        assert_eq!(editor.plugin.params.dream_eater.value(), 0.0);
+        assert!(
+            !editor.screen.texts().iter().any(|text| text == "Auto" || text == "C#"),
+            "the key menu is gone"
+        );
     }
 
     /// The text in the preset menu's button.
@@ -2030,7 +1982,7 @@ mod tests {
         let mut editor = Editor::new(false);
         editor.settle();
         let mut preset =
-            crate::preset::Preset { sample: Some(another_sample()), dream_key: KeyChoice::Fixed(7), ..Default::default() };
+            crate::preset::Preset { sample: Some(another_sample()), dream_key: crate::dream::KeyChoice::Fixed(7), ..Default::default() };
         for (id, value) in [("rate", 4.0), ("restart", 0.0), ("direction", 1.0), ("start", 0.125), ("depth", 0.4), ("release", 321.5)] {
             preset.values.insert(id.to_owned(), value);
         }
@@ -2055,13 +2007,13 @@ mod tests {
         assert_eq!(shown_preset(&mut editor), "Snare Gate", "not changed while the host applies the settings");
         editor.plugin.shared.processed_blocks.fetch_add(HOST_GRACE_BLOCKS, Ordering::Relaxed);
         assert_eq!(shown_preset(&mut editor), "Snare Gate*", "the test host never applies them, so they differ");
-        assert_eq!(params.dream_key.get(), KeyChoice::Fixed(7), "the preset's Dream Eater key comes with it");
+        assert_eq!(params.dream_key.get(), crate::dream::KeyChoice::Fixed(7), "the preset's Dream Eater key comes with it");
 
         pick_preset(&mut editor, "Water");
-        assert_eq!(params.dream_key.get(), KeyChoice::Auto, "factory presets listen for the key");
-        params.dream_key.set(KeyChoice::Fixed(3));
+        assert_eq!(params.dream_key.get(), crate::dream::KeyChoice::Auto, "factory presets still store Auto");
+        params.dream_key.set(crate::dream::KeyChoice::Fixed(3));
         pick_preset(&mut editor, "--");
-        assert_eq!(params.dream_key.get(), KeyChoice::Auto);
+        assert_eq!(params.dream_key.get(), crate::dream::KeyChoice::Auto);
     }
 
     #[test]

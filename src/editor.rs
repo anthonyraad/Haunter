@@ -7,7 +7,6 @@ use nih_plug_egui::{
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::dream::KeyChoice;
 use crate::drive::driven_columns;
 use crate::dsp::Direction;
 use crate::sample::Overview;
@@ -39,6 +38,11 @@ const EATER_DISC: Color32 = Color32::from_rgb(0x6e, 0x6e, 0x6e);
 const EATER_OUTLINE: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x2a);
 const EATER_TRACK: Color32 = Color32::from_rgb(0x3f, 0x3f, 0x3f);
 const EATER_ARC: Color32 = Color32::WHITE;
+/// The same knob while no sample is loaded and Dream Eater is bypassed.
+const EATER_DISC_DIM: Color32 = Color32::from_rgb(0xa3, 0xa3, 0xa3);
+const EATER_OUTLINE_DIM: Color32 = Color32::from_rgb(0x8a, 0x8a, 0x8a);
+const EATER_TRACK_DIM: Color32 = Color32::from_rgb(0x96, 0x96, 0x96);
+const EATER_ARC_DIM: Color32 = Color32::from_rgb(0xb4, 0xb4, 0xb4);
 
 const ROTARY_START: f32 = std::f32::consts::PI * 1.2;
 const ROTARY_END: f32 = std::f32::consts::PI * 2.8;
@@ -185,15 +189,16 @@ fn draw(
                 ("Release", &params.release, true, Face::Plain),
                 ("Mix", &params.mix, true, Face::Plain),
             ]);
-            let dream_level = shared.dream_level.load(Ordering::Relaxed);
-            let (lower_knobs, lower) = knob_row(ui, setter, &[
+            // No sample, no gate: the knob stays settable, and it is drawn dimmed so that reads.
+            let dream_active = params.sample.fingerprint() != 0;
+            let dream_level = if dream_active { shared.dream_level.load(Ordering::Relaxed) } else { 0.0 };
+            let (lower_knobs, _) = knob_row(ui, setter, &[
                 ("HP", &params.high_pass, true, Face::Plain),
                 ("LP", &params.low_pass, true, Face::Plain),
                 ("Drive", &params.drive, true, Face::Plain),
                 ("Blend", &params.blend, true, Face::Plain),
-                ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level }),
+                ("Dream Eater", &params.dream_eater, true, Face::Eater { progress: dream_level, active: dream_active }),
             ]);
-            key_menu(&lower[4], params);
             Drawn { used: ui.min_rect(), preset_menu, save, waveform, browse, restart, direction, upper_knobs, lower_knobs }
         })
         .inner
@@ -828,8 +833,9 @@ fn arc_points(center: Pos2, radius: f32, start: f32, end: f32) -> Vec<Pos2> {
 enum Face {
     Plain,
     /// Dropout's Destroy treatment: a dark disc with a white arc and pointer, and `progress`
-    /// (0..1, the sample's live sweep) filling the white arc in the accent colour from the start.
-    Eater { progress: f32 },
+    /// (0..1, how far the spectral gate has opened) filling the white arc in the accent colour.
+    /// `active` is false when no sample is loaded; the gate is bypassed then, and the knob is dimmed.
+    Eater { progress: f32, active: bool },
 }
 
 trait KnobParam {
@@ -895,9 +901,10 @@ fn draw_knob<P: Param>(
     let center = Pos2::new(rect.center().x, rect.top() + dial * 0.5 + 2.0);
     let radius = dial * 0.5 - 3.0;
     let angle = ROTARY_START + normalized * (ROTARY_END - ROTARY_START);
-    let (disc, outline, track, arc, pointer, pointer_width) = match face {
-        Face::Plain => (DISC, OUTLINE, TRACK, ARC, INK, 1.5_f32),
-        Face::Eater { .. } => (EATER_DISC, EATER_OUTLINE, EATER_TRACK, EATER_ARC, EATER_ARC, 2.2),
+    let (disc, outline, track, arc, pointer, pointer_width, readout) = match face {
+        Face::Plain => (DISC, OUTLINE, TRACK, ARC, INK, 1.5_f32, INK),
+        Face::Eater { active: true, .. } => (EATER_DISC, EATER_OUTLINE, EATER_TRACK, EATER_ARC, EATER_ARC, 2.2, INK),
+        Face::Eater { active: false, .. } => (EATER_DISC_DIM, EATER_OUTLINE_DIM, EATER_TRACK_DIM, EATER_ARC_DIM, EATER_ARC_DIM, 2.2, MUTED),
     };
     let painter = ui.painter();
     painter.circle_filled(center, radius - 1.0, disc);
@@ -906,7 +913,7 @@ fn draw_knob<P: Param>(
     if normalized > 0.004 {
         painter.line(arc_points(center, radius - 5.0, ROTARY_START, angle), Stroke::new(2.0_f32, arc));
     }
-    if let Face::Eater { progress } = face {
+    if let Face::Eater { progress, active: true } = face {
         let progress = progress.clamp(0.0, 1.0);
         if progress > 0.004 && angle > ROTARY_START + 0.004 {
             let filled = ROTARY_START + progress * (angle - ROTARY_START);
@@ -917,11 +924,11 @@ fn draw_knob<P: Param>(
     let outer = Pos2::new(center.x + angle.sin() * dial * 0.36, center.y - angle.cos() * dial * 0.36);
     painter.line_segment([inner, outer], Stroke::new(pointer_width, pointer));
 
-    let readout = Pos2::new(rect.center().x, rect.top() + dial + 14.0);
+    let readout_at = Pos2::new(rect.center().x, rect.top() + dial + 14.0);
     if turnable {
-        painter.text(readout, egui::Align2::CENTER_CENTER, param.to_string(), egui::FontId::proportional(13.0), INK);
+        painter.text(readout_at, egui::Align2::CENTER_CENTER, param.to_string(), egui::FontId::proportional(13.0), readout);
     } else {
-        draw_infinity(painter, readout, MUTED);
+        draw_infinity(painter, readout_at, MUTED);
     }
     painter.text(
         Pos2::new(rect.center().x, rect.top() + dial + 30.0),
@@ -930,21 +937,11 @@ fn draw_knob<P: Param>(
         egui::FontId::proportional(11.0),
         SUBTLE,
     );
-    response
-}
-
-/// Right-clicking Dream Eater chooses the key its resonances are tuned to. Nothing on the panel
-/// shows the choice.
-fn key_menu(knob: &egui::Response, params: &HaunterParams) {
-    knob.context_menu(|ui| {
-        let current = params.dream_key.get();
-        for choice in KeyChoice::all() {
-            if ui.selectable_label(choice == current, choice.label()).clicked() {
-                params.dream_key.set(choice);
-                ui.close_menu();
-            }
-        }
-    });
+    if matches!(face, Face::Eater { active: false, .. }) {
+        response.on_hover_text("Load a sample. Dream Eater does nothing until one is loaded.")
+    } else {
+        response
+    }
 }
 
 /// An infinity sign centred on `center`, from the font if it has one and drawn otherwise.
@@ -1855,45 +1852,30 @@ mod tests {
     }
 
     #[test]
-    fn right_clicking_dream_eater_picks_its_key_without_turning_it_or_showing_it() {
+    fn dream_eater_dims_until_a_sample_is_loaded() {
+        let mut editor = Editor::new(false);
+        let row = editor.settle().lower_knobs;
+        assert!(editor.screen.discs(EATER_DISC).is_empty(), "no sample, the live disc is not drawn");
+        let dim = editor.screen.discs(EATER_DISC_DIM);
+        assert_eq!(dim.len(), 1, "the knob is dimmed: {dim:?}");
+        assert!(row.contains(dim[0]));
+        editor.screen.take_edits();
+        editor.move_to(dim[0]);
+        editor.drag(egui::vec2(0.0, -40.0));
+        let dream = editor.plugin.params.dream_eater.as_ptr();
+        let edits = editor.screen.take_edits();
+        assert!(
+            edits.iter().any(|edit| matches!(edit, Edit::Set(p, value) if *p == dream && *value > 0.0)),
+            "it can still be set, for when a sample arrives: {edits:?}"
+        );
+    }
+
+    #[test]
+    fn right_clicking_dream_eater_does_not_turn_it() {
         let mut editor = Editor::new(true);
         let row = editor.settle().lower_knobs;
         let dream_eater = knob_centres(row).last().unwrap();
-        // Everything but the gain reduction readout, which falls while the test runs.
-        let panel_texts = |screen: &Screen| {
-            let mut texts: Vec<String> = screen.texts().into_iter().filter(|text| !text.starts_with(" -")).collect();
-            texts.sort();
-            texts
-        };
-        let panel = panel_texts(&editor.screen);
-        let labels: Vec<String> = KeyChoice::all().map(|choice| choice.label()).collect();
-        assert_eq!(labels.len(), 13);
-        let named: Vec<&String> = panel.iter().filter(|text| labels.contains(text)).collect();
-        assert_eq!(named, ["E"], "nothing on the panel names a key; the E is the End handle's tab");
         editor.screen.take_edits();
-
-        editor.move_to(dream_eater);
-        editor.screen.right_button(true);
-        editor.frame();
-        editor.screen.right_button(false);
-        editor.settle();
-        let shown = editor.screen.texts();
-        let count = |texts: &[String], label: &String| texts.iter().filter(|text| *text == label).count();
-        assert!(
-            labels.iter().all(|label| count(&shown, label) == count(&panel, label) + 1),
-            "Auto and the twelve keys, once each: {shown:?}"
-        );
-        assert_eq!(editor.plugin.params.dream_key.get(), KeyChoice::Auto);
-
-        let d_major = editor.screen.find_text(&KeyChoice::Fixed(2).label()).unwrap();
-        editor.click_at(d_major.center());
-        editor.settle();
-        assert_eq!(editor.plugin.params.dream_key.get(), KeyChoice::Fixed(2));
-        assert_eq!(editor.screen.take_edits(), [], "the key is not a parameter, and the knob did not move");
-        assert_eq!(editor.plugin.params.dream_eater.value(), 0.0);
-        assert_eq!(panel_texts(&editor.screen), panel, "the menu closes and the panel looks the same");
-
-        // A right-drag does not turn it either.
         editor.move_to(dream_eater);
         editor.screen.right_button(true);
         editor.frame();
@@ -1902,11 +1884,13 @@ mod tests {
             editor.frame();
         }
         editor.screen.right_button(false);
-        editor.frame();
-        editor.screen.press_key(egui::Key::Escape);
         editor.settle();
         assert_eq!(editor.screen.take_edits(), []);
-        assert_eq!(editor.plugin.params.dream_key.get(), KeyChoice::Fixed(2));
+        assert_eq!(editor.plugin.params.dream_eater.value(), 0.0);
+        assert!(
+            !editor.screen.texts().iter().any(|text| text == "Auto" || text == "C#"),
+            "the key menu is gone"
+        );
     }
 
     /// The text in the preset menu's button.
@@ -2030,7 +2014,7 @@ mod tests {
         let mut editor = Editor::new(false);
         editor.settle();
         let mut preset =
-            crate::preset::Preset { sample: Some(another_sample()), dream_key: KeyChoice::Fixed(7), ..Default::default() };
+            crate::preset::Preset { sample: Some(another_sample()), dream_key: crate::dream::KeyChoice::Fixed(7), ..Default::default() };
         for (id, value) in [("rate", 4.0), ("restart", 0.0), ("direction", 1.0), ("start", 0.125), ("depth", 0.4), ("release", 321.5)] {
             preset.values.insert(id.to_owned(), value);
         }
@@ -2055,13 +2039,13 @@ mod tests {
         assert_eq!(shown_preset(&mut editor), "Snare Gate", "not changed while the host applies the settings");
         editor.plugin.shared.processed_blocks.fetch_add(HOST_GRACE_BLOCKS, Ordering::Relaxed);
         assert_eq!(shown_preset(&mut editor), "Snare Gate*", "the test host never applies them, so they differ");
-        assert_eq!(params.dream_key.get(), KeyChoice::Fixed(7), "the preset's Dream Eater key comes with it");
+        assert_eq!(params.dream_key.get(), crate::dream::KeyChoice::Fixed(7), "the preset's Dream Eater key comes with it");
 
         pick_preset(&mut editor, "Water");
-        assert_eq!(params.dream_key.get(), KeyChoice::Auto, "factory presets listen for the key");
-        params.dream_key.set(KeyChoice::Fixed(3));
+        assert_eq!(params.dream_key.get(), crate::dream::KeyChoice::Auto, "factory presets still store Auto");
+        params.dream_key.set(crate::dream::KeyChoice::Fixed(3));
         pick_preset(&mut editor, "--");
-        assert_eq!(params.dream_key.get(), KeyChoice::Auto);
+        assert_eq!(params.dream_key.get(), crate::dream::KeyChoice::Auto);
     }
 
     #[test]

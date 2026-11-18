@@ -92,7 +92,7 @@ impl Choice {
 pub struct Preset {
     pub values: Values,
     pub sample: Option<EmbeddedSample>,
-    /// The key Dream Eater tunes to. Auto for the factory presets.
+    /// Kept so older presets load. Dream Eater no longer reads it. Auto for the factory presets.
     pub dream_key: KeyChoice,
 }
 
@@ -269,14 +269,30 @@ impl UserPresets {
         let failed = |err: std::io::Error| format!("Could not save the preset: {err}");
         std::fs::create_dir_all(&self.dir).map_err(failed)?;
         // Written next to the preset and then moved over it, so a failed save never leaves a
-        // half-written preset behind.
+        // half-written preset behind. A name that differs only by case replaces the preset
+        // already stored, the same way it does on Windows, where those are one file.
         let temporary = self.dir.join(format!("{name}.{FILE_EXTENSION}.tmp"));
         std::fs::write(&temporary, json).map_err(failed)?;
-        std::fs::rename(&temporary, self.path(&name)).map_err(|err| {
+        std::fs::rename(&temporary, self.preset_file(&name)).map_err(|err| {
             let _ = std::fs::remove_file(&temporary);
             failed(err)
         })?;
         Ok(name)
+    }
+
+    /// The file for `name`, or the one already saved under a different casing of it.
+    fn preset_file(&self, name: &str) -> PathBuf {
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else { continue };
+                let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else { continue };
+                if path.is_file() && extension.eq_ignore_ascii_case(FILE_EXTENSION) && stem.eq_ignore_ascii_case(name) {
+                    return path;
+                }
+            }
+        }
+        self.path(name)
     }
 
     pub fn load(&self, name: &str) -> Result<Preset, String> {

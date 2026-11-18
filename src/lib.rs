@@ -10,6 +10,7 @@ pub mod audio_file;
 pub mod dream;
 pub mod drive;
 pub mod dsp;
+mod splatter;
 mod editor;
 pub mod preset;
 pub mod sample;
@@ -120,7 +121,7 @@ pub struct Shared {
     gain_reduction_db: AtomicF32,
     /// Playback position as a fraction of the sample, or negative when idle.
     playhead: AtomicF32,
-    /// 0..1, how far the sample is sweeping the Dream Eater comb right now.
+    /// 0..1, how far Dream Eater's spectral gate has opened.
     dream_level: AtomicF32,
     /// Blocks processed so far. While the host runs the plugin, an edit from the editor only
     /// reaches the parameter in a later block, so this tells the editor whether it has had one.
@@ -248,7 +249,7 @@ pub struct HaunterParams {
     #[persist = "preset"]
     pub preset: SelectionSlot,
 
-    /// The key Dream Eater tunes to, chosen from the knob's right-click menu.
+    /// Kept so projects saved when Dream Eater tuned a chord still load. The gate ignores it.
     #[persist = "dream-key"]
     pub dream_key: KeyChoiceSlot,
 
@@ -345,9 +346,9 @@ fn cutoff_param(name: &str, default: f32, min: f32, max: f32, off_at: f32) -> Fl
 
 /// Whole-percent steps, so the knob is either exactly Off or at least 1%.
 fn dream_eater_param() -> FloatParam {
+    // The gate smooths the knob over 20 ms. Each partial then blooms and fades on its own.
     FloatParam::new("Dream Eater", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
         .with_step_size(0.01)
-        .with_smoother(SmoothingStyle::Linear(50.0))
         .with_value_to_string(Arc::new(|value| {
             if value <= 0.0 {
                 "Off".to_owned()
@@ -605,6 +606,7 @@ impl Plugin for Haunter {
             self.shared.playhead.store(report.playhead.unwrap_or(-1.0), Ordering::Relaxed);
             self.shared.dream_level.store(report.dream_level, Ordering::Relaxed);
         }
+        context.set_latency_samples(self.engine.latency_samples());
 
         ProcessStatus::Normal
     }
@@ -845,7 +847,7 @@ mod tests {
         let restored = Haunter::default();
         load_state(&restored, &state);
         assert_eq!(restored.params.dream_key.get(), KeyChoice::Fixed(9));
-        assert_eq!(restored.params.settings().dream_key, KeyChoice::Fixed(9), "and the engine gets it");
+        assert_eq!(restored.params.settings().dream_key, KeyChoice::Fixed(9), "older sessions still restore it");
 
         // A project from before 1.6 has no key, and opens on Auto even in an instance set to one.
         let mut fields = Haunter::default().params.serialize_fields();
